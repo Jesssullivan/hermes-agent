@@ -64,12 +64,10 @@ def test_lease_reload_and_unload_do_not_cross_profiles(tmp_path):
     second_ctx = PluginContext(manifest, PluginManager(scope_key=second))
     original, replacement, sibling = Example(), Example(), Example()
     a = first_ctx.register_login_backend(original)
-    b = first_ctx.register_login_backend(replacement)
+    assert first_ctx.register_login_backend(replacement) is None  # a held name is never taken over
     c = second_ctx.register_login_backend(sibling)
-    assert registry.get_provider("example", scope=first) is replacement
-    assert registry.get_provider("example", scope=second) is sibling
-    b.dispose()
     assert registry.get_provider("example", scope=first) is original
+    assert registry.get_provider("example", scope=second) is sibling
     a.dispose()
     assert registry.get_provider("example", scope=first) is None
     assert registry.get_provider("example", scope=second) is sibling

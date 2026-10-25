@@ -10,7 +10,7 @@ namespaced by ``prefix`` so ``backend_for_handle`` needs no lookup table.
 from __future__ import annotations
 
 import subprocess
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -38,7 +38,7 @@ class LoginBackend(ABC):
     def is_unlocked(self) -> bool:
         return True
 
-    def fill_context(self):
+    def fill_context(self) -> AbstractContextManager:
         """Optional profile-exclusive context covering origin check through CDP fill."""
         return nullcontext()
 
@@ -137,12 +137,8 @@ def enabled_backends() -> list[LoginBackend]:
         if is_enabled(cls.name):
             section = cfg.get(cls.name) or {}
             out.append(cls(section if isinstance(section, dict) else {}))
-    from agent.vault_backend_registry import list_providers
-    for backend in list_providers():
-        section = cfg.get(backend.name)
-        if isinstance(section, dict) and section.get("enabled") is True:
-            out.append(backend)
-    return out
+    from agent.vault_backend_registry import enabled_plugin_backends
+    return out + enabled_plugin_backends(cfg)
 
 
 def backend_for_handle(handle: str) -> Optional[LoginBackend]:
