@@ -429,3 +429,39 @@ def test_plugin_otp_is_minted_and_written_inside_the_backends_fill_context(vault
     assert backend.calls == ["enter", "resolve_otp", "write", "exit"]
     assert code in page.secret_evals[0] and code not in json.dumps(out)
 
+
+_LAZY_META_BACKEND = '''
+from agent.vault_backends.base import LoginBackend
+from agent.vault_store import VaultItemMeta
+
+class LazyMeta(VaultItemMeta):
+    def __getattribute__(self, field):
+        if field == "allowed_origins":
+            raise RuntimeError("manager said {leak}")
+        return super().__getattribute__(field)
+
+class Backend(LoginBackend):
+    name, prefix, display_name = "lazy", "lazy:", "Lazy"
+
+    def list_items(self):
+        return [self.get_meta("lazy:1")]
+
+    def get_meta(self, handle):
+        return LazyMeta(id=handle, kind="login", label="Lazy", origin="https://example.com",
+                        created_at="2026-01-01T00:00:00Z")
+
+    def resolve_password(self, handle):
+        return "unused"
+'''
+
+
+def test_errors_reading_plugin_metadata_get_the_fixed_message(vault_home, page):
+    home, _local, load = vault_home
+    _write_plugin(home, "lazy_vault", _LAZY_META_BACKEND.format(leak=LEAK), "    ctx.register_login_backend(Backend())\n")
+    load(["lazy_vault"], {"lazy": "true"})
+
+    listed, filled = _vault({"action": "list"}), _vault({"action": "fill", "handle": "lazy:1"})
+    assert LEAK not in listed and LEAK not in filled
+    assert json.loads(listed)["errors"] == [{"backend": "lazy", "error": "The lazy login backend failed."}]
+    assert json.loads(filled)["error_type"] == "backend_unavailable" and page.secret_evals == []
+

@@ -87,7 +87,7 @@ hold however the plugin implements its class:
 | **Off by default** | Only `vault.<name>.enabled: true` turns a backend on. |
 | **In-process only** | `ctx.register_login_backend` is refused under `plugins.isolation: host`, because `fill_context()` is a server-local context manager. |
 | **Same fill path** | Plugin items go through the same exact-origin pre-check, in-page origin re-assertion, supervisor CDP secret evaluation (never argv) and payment confirmation as built-in items. |
-| **Secrets stay out of the conversation** | Values you return are registered with the browser-result redaction boundary before they reach the page. Any exception your backend raises is replaced by a fixed message (`The <name> login backend failed.`) before it can reach a tool result, a log line or an exception chain, so a secret in your error text cannot reach the model. A value of the wrong type is refused the same way. |
+| **Secrets stay out of the conversation** | Values you return are registered with the browser-result redaction boundary before they reach the page. Any exception your backend raises is replaced by a fixed message (`The <name> login backend failed.`) before it can reach a tool result, a log line or an exception chain, so a secret in your error text cannot reach the model. A value of the wrong type is refused the same way. Hermes copies what you return (metadata fields, passwords, codes) into its own plain objects inside that same guard, so an error raised while a field is read gets the fixed message too. |
 
 An in-process plugin is ordinary Python running inside Hermes, so these rules are an API contract,
 not a sandbox. They guarantee that Hermes never hands your backend another backend's data; they do not
