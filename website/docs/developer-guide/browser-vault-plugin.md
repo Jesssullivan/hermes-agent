@@ -6,7 +6,8 @@ description: Add a password manager to browser_vault with ctx.register_login_bac
 # Browser Vault Plugins
 
 A plugin can add a password manager (KeePass, a team vault, a hardware-backed store) as a login
-source for the `browser_vault` tool. The agent then lists and fills that manager's logins the same way
+source for the `browser_vault` tool, when it comes from a verified source: the manager's vendor
+through the plugin catalog, or Nous (see [Who can register a backend](#who-can-register-a-backend)). The agent then lists and fills that manager's logins the same way
 it does for the built-in Hermes vault, 1Password and Bitwarden: it sees handles and metadata, never a password.
 
 Browser login backends are separate from [secret sources](./secret-source-plugin.md). A `SecretSource`
@@ -51,6 +52,27 @@ vault:
 Construct the backend without fetching credentials or reading profile state, and read the active
 profile's configuration lazily. Registration is profile-scoped and removed when the plugin unloads.
 
+## Who can register a backend
+
+Password-manager integrations come only from verified sources. `ctx.register_login_backend` is
+accepted from:
+
+- a plugin bundled with Hermes, or
+- a plugin installed from the [Hermes plugin catalog](./plugins/catalog-submission.md) at
+  `tier: verified` (published by the password-manager vendor itself) or `tier: official`
+  (maintained by Nous), at the catalog's reviewed pin.
+
+Every other plugin is refused at registration with a log line naming this rule: a plugin dropped
+into `~/.hermes/plugins/` by hand, a Git URL install, a community-tier catalog entry, a catalog
+install moved off its pin with `--ref`, one installed with `--allow-removed`, a project plugin and
+a pip entry-point plugin. Provenance is read from Hermes's own install record
+(`plugins/.install-metadata.json`, written by the installer), never from a file inside the plugin, so
+a repository that ships its own `.hermes-catalog.json` gains nothing. No config key relaxes the rule.
+
+If you build a password manager and want it in Hermes, submit the plugin to the catalog from your
+own repository and ask for `verified` tier (catalog admission rule 18). Integrations for managers
+whose vendor has not published one come from Nous as `official` entries.
+
 ## Isolation rules
 
 Hermes wraps every plugin backend in a core-owned adapter before the vault tool sees it. These rules
@@ -69,7 +91,8 @@ hold however the plugin implements its class:
 
 An in-process plugin is ordinary Python running inside Hermes, so these rules are an API contract,
 not a sandbox. They guarantee that Hermes never hands your backend another backend's data; they do not
-stop arbitrary code in the same process from reading files. Install password-manager plugins you trust.
+stop arbitrary code in the same process from reading files. The provenance rule above decides which
+plugins Hermes offers this seam to; it is not a sandbox either.
 
 ## Fill context
 
