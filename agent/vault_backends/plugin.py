@@ -18,9 +18,19 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from agent.vault_backends.base import LoginBackend
-from agent.vault_store import VaultItemMeta
+from agent.vault_store import VAULT_KINDS, VaultItemMeta
 
 _FAILED = object()
+
+
+def _well_formed(meta: Any) -> bool:
+    """``VaultItemMeta`` does not type-check its fields; the vault tool reads them outside any plugin guard."""
+    return (isinstance(meta, VaultItemMeta) and meta.kind in VAULT_KINDS
+            and all(isinstance(getattr(meta, f), str) for f in ("id", "label", "created_at"))
+            and all(getattr(meta, f) is None or isinstance(getattr(meta, f), str)
+                    for f in ("origin", "identifier", "identifier_type"))
+            and isinstance(meta.has_otp, bool) and isinstance(meta.allowed_origins, tuple)
+            and all(isinstance(o, str) for o in meta.allowed_origins))
 
 
 class PluginBackendError(RuntimeError):
@@ -56,13 +66,15 @@ class PluginLoginBackend(LoginBackend):
 
     def list_items(self) -> list[VaultItemMeta]:
         items = self._call(lambda: list(self._plugin.list_items()))
-        return [m for m in items if isinstance(m, VaultItemMeta) and self.owns(m.id)]
+        self._require(all(_well_formed(m) for m in items))
+        return [m for m in items if self.owns(m.id)]
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         if not self.owns(handle):
             return None
         meta = self._call(lambda: self._plugin.get_meta(handle))
-        return meta if isinstance(meta, VaultItemMeta) and meta.id == handle else None
+        self._require(meta is None or _well_formed(meta))
+        return meta if meta is not None and meta.id == handle else None
 
     def resolve_password(self, handle: str) -> str:
         self._require_own(handle)
@@ -86,8 +98,8 @@ class PluginLoginBackend(LoginBackend):
     @contextmanager
     def fill_context(self):
         """The plugin's own context around one of ITS fills; it never sees the core's exception."""
-        context = self._call(self._plugin.fill_context)
-        self._call(context.__enter__)
+        context = self._call(lambda: self._plugin.fill_context())
+        self._call(lambda: context.__enter__())
         try:
             yield
         finally:

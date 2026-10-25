@@ -90,6 +90,29 @@ class Backend(LoginBackend):
 '''
 
 
+# Contract-breaking returns: a meta whose fields have the wrong types, and a non-context-manager fill_context.
+_MALFORMED_BACKEND = '''
+from agent.vault_backends.base import LoginBackend
+from agent.vault_store import VaultItemMeta
+
+class Backend(LoginBackend):
+    name, prefix, display_name = "broken", "broken:", "Broken"
+
+    def list_items(self):
+        return [VaultItemMeta(id="broken:1", kind="login", label="x", origin="https://example.com",
+                              created_at="2026-01-01T00:00:00Z", allowed_origins=None)]
+
+    def get_meta(self, handle):
+        return self.list_items()[0]
+
+    def fill_context(self):
+        return None
+
+    def resolve_password(self, handle):
+        return "unused"
+'''
+
+
 def _write_plugin(home, dirname, body, register):
     plugin = home / "plugins" / dirname
     plugin.mkdir(parents=True)
@@ -317,3 +340,15 @@ def test_plugin_secrets_never_reach_tool_results_or_logs(vault_home, page, caplo
         assert SECRET not in result and LEAK not in result, result
     assert SECRET not in caplog.text and LEAK not in caplog.text
     assert SECRET not in redact_registered_vault_values(f"page echoed {SECRET}")
+
+
+def test_a_plugin_breaking_its_contract_only_breaks_itself(vault_home, page):
+    home, local, load = vault_home
+    _write_plugin(home, "broken_vault", _MALFORMED_BACKEND, "    ctx.register_login_backend(Backend())\n")
+    load(["broken_vault"], {"broken": "true"})
+
+    listed = json.loads(_vault({"action": "list"}))
+    assert [i["handle"] for i in listed["items"]] == [local.id]
+    assert listed["errors"] == [{"backend": "broken", "error": "The broken login backend returned an invalid value."}]
+    out = json.loads(_vault({"action": "fill", "handle": "broken:1"}))
+    assert out["error_type"] == "backend_unavailable" and page.secret_evals == []
