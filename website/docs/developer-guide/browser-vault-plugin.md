@@ -1,37 +1,86 @@
 ---
 title: Browser Vault Plugins
-description: Explicit, profile-scoped login backends for trusted in-process plugins
+description: Add a password manager to browser_vault with ctx.register_login_backend, and the isolation rules it runs under
 ---
 
-Browser login backends are separate from startup provider secret sources. A
-`SecretSource` registration does not make a password manager available to
-`browser_vault`.
+# Browser Vault Plugins
 
-An **in-process** plugin may implement `agent.vault_backends.base.LoginBackend`
-and call `ctx.register_login_backend(instance)` in `register(ctx)`. The existing
-plugin registration ledger scopes it to the current home and disposes/restores
-registrations on unload/reload. Host-isolated plugin RPC is not supported by
-this extension because `fill_context()` is a server-local context manager.
+A plugin can add a password manager (KeePass, a team vault, a hardware-backed store) as a login
+source for the `browser_vault` tool. The agent then lists and fills that manager's logins the same way
+it does for the built-in Hermes vault, 1Password and Bitwarden: it sees handles and metadata, never a password.
 
-Every custom backend requires `vault.<name>.enabled: true`; installed code is
-never automatically enabled. Names must be lowercase identifiers; custom
-handle prefixes use `name:` syntax. Builtin names/prefixes and another backend's
-prefix cannot be claimed.
+Browser login backends are separate from [secret sources](./secret-source-plugin.md). A `SecretSource`
+registration does not make a password manager available to `browser_vault`.
 
-Construct the backend without fetching credentials or reading profile state.
-Read the active profile's config lazily. `list_items()` and `get_meta()` return
-only `VaultItemMeta` with exact HTTPS origins and opaque IDs. Passwords are
-resolved only through `resolve_password()` after the existing browser origin
-precheck. Exceptions must contain fixed diagnostics, never credential values or
-secret-manager response bodies.
+## Registering a backend
 
-`fill_context()` defaults to a no-op. A backend may override it to lock fills
-and freeze credential-reference/origin configuration for the entire operation.
-This prevents reload from pairing old metadata with a newly configured secret.
-The context must reset/release on failure. A fill lock does not serialize
-unrelated browser navigation; applications must separately establish ownership
-of their persistent browser profile.
+An **in-process** plugin subclasses `agent.vault_backends.base.LoginBackend` and registers one instance:
 
-The existing browser tool keeps its atomic in-page origin assertion, secret CDP
-evaluation with no argv fallback, and egress redaction registration. A plugin
-must not bypass those through a model-facing password-returning tool.
+```python
+from agent.vault_backends.base import LoginBackend
+from agent.vault_store import VaultItemMeta
+
+
+class KeePassBackend(LoginBackend):
+    name = "keepass"            # lowercase identifier; also the config key
+    prefix = "keepass:"         # must be exactly "<name>:"
+    display_name = "KeePass"
+
+    def list_items(self) -> list[VaultItemMeta]:
+        ...  # metadata only: ids "keepass:<opaque>", exact HTTPS origins, identifier
+
+    def get_meta(self, handle: str) -> VaultItemMeta | None:
+        ...
+
+    def resolve_password(self, handle: str) -> str:
+        ...  # called once per fill, after the page origin matched the item
+
+
+def register(ctx):
+    ctx.register_login_backend(KeePassBackend())
+```
+
+The backend stays off until the user turns it on for the profile:
+
+```yaml
+vault:
+  keepass:
+    enabled: true   # exactly true; installed code is never enabled automatically
+```
+
+Construct the backend without fetching credentials or reading profile state, and read the active
+profile's configuration lazily. Registration is profile-scoped and removed when the plugin unloads.
+
+## Isolation rules
+
+Hermes wraps every plugin backend in a core-owned adapter before the vault tool sees it. These rules
+hold however the plugin implements its class:
+
+| Rule | What it means for your backend |
+|---|---|
+| **Own namespace only** | Your handles are `<name>:…`. Hermes decides ownership from the registered name, so it never calls your `owns()` and never passes you a `vault_…` (Hermes vault), `op:…`, `bw:…` or another plugin's handle. Items your `list_items()` returns with an id outside your namespace are dropped, and a `get_meta()` answer whose id is not the requested handle is ignored. |
+| **Handle in, value out** | `list_items()` gets no arguments; `get_meta()`, `resolve_password()`, `resolve_otp()` and `resolve_secret()` get your handle and nothing else. You never receive the page, the CDP/browser session, the task, other vault entries, or decrypted values from any other backend. |
+| **No master-password prompt** | Hermes' unlock prompt is reserved for built-in managers. A backend with `needs_unlock = True` is refused at registration, and a plugin backend is never offered the `unlock` action, so the user is never asked to type a master password into a dialog a plugin labelled. Authenticate through your manager's own agent, session or OS keychain. |
+| **Reserved namespaces** | The names `local`, `onepassword`, `bitwarden`, `vault`, `op` and `bw`, and any prefix inside a built-in prefix (`vault_x:`), are refused. So is a name another plugin already holds in the profile: no backend, built-in or plugin, can be replaced or shadowed. `name` and `prefix` must be plain string attributes, not properties. |
+| **Off by default** | Only `vault.<name>.enabled: true` turns a backend on. |
+| **In-process only** | `ctx.register_login_backend` is refused under `plugins.isolation: host`, because `fill_context()` is a server-local context manager. |
+| **Same fill path** | Plugin items go through the same exact-origin pre-check, in-page origin re-assertion, supervisor CDP secret evaluation (never argv) and payment confirmation as built-in items. |
+| **Secrets stay out of the conversation** | Values you return are registered with the browser-result redaction boundary before they reach the page. Any exception your backend raises is replaced by a fixed message (`The <name> login backend failed.`) before it can reach a tool result, a log line or an exception chain, so a secret in your error text cannot reach the model. A value of the wrong type is refused the same way. |
+
+An in-process plugin is ordinary Python running inside Hermes, so these rules are an API contract,
+not a sandbox. They guarantee that Hermes never hands your backend another backend's data; they do not
+stop arbitrary code in the same process from reading files. Install password-manager plugins you trust.
+
+## Fill context
+
+`fill_context()` defaults to a no-op. A backend may return its own context manager to lock fills and
+freeze credential-reference/origin configuration for the whole operation, so a reload cannot pair old
+metadata with a newly configured secret. Hermes enters it only for fills of your own handles, calls it
+with no arguments, and exits it with `(None, None, None)`, so you never see the core's exception. Release
+on exit even when the fill failed. A fill lock does not serialize unrelated browser navigation.
+
+## Writing errors
+
+Raise exceptions with fixed diagnostics. Hermes discards your exception text, but your own logs may
+still record it, so never put credential values or secret-manager response bodies in it. Never expose
+a model-facing tool that returns a password: it would bypass every rule above.
