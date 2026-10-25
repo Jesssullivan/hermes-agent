@@ -86,7 +86,7 @@ hold however the plugin implements its class:
 | **Reserved namespaces** | The names `local`, `onepassword`, `bitwarden`, `vault`, `op` and `bw`, and any prefix inside a built-in prefix (`vault_x:`), are refused. So is a name another plugin already holds in the profile: no backend, built-in or plugin, can be replaced or shadowed. `name` and `prefix` must be plain string attributes, not properties, and the class may not override `__getattribute__` or `__class__`: Hermes judges the registration without running your code. |
 | **Off by default** | Only `vault.<name>.enabled: true` turns a backend on. |
 | **In-process only** | `ctx.register_login_backend` is refused under `plugins.isolation: host`, because `fill_context()` is a server-local context manager. |
-| **Same fill path** | Plugin items go through the same exact-origin pre-check, in-page origin re-assertion, supervisor CDP secret evaluation (never argv) and payment confirmation as built-in items. |
+| **Same fill path** | Plugin items (passwords and automatic one-time codes) go through the same exact-origin pre-check, in-page origin re-assertion, supervisor CDP secret evaluation (never argv) and payment confirmation as built-in items. |
 | **Secrets stay out of the conversation** | Values you return are registered with the browser-result redaction boundary before they reach the page. Any exception your backend raises is replaced by a fixed message (`The <name> login backend failed.`) before it can reach a tool result, a log line or an exception chain, so a secret in your error text cannot reach the model. A value of the wrong type is refused the same way. Hermes copies what you return (metadata fields, passwords, codes) into its own plain objects inside that same guard, so an error raised while a field is read gets the fixed message too. |
 
 An in-process plugin is ordinary Python running inside Hermes, so these rules are an API contract,
@@ -100,9 +100,12 @@ plugins Hermes offers this seam to; it is not a sandbox either.
 freeze credential-reference/origin configuration for the whole operation, so a reload cannot pair old
 metadata with a newly configured secret. Hermes enters it only for fills of your own handles (a
 password fill, and an automatic one-time code for `browser_vault action=enter_code`, both through the
-in-page write), calls it
-with no arguments, and exits it with `(None, None, None)`, so you never see the core's exception. Release
-on exit even when the fill failed. A fill lock does not serialize unrelated browser navigation.
+in-page write), and only after the page origin matched your item's `get_meta()`: a page on another
+origin never opens your context. Inside the context Hermes calls `get_meta()` again and refuses the
+fill unless the frozen item still binds that page origin, so the origins checked and the secret
+resolved come from one snapshot. It calls `fill_context()` with no arguments and exits it with
+`(None, None, None)`, so you never see the core's exception. Release on exit even when the fill
+failed. A fill lock does not serialize unrelated browser navigation.
 
 ## Writing errors
 

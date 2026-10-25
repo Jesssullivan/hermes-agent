@@ -8,7 +8,8 @@ browser's CDP boundary (page origin, input inspection, the secret eval) is faked
 1. a plugin backend only ever sees handles in its own ``<name>:`` namespace;
 2. it receives the handle and nothing else: no fill-context arguments, no master password;
 3. built-in names and handle prefixes are reserved, and a backend name cannot be taken over;
-4. it is off until ``vault.<name>.enabled: true``, refused in the plugin host, and origin-checked;
+4. it is off until ``vault.<name>.enabled: true``, refused in the plugin host, and origin-checked before
+   its ``fill_context`` is entered (fill and one-time code alike), then again inside it;
 5. its secret values never reach a tool result (the transcript) or the logs, and are redacted.
 """
 
@@ -238,9 +239,10 @@ def test_plugin_backend_gets_only_its_handle_never_unlock_material(vault_home, p
     alpha.calls.clear()
     out = json.loads(_vault({"action": "fill", "handle": "alpha:1"}))
     assert out["success"] is True and out["backend"] == "alpha"
-    assert [c[0] for c in alpha.calls] == ["fill_context", "get_meta", "resolve_password"]
-    assert alpha.calls[0] == ("fill_context", (), {})
-    assert all(c[1:] == ("alpha:1", (), {}) for c in alpha.calls[1:])
+    # metadata + origin guard, then the context, the in-context re-read, and only then the secret
+    assert [c[0] for c in alpha.calls] == ["get_meta", "fill_context", "get_meta", "resolve_password"]
+    assert alpha.calls[1] == ("fill_context", (), {})
+    assert all(c[1:] == ("alpha:1", (), {}) for c in alpha.calls if c[0] != "fill_context")
 
     # A plugin may not drive Hermes' master-password prompt: the user would be typing a password
     # into a dialog the plugin labelled (here "1Password").
@@ -323,7 +325,7 @@ def test_plugin_backend_is_off_until_enabled_refused_in_host_and_origin_checked(
     page.origin = "https://evil.example"
     out = json.loads(_vault({"action": "fill", "handle": "alpha:1"}))
     assert out["error_type"] == "origin_mismatch"
-    assert "resolve_password" not in [c[0] for c in alpha.calls]
+    assert [c[0] for c in alpha.calls] == ["get_meta"]  # refused before fill_context, before any secret
     page.origin = ORIGIN
     assert json.loads(_vault({"action": "fill", "handle": "alpha:1"}))["success"] is True
     assert len(page.secret_evals) == 1 and json.dumps(ORIGIN) in page.secret_evals[0]
@@ -376,7 +378,7 @@ class Backend(LoginBackend):
     name, prefix, display_name = "ctxvault", "ctxvault:", "Ctx"
 
     def __init__(self):
-        self.calls, self.active = [], False
+        self.calls, self.active, self.moved = [], False, False
 
     @contextlib.contextmanager
     def fill_context(self):
@@ -392,10 +394,13 @@ class Backend(LoginBackend):
         return [self.get_meta("ctxvault:1")]
 
     def get_meta(self, handle):
-        return VaultItemMeta(id=handle, kind="login", label="Ctx", origin="https://example.com",
+        # ``moved``: the manager's entry was re-bound to another site; the frozen snapshot shows it.
+        origin = "https://moved.example" if self.active and self.moved else "https://example.com"
+        return VaultItemMeta(id=handle, kind="login", label="Ctx", origin=origin,
                              created_at="2026-01-01T00:00:00Z", has_otp=True)
 
     def resolve_password(self, handle):
+        self.calls.append("resolve_password")
         return "unused"
 
     def resolve_otp(self, handle):
@@ -428,6 +433,44 @@ def test_plugin_otp_is_minted_and_written_inside_the_backends_fill_context(vault
     assert out["success"] is True and out["source"] == "ctxvault", out
     assert backend.calls == ["enter", "resolve_otp", "write", "exit"]
     assert code in page.secret_evals[0] and code not in json.dumps(out)
+
+
+def _ctx_backend(vault_home, page, monkeypatch, code="739251"):
+    from tools import browser_vault_tool
+
+    home, _local, load = vault_home
+    _write_plugin(home, "ctx_vault", _CONTEXT_BACKEND.format(code=code), "    ctx.register_login_backend(Backend())\n")
+    load(["ctx_vault"], {"ctxvault": "true"})
+    otp_field = {"autocomplete": "one-time-code", "formIndex": 0, "index": 0, "label": "", "name": "otp", "type": "text"}
+    monkeypatch.setattr(browser_vault_tool, "_eval_js",
+                        lambda task_id, expr: {"success": True, "result": json.dumps(_CONTROLS + [otp_field])})
+    return _backend("ctxvault")
+
+
+def test_plugin_otp_on_a_foreign_origin_is_refused_before_fill_context(vault_home, page, monkeypatch):
+    from agent.vault_backends import unlock as unlock_mod
+
+    backend = _ctx_backend(vault_home, page, monkeypatch)
+    page.origin = "https://evil.example"
+    asked = []
+    unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "000000")
+    try:
+        out = json.loads(_vault({"action": "enter_code", "handle": "ctxvault:1"}))
+    finally:
+        unlock_mod.set_code_prompt_callback(None)
+    assert out["error_type"] == "origin_mismatch", out
+    assert backend.calls == [] and page.secret_evals == [] and asked == []
+
+
+def test_an_item_rebound_inside_fill_context_is_refused_before_its_secret(vault_home, page, monkeypatch):
+    backend = _ctx_backend(vault_home, page, monkeypatch)
+    backend.moved = True
+    for args in ({"action": "fill", "handle": "ctxvault:1"}, {"action": "enter_code", "handle": "ctxvault:1"}):
+        backend.calls.clear()
+        out = json.loads(_vault(args))
+        assert out["error_type"] == "origin_mismatch", (args, out)
+        assert backend.calls == ["enter", "exit"], (args, backend.calls)
+    assert page.secret_evals == []
 
 
 _LAZY_META_BACKEND = '''

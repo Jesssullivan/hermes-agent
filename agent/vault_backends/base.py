@@ -39,7 +39,8 @@ class LoginBackend(ABC):
         return True
 
     def fill_context(self) -> AbstractContextManager:
-        """Optional profile-exclusive context covering origin check through CDP fill."""
+        """Optional profile-exclusive context, entered after the origin pre-check: covers the in-context
+        metadata re-check, secret resolution and the CDP write."""
         return nullcontext()
 
     @abstractmethod
