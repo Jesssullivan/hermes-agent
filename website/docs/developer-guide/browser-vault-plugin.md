@@ -98,7 +98,9 @@ plugins Hermes offers this seam to; it is not a sandbox either.
 
 `fill_context()` defaults to a no-op. A backend may return its own context manager to lock fills and
 freeze credential-reference/origin configuration for the whole operation, so a reload cannot pair old
-metadata with a newly configured secret. Hermes enters it only for fills of your own handles, calls it
+metadata with a newly configured secret. Hermes enters it only for fills of your own handles (a
+password fill, and an automatic one-time code for `browser_vault action=enter_code`, both through the
+in-page write), calls it
 with no arguments, and exits it with `(None, None, None)`, so you never see the core's exception. Release
 on exit even when the fill failed. A fill lock does not serialize unrelated browser navigation.
 

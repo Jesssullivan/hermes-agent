@@ -364,3 +364,68 @@ def test_a_plugin_breaking_its_contract_only_breaks_itself(vault_home, page):
     assert listed["errors"] == [{"backend": "broken", "error": "The broken login backend returned an invalid value."}]
     out = json.loads(_vault({"action": "fill", "handle": "broken:1"}))
     assert out["error_type"] == "backend_unavailable" and page.secret_evals == []
+
+
+# A manager session that only exists inside the backend's fill_context (an unlocked CLI session, a lock).
+_CONTEXT_BACKEND = '''
+import contextlib
+from agent.vault_backends.base import LoginBackend
+from agent.vault_store import VaultItemMeta
+
+class Backend(LoginBackend):
+    name, prefix, display_name = "ctxvault", "ctxvault:", "Ctx"
+
+    def __init__(self):
+        self.calls, self.active = [], False
+
+    @contextlib.contextmanager
+    def fill_context(self):
+        self.calls.append("enter")
+        self.active = True
+        try:
+            yield
+        finally:
+            self.active = False
+            self.calls.append("exit")
+
+    def list_items(self):
+        return [self.get_meta("ctxvault:1")]
+
+    def get_meta(self, handle):
+        return VaultItemMeta(id=handle, kind="login", label="Ctx", origin="https://example.com",
+                             created_at="2026-01-01T00:00:00Z", has_otp=True)
+
+    def resolve_password(self, handle):
+        return "unused"
+
+    def resolve_otp(self, handle):
+        self.calls.append("resolve_otp")
+        if not self.active:
+            raise RuntimeError("manager session is closed")
+        return "{code}"
+'''
+
+
+def test_plugin_otp_is_minted_and_written_inside_the_backends_fill_context(vault_home, page, monkeypatch):
+    from tools import browser_vault_tool
+
+    code = "739251"
+    home, _local, load = vault_home
+    _write_plugin(home, "ctx_vault", _CONTEXT_BACKEND.format(code=code), "    ctx.register_login_backend(Backend())\n")
+    load(["ctx_vault"], {"ctxvault": "true"})
+    backend = _backend("ctxvault")
+    otp_field = {"autocomplete": "one-time-code", "formIndex": 0, "index": 0, "label": "", "name": "otp", "type": "text"}
+    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr: {"success": True, "result": json.dumps([otp_field])})
+
+    def secret_eval(task_id, expression):
+        backend.calls.append("write")
+        page.secret_evals.append(expression)
+        return {"success": True, "result": json.dumps({"filled": 1})}
+
+    monkeypatch.setattr(browser_vault_tool, "_eval_js_secret", secret_eval)
+
+    out = json.loads(_vault({"action": "enter_code", "handle": "ctxvault:1"}))
+    assert out["success"] is True and out["source"] == "ctxvault", out
+    assert backend.calls == ["enter", "resolve_otp", "write", "exit"]
+    assert code in page.secret_evals[0] and code not in json.dumps(out)
+

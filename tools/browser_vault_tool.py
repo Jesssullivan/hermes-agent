@@ -379,43 +379,39 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                            "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
-    code: Optional[str] = None
-    source = "user"
-    if meta is not None:
-        try:
-            code = backend.resolve_otp(handle)
-        except Exception:
-            code = None
-        if code:
-            source = backend.name
+    def write(code: str, source: str) -> str:
+        register_vault_redaction_value(code)
+        fills = build_otp_fills(otp_controls, code)
+        result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+        del code
+        if not result.get("success"):
+            return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+        parsed = _parse_json_result(result.get("result"))
+        if isinstance(parsed, str):
+            parsed = _parse_json_result(parsed)
+        if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+            return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
+        filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+        return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
+                           "next": "Submit the form (many sites auto-submit when the last digit lands)."})
+
+    if meta is not None:  # a saved login on its bound origin: mint + write inside the backend's fill_context
+        written = write_backend_code(backend, handle, lambda code: write(code, backend.name))
+        if written is not None:
+            return written
+    prompt = get_code_prompt_callback()
+    if prompt is None or not can_prompt_here():
+        return json.dumps({"success": False, "error_type": "prompt_unavailable",
+                           "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
+                                     "Save an authenticator key for this login so codes can be generated automatically.")})
+    code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
     if not code:
-        prompt = get_code_prompt_callback()
-        if prompt is None or not can_prompt_here():
-            return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                               "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                         "Save an authenticator key for this login so codes can be generated automatically.")})
-        code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
-        if not code:
-            return json.dumps({"success": False, "error_type": "code_declined",
-                               "error": "The user did not enter a code. Do not ask again this turn."})
-
-    register_vault_redaction_value(code)
-    fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
-    del code
-    if not result.get("success"):
-        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
-    parsed = _parse_json_result(result.get("result"))
-    if isinstance(parsed, str):
-        parsed = _parse_json_result(parsed)
-    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
-        return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
-    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
-    return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
-                       "next": "Submit the form (many sites auto-submit when the last digit lands)."})
+        return json.dumps({"success": False, "error_type": "code_declined",
+                           "error": "The user did not enter a code. Do not ask again this turn."})
+    return write(code, "user")
 
 
-from tools.browser_vault_context import with_backend_fill_context
+from tools.browser_vault_context import with_backend_fill_context, write_backend_code
 
 
 @with_backend_fill_context
