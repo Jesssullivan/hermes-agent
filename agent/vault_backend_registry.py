@@ -3,8 +3,9 @@
 Registration (``ctx.register_login_backend``) is refused for: a name that is not a lowercase
 identifier, a handle prefix other than ``<name>:``, a name or prefix in a built-in backend's namespace,
 a name another plugin already holds in this profile, a backend that wants Hermes' master-password
-prompt (``needs_unlock``), and ``name``/``prefix`` computed by a descriptor (they could change after
-validation). ``enabled_plugin_backends`` re-checks every stored key and wraps each backend in
+prompt (``needs_unlock``), and ``name``/``prefix`` computed by a descriptor or an attribute-access hook
+(they could change after validation, and reading them would run plugin code; :func:`static_name` judges
+them before anything reads them). ``enabled_plugin_backends`` re-checks every stored key and wraps each backend in
 :class:`agent.vault_backends.plugin.PluginLoginBackend`, the only form the vault tool ever sees.
 """
 
@@ -41,17 +42,30 @@ def _namespace_error(name) -> str:
     return ""
 
 
-def register_provider(provider, *, scope=None):
-    if not isinstance(provider, LoginBackend):
+def static_name(provider) -> str:
+    """The backend's name, judged without running plugin code (``ValueError`` with a fixed message when refused).
+
+    Registration reads ``provider.name``; a property, a ``__getattribute__`` hook or a ``__class__`` override
+    would run the plugin's code there, outside any guard, and its exception text would reach the loader log.
+    """
+    cls = type(provider)
+    if not issubclass(cls, LoginBackend):
         raise ValueError("login backend must subclass LoginBackend")
+    if cls.__getattribute__ is not object.__getattribute__ or any("__class__" in vars(k) for k in cls.__mro__[:-1]):
+        raise ValueError("login backend must not override attribute access")
     name, prefix = inspect.getattr_static(provider, "name", None), inspect.getattr_static(provider, "prefix", None)
-    if not isinstance(name, str) or not isinstance(prefix, str):
+    if type(name) is not str or type(prefix) is not str:
         raise ValueError("login backend name and prefix must be plain string attributes")
     error = _namespace_error(name) or ("" if prefix == f"{name}:" else "login backend prefix must be '<name>:'")
     if error:
         raise ValueError(error)
     if inspect.getattr_static(provider, "needs_unlock", False) is not False:
         raise ValueError("plugin login backends cannot use the Hermes master-password prompt (needs_unlock)")
+    return name
+
+
+def register_provider(provider, *, scope=None):
+    name = static_name(provider)
     if name in _registry.merged(scope):
         raise ValueError(f"login backend name {name!r} is already registered")
     _registry.register(provider, scope=scope)

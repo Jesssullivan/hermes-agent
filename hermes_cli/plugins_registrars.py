@@ -6,7 +6,9 @@ the displaced entry. ``hermes_cli.plugins`` generates one ctx method per row. Ro
 registry module, base-class module:attr, label, docstring, options). ``normalize``: ``strip``
 (default), ``lower`` (strip+lowercase) or ``None`` (raw name). ``admit``: ``module:function`` taking
 the plugin's manifest and returning why it may not register this kind ("" = it may), judged under the
-manager's home before the registry is touched. Object-taking rows also need a
+manager's home before the registry is touched. ``identity``: a registry function judging the provider's
+name without running its code, before the shared body reads ``provider.name`` (``ValueError`` = refused,
+logged with ``reject_message``). Object-taking rows also need a
 ``plugin_isolation.HOST_OBJECT_BASES`` entry so the provider works under ``plugins.isolation: host``.
 """
 
@@ -28,7 +30,7 @@ _SCOPED_PROVIDER_REGISTRARS: tuple[tuple[str, str, str, str, str, str, dict[str,
      "Backend instances must read active-profile configuration lazily. Accepted only from bundled "
      "plugins and catalog installs at tier verified or official.",
      {"normalize": None, "reject_message": "Plugin '%s' login backend rejected: %s",
-      "admit": "hermes_cli.plugins_cmd_catalog:login_backend_provenance_error"}),
+      "admit": "hermes_cli.plugins_cmd_catalog:login_backend_provenance_error", "identity": "static_name"}),
     ("register_image_gen_provider", "image_gen_provider", "agent.image_gen_registry",
      "agent.image_gen_provider:ImageGenProvider", "image_gen provider",
      "Register an :class:`agent.image_gen_provider.ImageGenProvider`; "
@@ -95,7 +97,7 @@ def make_scoped_provider_registrar(method_name, kind, registry_mod, base_ref, la
     """Build one ``register_<category>_provider`` method from a ``_SCOPED_PROVIDER_REGISTRARS`` row."""
     normalize_fn = _NAME_NORMALIZERS[options.get("normalize", "strip")]
     register_name = options.get("register")
-    admit = options.get("admit")
+    admit, identity = options.get("admit"), options.get("identity")
 
     def register(self, provider):
         if admit:
@@ -105,6 +107,12 @@ def make_scoped_provider_registrar(method_name, kind, registry_mod, base_ref, la
                 logger.warning(options["reject_message"], self.manifest.name, refusal)
                 return None
         registry = importlib.import_module(registry_mod)
+        if identity:
+            try:
+                getattr(registry, identity)(provider)
+            except ValueError as exc:
+                logger.warning(options["reject_message"], self.manifest.name, exc)
+                return None
         return self._register_scoped_provider(
             provider, kind=kind, base_class=_resolve(base_ref),
             registry=registry, label=label, article=options.get("article", "a"), normalize=normalize_fn,

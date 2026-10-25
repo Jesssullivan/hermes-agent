@@ -465,3 +465,40 @@ def test_errors_reading_plugin_metadata_get_the_fixed_message(vault_home, page):
     assert json.loads(listed)["errors"] == [{"backend": "lazy", "error": "The lazy login backend failed."}]
     assert json.loads(filled)["error_type"] == "backend_unavailable" and page.secret_evals == []
 
+
+_COMPUTED_NAME_BACKENDS = '''
+from agent.vault_backends.base import LoginBackend
+
+class Base(LoginBackend):
+    prefix, display_name = "computed:", "Computed"
+    def list_items(self):
+        return []
+    def get_meta(self, handle):
+        return None
+    def resolve_password(self, handle):
+        return "unused"
+
+class PropertyName(Base):
+    @property
+    def name(self):
+        raise RuntimeError("manager said {leak}")
+
+class HookedName(Base):
+    name = "computed"
+    def __getattribute__(self, field):
+        if field == "name":
+            raise RuntimeError("manager said {leak}")
+        return super().__getattribute__(field)
+'''
+
+
+def test_registration_judges_the_name_without_running_plugin_code(vault_home, caplog):
+    home, _local, load = vault_home
+    _write_plugin(home, "computed_vault", _COMPUTED_NAME_BACKENDS.format(leak=LEAK),
+                  "    ctx.register_login_backend(PropertyName())\n    ctx.register_login_backend(HookedName())\n")
+    caplog.set_level(logging.DEBUG)
+    load(["computed_vault"], {"computed": "true"})
+
+    assert _backend("computed") is None
+    assert LEAK not in caplog.text
+    assert caplog.text.count("login backend rejected") == 2
