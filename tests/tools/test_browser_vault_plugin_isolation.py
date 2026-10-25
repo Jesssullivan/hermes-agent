@@ -118,6 +118,18 @@ def _write_plugin(home, dirname, body, register):
     plugin.mkdir(parents=True)
     (plugin / "plugin.yaml").write_text(f"name: {dirname}\n", encoding="utf-8")
     (plugin / "__init__.py").write_text(body + "\n\ndef register(ctx):\n" + register, encoding="utf-8")
+    _record_verified_install(home, dirname)
+
+
+def _record_verified_install(home, dirname):
+    """The installer-owned record a catalog install at tier ``verified`` leaves (login backends need one)."""
+    path = home / "plugins" / ".install-metadata.json"
+    records = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    sha = "a" * 40
+    records[dirname] = {"source": f"https://github.com/example/{dirname}", "revision": sha, "pinned": True,
+                        "catalog": {"name": dirname, "repo": f"https://github.com/example/{dirname}",
+                                    "tier": "verified", "pin": sha, "sha": sha}}
+    path.write_text(json.dumps(records), encoding="utf-8")
 
 
 def _write_config(home, plugins, vault):
