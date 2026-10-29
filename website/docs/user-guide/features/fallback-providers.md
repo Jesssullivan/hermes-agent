@@ -344,12 +344,21 @@ When you set an explicit auxiliary provider (e.g. `auxiliary.vision.provider: gl
 
 1. **Primary aux provider** — the one you configured (tried first, always)
 2. **`auxiliary.<task>.fallback_chain`** — your per-task override list, if you wrote one
-3. **Main agent provider + model** — last-resort safety net (always tried, even if you didn't write a chain)
+3. **Main agent provider + model** — last-resort safety net (tried even if you didn't write a chain, unless `auxiliary.main_model_fallback: false`)
 4. **Warn + re-raise** — if every layer fails, Hermes logs `Auxiliary <task>: ... all fallbacks exhausted` at WARNING level and re-raises the original error
 
 Transient HTTP 429 rate limits (`Retry-After: ...`) are treated as request constraints, not capacity problems — they respect your explicit provider choice and do **not** trigger the fallback ladder. Only daily/monthly quota exhaustion, payment errors, and connection failures bypass the explicit-provider gate.
 
 **Auth errors (HTTP 401) on an explicit provider** walk only step 2: if you wrote `auxiliary.<task>.fallback_chain`, its entries are tried in order (and a chain entry that dies mid-request hands off to the next one); the main agent model and the auto-detection chain are never consulted, because you did not opt that task into them. Without a chain the task fails on the auth error as before. Auth is credential-wide, so chain entries on the same provider label are skipped — point the spare at a different provider (a separate `providers:` entry counts).
+
+**Keeping side traffic off the main model.** `auxiliary.main_model_fallback: false` removes step 3 for every auxiliary slot: when the slot's own `fallback_chain` is exhausted (or absent), the call fails with its primary error, Hermes logs a WARNING naming the key, and the main agent model receives no request. Use it when the main model's quota must not absorb background traffic, for example an on-prem auxiliary endpoint that answers capacity errors while its GPU is busy. The compressor's own one-shot retry on the main model is a separate net, turned off with `compression.main_model_fallback: false`:
+
+```yaml
+auxiliary:
+  main_model_fallback: false   # default true
+compression:
+  main_model_fallback: false   # default true
+```
 
 For users on `provider: auto` (no explicit aux provider), the existing auto-detection chain runs in place of steps 2–3. Its first step is already the main agent model, so `auto` users get the same outcome with zero config.
 
@@ -451,7 +460,7 @@ To keep fallback for a job, leave it unpinned and choose its model with `cron.mo
 |---------|-------------------|----------------|
 | Main agent model | `fallback_providers` in config.yaml — per-turn failover on errors (primary restored each turn) | `fallback_providers:` (top-level list) |
 | Auxiliary tasks (any) — auto users | Full auto-detection chain (main agent model first, then provider chain) on capacity errors | `auxiliary.<task>.provider: auto` |
-| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → warn + raise, on capacity errors; auth errors (401) walk `fallback_chain` only | `auxiliary.<task>.fallback_chain` |
+| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model (unless `auxiliary.main_model_fallback: false`) → warn + raise, on capacity errors; auth errors (401) walk `fallback_chain` only | `auxiliary.<task>.fallback_chain`, `auxiliary.main_model_fallback` |
 | Vision | Layered (see above) + internal OpenRouter retry | `auxiliary.vision` |
 | Context compression | Layered (see above); degrades to no-summary if all layers unavailable | `auxiliary.compression` |
 | Skills hub | Layered (see above) | `auxiliary.skills_hub` |

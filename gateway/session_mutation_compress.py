@@ -74,7 +74,8 @@ async def prepare_compress(authority, live, payload, prepared):
                 api_mode=runtime.get('api_mode') or '', quiet_mode=True, abort_on_summary_failure=True,
                 protect_first_n=options.get('protect_first_n', 3), protect_last_n=options.get('protect_last_n', 20),
                 min_tail_user_messages=max(1, _parse_config_int(options.get('min_tail_user_messages', 1), 1)),
-                custom_providers=config.get('custom_providers'))
+                custom_providers=config.get('custom_providers'),
+                main_model_fallback=is_truthy_value(options.get('main_model_fallback'), default=True))
             compressed = compressor.compress(json.loads(json.dumps(head)), force=True,
                                                focus_topic=request.focus_topic, memory_context=memory_context)
             if not any(m.get('_compressed_summary') for m in compressed):

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 
 if TYPE_CHECKING:
     from agent.context_compressor import _HandoffScan
+
+logger = logging.getLogger(__name__)
 
 
 def _accepts_keyword_argument(callable_obj: Any, name: str) -> bool:
@@ -27,6 +30,32 @@ def _accepts_keyword_argument(callable_obj: Any, name: str) -> bool:
 
 
 class SummaryDispatchMixin:
+    def _summary_main_retry_allowed(self, e: Exception, route_model: str) -> bool:
+        """Whether a failed summary gets its one retry on the main model.
+
+        A distinct summary route that has not yet fallen back is retried once on the main model
+        unless ``compression.main_model_fallback`` is false. Then the failure stands: no request
+        reaches the main model, and the recorded error names the key (``_summary_failure_text``)."""
+        self._summary_main_retry_refused = False
+        if not route_model or route_model == self.model or getattr(self, "_summary_model_fallen_back", False):
+            return False
+        if getattr(self, "main_model_fallback", True):
+            return True
+        self._summary_main_retry_refused = True
+        logger.warning(
+            "Summary model '%s' failed (%s); main-model retry is off (compression.main_model_fallback: "
+            "false), so no request goes to main model '%s'.", route_model, e, self.model,
+        )
+        return False
+
+    def _summary_failure_text(self, e: Exception) -> str:
+        from agent.context_compressor import _short_error_text
+
+        text = _short_error_text(e)
+        if getattr(self, "_summary_main_retry_refused", False):
+            return f"{text} (main-model retry off: compression.main_model_fallback is false)"
+        return text
+
     def _apply_summary_route(self, call_kwargs: dict, pinned: Optional[dict[str, Any]] = None) -> None:
         """Pin the summary route onto ``call_kwargs`` for both compression entry points.
 

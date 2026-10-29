@@ -204,6 +204,17 @@ attempt anyway:
   compaction rebinds the compressor and resets the ladder count, so each
   compaction cycle grants the LLM route one stall before escalating; the
   persisted cooldown row still paces attempts across turns and restarts.
+- **No main-model retry when `compression.main_model_fallback: false`.** A
+  summary that fails on a distinct compression model normally gets one retry
+  on the main model (`_on_summary_failure` →
+  `_fallback_to_main_for_compression`). With the key false
+  (`ContextCompressor(main_model_fallback=False)`, set by `agent_init` and the
+  gateway's manual `/compress`), the failure stands: the cooldown is armed,
+  `_last_summary_error` names the key, `abort_on_summary_failure` decides
+  between abort and the deterministic fallback, and the main model receives no
+  request. The auxiliary ladder's own main-agent net for the compression slot
+  is `auxiliary.main_model_fallback`; a deployment that must keep compression
+  off the main model sets both.
 - **Summary provider overloaded → abort, transcript kept.** When the summary
   call fails with a provider-overload error (`overloaded`, `at capacity`,
   HTTP 529) and the one-shot main-model retry also fails, compress() aborts

@@ -55,7 +55,8 @@ def _get_auxiliary_task_config(task: str, _seen: frozenset = frozenset()) -> dic
     return config
 
 
-def _task_config(task: str, _seen: frozenset) -> dict[str, Any]:
+def _auxiliary_section() -> dict[str, Any]:
+    """The session's frozen ``auxiliary:`` section, else the active profile's config.yaml one."""
     aux = _SESSION_AUXILIARY.get()
     if aux is None:
         try:
@@ -64,7 +65,30 @@ def _task_config(task: str, _seen: frozenset) -> dict[str, Any]:
         except ImportError:
             return {}
         aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
-    task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
+    return aux if isinstance(aux, dict) else {}
+
+
+def main_model_fallback_refused(task: str | None, reason: str, failed_provider: str) -> bool:
+    """True when ``auxiliary.main_model_fallback`` is false (default true).
+
+    The main-agent model is the last-resort net for an explicit-provider aux slot whose own
+    ``fallback_chain`` is exhausted. A deployment that must keep side traffic off the main
+    model's quota (an on-prem slot that answers capacity errors while its GPU is busy) turns
+    the net off for every slot: the call then fails closed with its primary error, and no
+    request reaches the main model."""
+    from utils import is_truthy_value
+
+    if is_truthy_value(_auxiliary_section().get("main_model_fallback"), default=True):
+        return False
+    logger.warning(
+        "Auxiliary %s: %s on %s; main-model fallback is off (auxiliary.main_model_fallback: false), "
+        "so no request goes to the main agent model", task or "call", reason, failed_provider)
+    return True
+
+
+def _task_config(task: str, _seen: frozenset) -> dict[str, Any]:
+    aux = _auxiliary_section()
+    task_config = aux.get(task, {})
     if not isinstance(task_config, dict):
         task_config = {}
     try:
