@@ -757,7 +757,7 @@ DEFAULT_CONFIG = {
         # When true, the auto-chain's OpenRouter step is skipped unless the fallback model ends in ":free" —
         # a PAID lane is never used for background aux traffic even with OPENROUTER_API_KEY set.
         "free_only": False,
-        "main_model_fallback": True,  # False: no slot retries on the main agent model once its own chain is exhausted
+        "main_model_fallback": True,  # False: no explicit-provider slot falls back to the main model (auto slots still use it)
         # Override the auto-chain's OpenRouter fallback model (default google/gemini-3.6-flash,
         # PAID). Pair e.g. "nvidia/nemotron-3-ultra-550b-a55b:free" with free_only: true. A one-time
         # WARNING is logged whenever a non-":free" model is engaged.

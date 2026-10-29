@@ -351,7 +351,7 @@ Transient HTTP 429 rate limits (`Retry-After: ...`) are treated as request const
 
 **Auth errors (HTTP 401) on an explicit provider** walk only step 2: if you wrote `auxiliary.<task>.fallback_chain`, its entries are tried in order (and a chain entry that dies mid-request hands off to the next one); the main agent model and the auto-detection chain are never consulted, because you did not opt that task into them. Without a chain the task fails on the auth error as before. Auth is credential-wide, so chain entries on the same provider label are skipped — point the spare at a different provider (a separate `providers:` entry counts).
 
-**Keeping side traffic off the main model.** `auxiliary.main_model_fallback: false` removes step 3 for every auxiliary slot: when the slot's own `fallback_chain` is exhausted (or absent), the call fails with its primary error, Hermes logs a WARNING naming the key, and the main agent model receives no request. Use it when the main model's quota must not absorb background traffic, for example an on-prem auxiliary endpoint that answers capacity errors while its GPU is busy. The compressor's own one-shot retry on the main model is a separate net, turned off with `compression.main_model_fallback: false`:
+**Keeping side traffic off the main model.** `auxiliary.main_model_fallback: false` removes step 3 for every slot with an explicit provider: when the slot's own `fallback_chain` is exhausted (or absent), the call fails with its primary error, Hermes logs a WARNING naming the key, and the main agent model receives no request. The key also turns off the auto-detection rescue of an explicit slot that cannot build a client at all (for example bare `openrouter` or `custom` with no credentials and no `base_url`, or a hosted vision provider whose key is missing), because that rescue starts at the main model; the call raises instead. Use it when the main model's quota must not absorb background traffic, for example an on-prem auxiliary endpoint that answers capacity errors while its GPU is busy. The compressor's own one-shot retry on the main model is a separate net, turned off with `compression.main_model_fallback: false`:
 
 ```yaml
 auxiliary:
@@ -359,6 +359,8 @@ auxiliary:
 compression:
   main_model_fallback: false   # default true
 ```
+
+The key covers only the explicit-slot nets. A slot left on `provider: auto`, including every slot you never pinned and every plugin-registered task that stays on auto, still sends its requests to the main model, because auto means the main model by design. To keep all side traffic off the main model, pin every slot you use to an explicit provider, `vision`, `review`, `moa_reference` and `moa_aggregator` included.
 
 For users on `provider: auto` (no explicit aux provider), the existing auto-detection chain runs in place of steps 2–3. Its first step is already the main agent model, so `auto` users get the same outcome with zero config.
 
