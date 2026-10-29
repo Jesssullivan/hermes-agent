@@ -4298,8 +4298,6 @@ def _try_main_agent_model_fallback(
     """Last-resort fallback to the main agent provider + model after the configured chain is exhausted.
     ``failed_model`` scoping per ``_failed_backend_skip``; same-URL custom endpoints serve many models,
     so a hung aux model says nothing about the main model's health. Returns (client, model, label) or (None, None, "")."""
-    if main_model_fallback_refused(task, reason, failed_provider):
-        return None, None, ""
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
     if main_provider.lower() == "moa":
@@ -4324,6 +4322,8 @@ def _try_main_agent_model_fallback(
         return None, None, ""
     if _is_provider_unhealthy(main_provider, main_base_url):
         _log_skip_unhealthy(main_provider, task, base_url=main_base_url)
+        return None, None, ""
+    if main_model_fallback_refused(task, reason, failed_provider):  # after the no-op checks
         return None, None, ""
     try:
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
@@ -6257,7 +6257,8 @@ _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 
 # Read-time resolution of auxiliary.<task> (plugin defaults, inherit_from) lives in its own module;
 # re-exported here because callers and tests reach it as agent.auxiliary_client._get_auxiliary_task_config.
-from agent.auxiliary_task_config import _get_auxiliary_task_config, main_model_fallback_refused
+from agent.auxiliary_task_config import (
+    _get_auxiliary_task_config, exhausted_layers, main_model_fallback_refused, refuse_auto_rescue_off_main)
 
 
 class CompressionFastLane(NamedTuple):
@@ -7403,8 +7404,8 @@ def _resolve_call_client(
             api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
-            logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
-                           resolved_provider)
+            refuse_auto_rescue_off_main(task, resolved_provider)  # auto vision starts at the main provider
+            logger.warning("Vision provider %s unavailable, falling back to auto vision backends", resolved_provider)
             effective_provider, client, final_model = resolve_vision_provider_client(
                 provider="auto", model=resolved_model, async_mode=async_mode,
                 main_runtime=main_runtime)
@@ -7417,8 +7418,7 @@ def _resolve_call_client(
             task=task)
         effective_provider = _effective_provider_for_client(client, resolved_provider)
         if client is None:
-            # Explicit provider with no credentials: honor the task fallback_chain before
-            # raising (fallback entries may use OAuth / credential-pool auth).
+            # Explicit provider, no credentials: honor the task fallback_chain (OAuth / pool auth) before raising.
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
@@ -7433,9 +7433,9 @@ def _resolve_call_client(
                         fb_client, fb_model or "", is_vision=(task == "vision"))
                 resolved_provider = fb_label or resolved_provider
                 effective_provider = resolved_provider
-            # Auto/custom with no credentials: walk the full auto chain (not just OpenRouter).
-            # model=None so each provider uses its own default.
+            # Auto/custom, no credentials: the full auto chain (main model first), model=None per provider default.
             if client is None and not resolved_base_url:
+                refuse_auto_rescue_off_main(task, resolved_provider)
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client(
@@ -7916,8 +7916,8 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
             task_chain_only=explicit_auth_with_task_chain)
     # All fallback layers exhausted: one user-visible warning (#26882), then the caller re-raises.
-    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted (fallback_chain + main agent model). "
-                   "Raising the primary error.", task or "call", tag, reason, resolved_provider)
+    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted (%s). Raising the primary error.",
+                   task or "call", tag, reason, resolved_provider, exhausted_layers(is_auto))
     if primary_route is not None and route.route_info is not None:
         route.route_info.update(primary_route)
     return None

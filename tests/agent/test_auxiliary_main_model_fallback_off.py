@@ -6,6 +6,10 @@ the main agent model once its own ``fallback_chain`` is exhausted, and a compres
 fails on a distinct compression model retries once on the main model. Both nets stay on by
 default. With the keys false, the call fails closed and the main model receives no request.
 
+The key covers only the explicit-slot nets: the ladder's main-agent net and the resolution-time
+auto-detection rescue of an explicit slot that cannot build a client (text and vision). A slot on
+``provider: auto`` (and a plugin task left on auto) still uses the main model by design.
+
 Real imports against a temp ``HERMES_HOME``, loopback fakes and synthetic keys only.
 """
 
@@ -20,12 +24,22 @@ import hermes_yaml as yaml
 MAIN_MODEL = "main-chat-model"
 ONPREM_MODEL = "onprem-aux-model"
 
-# Every text slot the auxiliary ladder serves except compression (probed on its own below).
+# The built-in text slots (DEFAULT_CONFIG["auxiliary"]) probed here. Left out: compression and
+# vision (probed on their own below) and moa_reference / moa_aggregator (MoA advisor pins).
 AUX_TEXT_SLOTS = (
     "skills_hub", "approval", "mcp", "title_generation", "memory_query_rewrite", "tts_audio_tags",
     "voice_chat", "triage_specifier", "kanban_decomposer", "profile_describer", "goal_judge",
-    "curator", "monitor", "background_review",
+    "curator", "monitor", "background_review", "review",
 )
+
+# Credentials the auto-detection chain could otherwise pick up from the test environment.
+_AMBIENT_CREDENTIALS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL")
+
+# A 1x1 PNG, so the vision slot carries a real image part.
+_PIXEL = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+          "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+_VISION_MESSAGES = [{"role": "user", "content": [
+    {"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": _PIXEL}}]}]
 
 
 def _serve(status):
@@ -102,7 +116,7 @@ def endpoints(monkeypatch):
             thread.join(timeout=5)
 
 
-def _write_config(home, main_url, onprem_url, *, aux_key=None, compression_key=None):
+def _write_config(home, main_url, onprem_url, *, aux_key=None, compression_key=None, slots=None):
     slot = {"provider": "custom:onprem", "model": ONPREM_MODEL, "timeout": 5}
     config = {
         "model": {"provider": "custom:main", "default": MAIN_MODEL, "context_length": 128000},
@@ -115,6 +129,7 @@ def _write_config(home, main_url, onprem_url, *, aux_key=None, compression_key=N
                       **{task: dict(slot) for task in AUX_TEXT_SLOTS}},
         "compression": {},
     }
+    config["auxiliary"].update(slots or {})
     if aux_key is not None:
         config["auxiliary"]["main_model_fallback"] = aux_key
     if compression_key is not None:
@@ -136,7 +151,7 @@ def _call_every_slot():
 
 
 def test_closed_onprem_slots_retry_on_main_model_by_default(tmp_path, monkeypatch, endpoints):
-    """Upstream default kept: each of the 14 slots answers through the main model."""
+    """Upstream default kept: each probed slot answers through the main model."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     main_url, main_seen = endpoints["main"]
     _write_config(tmp_path, main_url, _closed_port_url())
@@ -247,3 +262,105 @@ def test_closed_onprem_compression_needs_both_keys_off(tmp_path, monkeypatch, en
     assert compressor._generate_summary(list(_TURNS)) is None
 
     assert main_seen == []
+
+
+# ── Resolution-time rescue: an explicit slot that cannot build a client ──────────────────────
+# Bare ``openrouter`` / ``custom`` with no credentials and no base_url are re-resolved on the
+# auto chain (text) or the auto vision route, and both start at the main provider.
+
+def _unconfigured(monkeypatch, tmp_path, endpoints, task, provider, aux_key):
+    for name in _AMBIENT_CREDENTIALS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    main_url, main_seen = endpoints["main"]
+    _write_config(tmp_path, main_url, _closed_port_url(), aux_key=aux_key,
+                  slots={task: {"provider": provider, "model": "x-model", "timeout": 5}})
+    return main_seen
+
+
+def _call(task, messages):
+    from agent.auxiliary_client import call_llm
+
+    return call_llm(task=task, messages=messages, timeout=5)
+
+
+_TEXT_MESSAGES = [{"role": "user", "content": "side task"}]
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "custom"])
+def test_unconfigured_explicit_text_slot_rescued_on_main_model_by_default(
+    tmp_path, monkeypatch, endpoints, provider,
+):
+    main_seen = _unconfigured(monkeypatch, tmp_path, endpoints, "curator", provider, None)
+
+    resp = _call("curator", _TEXT_MESSAGES)
+
+    assert resp.choices[0].message.content == "main model answered"
+    assert main_seen == [MAIN_MODEL]
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "custom"])
+def test_unconfigured_explicit_text_slot_fails_closed_when_main_model_fallback_off(
+    tmp_path, monkeypatch, endpoints, caplog, provider,
+):
+    from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
+
+    main_seen = _unconfigured(monkeypatch, tmp_path, endpoints, "curator", provider, False)
+
+    with caplog.at_level("WARNING"), pytest.raises(AuxiliaryClientUnavailable, match="main_model_fallback"):
+        _call("curator", _TEXT_MESSAGES)
+
+    assert main_seen == []
+    assert any("auxiliary.main_model_fallback: false" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "custom"])
+def test_unconfigured_explicit_vision_slot_rescued_on_main_provider_by_default(
+    tmp_path, monkeypatch, endpoints, provider,
+):
+    main_seen = _unconfigured(monkeypatch, tmp_path, endpoints, "vision", provider, None)
+
+    resp = _call("vision", _VISION_MESSAGES)
+
+    assert resp.choices[0].message.content == "main model answered"
+    assert main_seen  # the auto vision route reached the main endpoint
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "custom"])
+def test_unconfigured_explicit_vision_slot_fails_closed_when_main_model_fallback_off(
+    tmp_path, monkeypatch, endpoints, caplog, provider,
+):
+    from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
+
+    main_seen = _unconfigured(monkeypatch, tmp_path, endpoints, "vision", provider, False)
+
+    with caplog.at_level("WARNING"), pytest.raises(AuxiliaryClientUnavailable, match="main_model_fallback"):
+        _call("vision", _VISION_MESSAGES)
+
+    assert main_seen == []
+    assert any("auxiliary.main_model_fallback: false" in r.getMessage() for r in caplog.records)
+
+
+def test_closed_onprem_vision_slot_fails_closed_when_main_model_fallback_off(tmp_path, monkeypatch, endpoints):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    main_url, main_seen = endpoints["main"]
+    _write_config(tmp_path, main_url, _closed_port_url(), aux_key=False,
+                  slots={"vision": {"provider": "custom:onprem", "model": ONPREM_MODEL, "timeout": 5}})
+
+    with pytest.raises(Exception):
+        _call("vision", _VISION_MESSAGES)
+
+    assert main_seen == []
+
+
+def test_exhaustion_warning_says_the_main_model_net_is_off(tmp_path, monkeypatch, endpoints, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    main_url, _main_seen = endpoints["main"]
+    _write_config(tmp_path, main_url, _closed_port_url(), aux_key=False)
+
+    with caplog.at_level("WARNING"), pytest.raises(Exception):
+        _call("curator", _TEXT_MESSAGES)
+
+    exhausted = [r.getMessage() for r in caplog.records if "all fallbacks exhausted" in r.getMessage()]
+    assert exhausted and all("main-model fallback is off" in m for m in exhausted), exhausted
+    assert not any("fallback_chain + main agent model" in m for m in exhausted)
