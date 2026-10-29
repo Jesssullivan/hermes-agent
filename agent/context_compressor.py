@@ -2816,7 +2816,7 @@ class ContextCompressor(
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        custom_providers: list | None = None, main_model_fallback: bool = True,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
@@ -2859,7 +2859,7 @@ class ContextCompressor(
         # (#43547) Coerce defensively: only a positive int is a real reservation; any other value (None,
         # non-numeric, <=0) means "no reservation" so the threshold arithmetic never sees a non-int (e.g. a
         # test MagicMock).
-        self.abort_on_summary_failure = abort_on_summary_failure
+        self.abort_on_summary_failure, self.main_model_fallback = abort_on_summary_failure, main_model_fallback
 
         # Micro-compaction is OFF by default: each pass breaks the prompt-cache prefix every turn.
         self._micro_compact_enabled = False
@@ -4123,15 +4123,15 @@ Write only the summary body. Do not include any preamble or prefix."""
                 "summary_model=%s main_model=%s base_url=%s err=%s",
                 self.provider or "auto", self.summary_model or "(main)", self.model, self.base_url or "default", e,
             )
-        # A distinct summary model gets ONE main-model retry: a specific reason for known transient classes,
-        # else a best-effort "failed" retry — losing N turns is worse than one extra summary attempt.
+        # A distinct summary model gets ONE main-model retry (unless compression.main_model_fallback is false): a specific
+        # reason for known transient classes, else a best-effort "failed" retry — losing N turns is worse than one more attempt.
         # ``provider: auto`` resolves a model per call WITHOUT setting ``summary_model``; use the model the
         # aux lane actually resolved so an auto route that keeps returning empty content (a proxy channel
         # answering 200 with no body) is abandoned for the main model instead of retried forever (#116472).
         _route_model = str(
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
-        if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
+        if self._summary_main_retry_allowed(e, _route_model):
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
             # Retry immediately on the main model.
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
@@ -4145,7 +4145,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             _transient_cooldown = _next_timeout_cooldown(self, "_consecutive_truncation_failures")
         else:
             _transient_cooldown = 30 if (kind.json_decode or kind.streaming_closed or kind.empty_content) else 60
-        err_text = _short_error_text(e)
+        err_text = self._summary_failure_text(e)
         self._record_compression_failure_cooldown(_transient_cooldown, err_text)
         self._last_summary_error = err_text
         # Terminal network/empty-content failure after any fallback: flag so compress() ABORTS

@@ -55,7 +55,8 @@ def _get_auxiliary_task_config(task: str, _seen: frozenset = frozenset()) -> dic
     return config
 
 
-def _task_config(task: str, _seen: frozenset) -> dict[str, Any]:
+def _auxiliary_section() -> dict[str, Any]:
+    """The session's frozen ``auxiliary:`` section, else the active profile's config.yaml one."""
     aux = _SESSION_AUXILIARY.get()
     if aux is None:
         try:
@@ -64,7 +65,62 @@ def _task_config(task: str, _seen: frozenset) -> dict[str, Any]:
         except ImportError:
             return {}
         aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
-    task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
+    return aux if isinstance(aux, dict) else {}
+
+
+def main_model_fallback_enabled() -> bool:
+    """``auxiliary.main_model_fallback`` (default true), read without logging."""
+    from utils import is_truthy_value
+
+    return is_truthy_value(_auxiliary_section().get("main_model_fallback"), default=True)
+
+
+def main_model_fallback_refused(task: str | None, reason: str, failed_provider: str) -> bool:
+    """True when ``auxiliary.main_model_fallback`` is false (default true).
+
+    The main-agent model is the last-resort net for an explicit-provider aux slot whose own
+    ``fallback_chain`` is exhausted. A deployment that must keep side traffic off the main
+    model's quota (an on-prem slot that answers capacity errors while its GPU is busy) turns
+    the net off for every explicit slot: the call then fails closed with its primary error, and
+    no request reaches the main model. A slot on ``provider: auto`` is not covered: auto means
+    the main model by design."""
+    if main_model_fallback_enabled():
+        return False
+    logger.warning(
+        "Auxiliary %s: %s on %s; main-model fallback is off (auxiliary.main_model_fallback: false), "
+        "so no request goes to the main agent model", task or "call", reason, failed_provider)
+    return True
+
+
+def refuse_auto_rescue_off_main(task: str | None, provider: str) -> None:
+    """Raise ``AuxiliaryClientUnavailable`` when ``auxiliary.main_model_fallback`` is false.
+
+    An explicit slot that cannot build a client (bare ``openrouter`` / ``custom`` without
+    credentials, a hosted vision provider whose key is missing) is otherwise re-resolved on the
+    auto chain or the auto vision route, and both start at the main provider + model."""
+    if (provider or "auto").strip().lower() == "auto" or main_model_fallback_enabled():
+        return
+    from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
+
+    logger.warning(
+        "Auxiliary %s: provider %s unavailable; the auto-detection rescue is off "
+        "(auxiliary.main_model_fallback: false), so no request goes to the main agent model",
+        task or "call", provider)
+    raise AuxiliaryClientUnavailable(
+        f"Auxiliary {task or 'call'}: provider {provider} unavailable and "
+        "auxiliary.main_model_fallback is false (no auto-detection rescue)")
+
+
+def exhausted_layers(is_auto: bool) -> str:
+    """The fallback layers an exhausted explicit or auto call walked, for its final WARNING."""
+    if is_auto or main_model_fallback_enabled():
+        return "fallback_chain + main agent model"
+    return "fallback_chain; main-model fallback is off"
+
+
+def _task_config(task: str, _seen: frozenset) -> dict[str, Any]:
+    aux = _auxiliary_section()
+    task_config = aux.get(task, {})
     if not isinstance(task_config, dict):
         task_config = {}
     try:

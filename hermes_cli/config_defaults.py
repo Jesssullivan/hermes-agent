@@ -656,10 +656,10 @@ DEFAULT_CONFIG = {
         # Non-system head messages always kept verbatim, in ADDITION to the (always protected)
         # system prompt. 0 = pin nothing but system prompt + summary + tail.
         "protect_first_n": 3,
-        # When True, auto-compression whose summary fails (aux error / non-JSON / timeout) aborts
-        # instead of dropping the middle with a "summary unavailable" placeholder; the session
-        # freezes at its size until /compress (bypasses the cooldown) or /new.
+        # When True, auto-compression whose summary fails (aux error / non-JSON / timeout) aborts instead of dropping
+        # the middle with a "summary unavailable" placeholder; the session freezes until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
+        "main_model_fallback": True,  # False: a failed distinct summary model is never retried on the main model
         # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
         # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
         # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
@@ -739,10 +739,10 @@ DEFAULT_CONFIG = {
         # falling back; clamped [0,6]. Matters for pinned calls (MoA advisors) where provider
         # fallback is not meaningful recovery.
         "transient_retries": 2,
-        # When true, the auto-chain's OpenRouter step is skipped unless the fallback model ends in
-        # ":free" — a PAID lane is never used for background aux traffic even with
-        # OPENROUTER_API_KEY set.
+        # When true, the auto-chain's OpenRouter step is skipped unless the fallback model ends in ":free" —
+        # a PAID lane is never used for background aux traffic even with OPENROUTER_API_KEY set.
         "free_only": False,
+        "main_model_fallback": True,  # False: no explicit-provider slot falls back to the main model (auto slots still use it)
         # Override the auto-chain's OpenRouter fallback model (default google/gemini-3.6-flash,
         # PAID). Pair e.g. "nvidia/nemotron-3-ultra-550b-a55b:free" with free_only: true. A one-time
         # WARNING is logged whenever a non-":free" model is engaged.

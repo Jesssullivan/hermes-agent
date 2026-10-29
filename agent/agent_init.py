@@ -1570,8 +1570,8 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         ),
         protect_first=protect_first,
         abort_on_summary_failure=_cfg_flag(cfg, "abort_on_summary_failure", False),
-        # Per-model threshold overrides: keys substring-matched against the model name
-        # (longest match wins); {} = global threshold for all models.
+        main_model_fallback=is_truthy_value(cfg.get("main_model_fallback"), default=True),
+        # Per-model threshold overrides (substring match on the model name, longest wins); {} = global threshold.
         model_thresholds={
             str(k): float(v) for k, v in _cfg_dict(cfg, "model_thresholds").items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -2010,7 +2010,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
-            custom_providers=_custom_providers,
+            custom_providers=_custom_providers, main_model_fallback=cs.main_model_fallback,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
