@@ -180,6 +180,22 @@ deliberately conservative for code-review-style advice: bare digit runs, line
 numbers, timestamps, git SHAs, and IP addresses are never touched — only
 delimited phone formats like `(555) 123-4567` or `555-123-4567` match.
 
+### Inline turn markers
+
+A message that starts with `__HERMES_MOA_TURN_V1__` carries an encoded preset:
+its own advisor models and aggregator. Hermes decodes one only from a trusted
+internal caller, or on a local session when `moa.inline_marker` is on:
+
+```yaml
+moa:
+  inline_marker: false   # the default
+```
+
+The API server and gateway platforms such as Discord never decode the marker,
+whatever this key says. There the marker stays plain user text: the turn runs
+on the session's model, no advisor runs and Hermes logs a warning. `/moa`
+and the model picker do not use the marker, so they work with the key off.
+
 ### Per-slot reasoning effort
 
 Reference and aggregator slots may also set `reasoning_effort`. Use this when

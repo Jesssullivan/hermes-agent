@@ -1445,6 +1445,10 @@ DEFAULT_CONFIG = {
         # records); the aggregator still sees raw advisor text. "full"    — additionally redact the advisor
         # text injected into the aggregator prompt (issue #59959).
         "privacy_filter": "",
+        # Decode an inline __HERMES_MOA_TURN_V1__ marker turn into a MoA preset on a local session.
+        # Off: the marker stays plain user text. Gateway platforms and the API server never decode
+        # it, whatever this key says.
+        "inline_marker": False,
         "presets": {
             "default": {
                 "reference_models": [

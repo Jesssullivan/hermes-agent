@@ -275,7 +275,8 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         # Compatibility/flattened view for existing dashboard/desktop callers.
         **{key: deepcopy(presets[default_name][key]) for key in _FLAT_PRESET_KEYS},
         # MoA-level (not per-preset) toggle; see coerce_privacy_filter for the modes.
-        "privacy_filter": coerce_privacy_filter(raw.get("privacy_filter"))}
+        "privacy_filter": coerce_privacy_filter(raw.get("privacy_filter")),
+        "inline_marker": moa_inline_marker_enabled(raw)}
 
 
 def resolve_moa_preset(config: Any, name: str | None = None) -> dict[str, Any]:
@@ -339,9 +340,29 @@ def exact_moa_preset_name(config: Any, text: str) -> str | None:
     return None if preset is None or not preset.get("enabled", True) else wanted
 
 
+def moa_inline_marker_enabled(raw: Any) -> bool:
+    """``moa.inline_marker``: whether a local session may decode an inline ``MOA_MARKER_PREFIX``
+    turn into a MoA preset. Off by default, and unset, blank or unknown values read as off.
+
+    A marker turn carries its own preset (advisor models and aggregator), so decoding one from
+    message text lets that text choose which providers the turn fans out to. Only a trusted caller
+    or a ``Platform.LOCAL`` session with this key on may decode one. See ``run_conversation``.
+    """
+    return _coerce_bool(raw.get("inline_marker") if isinstance(raw, dict) else None, False)
+
+
+def is_moa_turn_marker(message: Any) -> bool:
+    """True when ``message`` is text that starts with the inline MoA turn marker."""
+    return isinstance(message, str) and message.startswith(MOA_MARKER_PREFIX)
+
+
 def decode_moa_turn(message: Any) -> tuple[str, dict[str, Any] | None]:
-    """Decode a hidden /moa one-shot marker."""
-    if not isinstance(message, str) or not message.startswith(MOA_MARKER_PREFIX):
+    """Decode a hidden /moa one-shot marker.
+
+    The caller decides whether the message came from a trusted source; ``run_conversation``
+    decodes only for a trusted caller or a local session with ``moa.inline_marker`` on.
+    """
+    if not is_moa_turn_marker(message):
         return message, None
     encoded = message[len(MOA_MARKER_PREFIX):].strip()
     try:
