@@ -4298,6 +4298,8 @@ def _try_main_agent_model_fallback(
     """Last-resort fallback to the main agent provider + model after the configured chain is exhausted.
     ``failed_model`` scoping per ``_failed_backend_skip``; same-URL custom endpoints serve many models,
     so a hung aux model says nothing about the main model's health. Returns (client, model, label) or (None, None, "")."""
+    if main_model_fallback_refused(task, reason, failed_provider):
+        return None, None, ""
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
     if main_provider.lower() == "moa":
@@ -6255,7 +6257,7 @@ _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 
 # Read-time resolution of auxiliary.<task> (plugin defaults, inherit_from) lives in its own module;
 # re-exported here because callers and tests reach it as agent.auxiliary_client._get_auxiliary_task_config.
-from agent.auxiliary_task_config import _get_auxiliary_task_config
+from agent.auxiliary_task_config import _get_auxiliary_task_config, main_model_fallback_refused
 
 
 class CompressionFastLane(NamedTuple):
@@ -7840,8 +7842,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     # fallback when the provider clearly cannot serve the request due to capacity: payment/quota exhaustion
     # and connection failures are capacity problems, not request constraints. See #26803: daily token quota
     # (429 + "too many tokens per day") must fall back just like a 402 credit error.
-    # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity. See
-    # #52228. See #26803: daily token quota must fall back like a 402 credit error.
+    # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity (#52228).
     is_auto = resolved_provider in {"auto", "", None}
     reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
     is_capacity_error = any(
@@ -7915,9 +7916,8 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
             task_chain_only=explicit_auth_with_task_chain)
     # All fallback layers exhausted: one user-visible warning (#26882), then the caller re-raises.
-    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-                   "(fallback_chain + main agent model). Raising the primary error.",
-                   task or "call", tag, reason, resolved_provider)
+    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted (fallback_chain + main agent model). "
+                   "Raising the primary error.", task or "call", tag, reason, resolved_provider)
     if primary_route is not None and route.route_info is not None:
         route.route_info.update(primary_route)
     return None
