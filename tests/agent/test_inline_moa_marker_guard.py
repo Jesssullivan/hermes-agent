@@ -1,17 +1,21 @@
-"""An inline ``__HERMES_MOA_TURN_V1__`` marker applies a MoA preset only from a trusted caller or a
-local session with ``moa.inline_marker`` on.
+"""An inline ``__HERMES_MOA_TURN_V1__`` marker applies a MoA preset only when an internal caller
+passes ``moa_marker_trusted=True``. No in-tree caller does, and no config key turns decoding on.
 
 The marker carries its own preset (advisor models and aggregator). Decoded from message text, it
-would let any sender pick the providers a turn fans out to. The API server and gateway platforms
-such as Discord keep it as plain user text: the turn makes one main-model chat and no advisor call.
+would let any sender pick the providers a turn fans out to. The API server, gateway platforms such
+as Discord and every local surface keep it as plain user text: the turn makes one main-model chat
+and no advisor call. Kanban workers, ``--source tool``, oneshot runs and plugin injections into a
+local session all build their agent with platform "cli", so the cli cases cover them.
 
 Real imports against a temp ``HERMES_HOME``, one loopback OpenAI-compatible endpoint that records
 the model of every chat, and synthetic keys only.
 """
 
+import ast
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import threading
 
 import pytest
@@ -25,9 +29,9 @@ AGGREGATOR_MODEL = "advisor-aggregator"
 PROMPT = "compare the two riffs"
 
 
-def _marker(prompt=PROMPT):
+def _marker(prompt=PROMPT, advisors=ADVISOR_MODELS):
     payload = {"prompt": prompt, "config": {
-        "reference_models": [{"provider": "custom:main", "model": m} for m in ADVISOR_MODELS],
+        "reference_models": [{"provider": "custom:main", "model": m} for m in advisors],
         "aggregator": {"provider": "custom:main", "model": AGGREGATOR_MODEL},
     }}
     return MOA_MARKER_PREFIX + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode("ascii")
@@ -164,7 +168,7 @@ def _api_app(adapter):
 @pytest.mark.parametrize("inline_marker", [None, False, True])
 async def test_api_server_marker_is_plain_text(home, monkeypatch, caplog, inline_marker):
     """A marker posted to a public home's ``/v1/chat/completions`` runs one main-model chat and no
-    advisor, whatever ``moa.inline_marker`` says: the API server is not a local session."""
+    advisor. A leftover ``moa.inline_marker`` key from an older config changes nothing."""
     from aiohttp.test_utils import TestClient, TestServer
     from gateway.config import PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
@@ -206,26 +210,54 @@ def test_discord_shaped_marker_is_plain_text(home):
     _assert_plain_text_turn(home["seen"])
 
 
-# -- Local sessions and trusted callers ------------------------------------------------------
+# -- Local sessions ---------------------------------------------------------------------------
 
 
-def test_local_session_marker_is_plain_text_by_default(home):
-    agent = _agent(home["url"], "cli")
+def _local_platforms():
+    """Every agent platform a local session reaches: the SURFACES targets (cli covers kanban,
+    tool, oneshot and plugin-injected turns) plus the gateway's LOCAL mapping and case variants."""
+    from gateway.session_policy import SURFACES
+
+    return sorted(set(SURFACES.values()) | {"cli", "local", "CLI ", "Cli"})
+
+
+@pytest.mark.parametrize("platform", _local_platforms())
+@pytest.mark.parametrize("inline_marker", [None, True, "true"])
+def test_local_session_marker_is_plain_text(home, platform, inline_marker):
+    """No local surface decodes a marker, with or without a leftover ``moa.inline_marker`` key."""
+    if inline_marker is not None:
+        home["write"](inline_marker=inline_marker)
+    agent = _agent(home["url"], platform)
 
     agent.run_conversation(_marker())
 
     _assert_plain_text_turn(home["seen"])
 
 
-@pytest.mark.parametrize("value", [True, "true"])
-def test_local_session_decodes_marker_when_inline_marker_on(home, value):
-    home["write"](inline_marker=value)
+def test_kanban_workers_run_as_cli():
+    """Pins the premise above: a kanban worker's policy runs on the cli surface, as do the tool
+    and oneshot sources. If this changes, add the new surface to ``_local_platforms``."""
+    from gateway.session_policy import SURFACES
+
+    source = (Path(__file__).resolve().parents[2] / "gateway" / "session_kanban.py").read_text(encoding="utf-8")
+    assert "source='kanban', platform='cli'" in source
+    assert SURFACES["tool"] == SURFACES["oneshot"] == "cli"
+
+
+def test_blocked_marker_warns_once_per_agent(home, caplog):
+    """A sender who repeats the marker gets one warning per agent, then debug lines."""
     agent = _agent(home["url"], "cli")
 
-    result = agent.run_conversation(_marker())
+    with caplog.at_level("DEBUG", logger="agent.conversation_loop"):
+        agent.run_conversation(_marker())
+        agent.run_conversation(_marker())
 
-    assert result["final_response"] == "loopback answered"
-    _assert_moa_turn(home["seen"])
+    blocked = [r for r in caplog.records if "Inline MoA marker on a" in r.getMessage()]
+    assert [r.levelname for r in blocked] == ["WARNING", "DEBUG"]
+    assert all(PROMPT not in r.getMessage() for r in blocked)
+
+
+# -- Trusted callers --------------------------------------------------------------------------
 
 
 def test_trusted_caller_decodes_marker_on_any_platform(home):
@@ -237,13 +269,59 @@ def test_trusted_caller_decodes_marker_on_any_platform(home):
     _assert_moa_turn(home["seen"])
 
 
-def test_inline_marker_key_defaults_off_and_survives_normalize():
-    from hermes_cli.config_defaults import DEFAULT_CONFIG
-    from hermes_cli.moa_config import moa_inline_marker_enabled, normalize_moa_config
+def test_trusted_marker_with_too_many_advisors_is_plain_text(home):
+    """A trusted marker cannot fan one turn out past ``MAX_DECODED_REFERENCE_MODELS`` advisors."""
+    from hermes_cli.moa_config import MAX_DECODED_REFERENCE_MODELS
 
-    assert DEFAULT_CONFIG["moa"]["inline_marker"] is False
-    assert normalize_moa_config({})["inline_marker"] is False
-    assert normalize_moa_config({"inline_marker": True})["inline_marker"] is True
-    assert moa_inline_marker_enabled({"inline_marker": "off"}) is False
-    assert moa_inline_marker_enabled({"inline_marker": "nonsense"}) is False
-    assert moa_inline_marker_enabled(None) is False
+    advisors = tuple(f"advisor-{i}" for i in range(MAX_DECODED_REFERENCE_MODELS + 1))
+    agent = _agent(home["url"], "cli")
+
+    agent.run_conversation(_marker(advisors=advisors), moa_marker_trusted=True)
+
+    _assert_plain_text_turn(home["seen"])
+
+
+def test_decode_caps_reference_models():
+    from hermes_cli.moa_config import MAX_DECODED_REFERENCE_MODELS, decode_moa_turn
+
+    at_cap = tuple(f"advisor-{i}" for i in range(MAX_DECODED_REFERENCE_MODELS))
+    prompt, preset = decode_moa_turn(_marker(advisors=at_cap))
+    assert prompt == PROMPT
+    assert [slot["model"] for slot in preset["reference_models"]] == list(at_cap)
+
+    over = _marker(advisors=at_cap + ("one-more",))
+    assert decode_moa_turn(over) == (over, None)
+
+
+def test_no_in_tree_caller_trusts_the_marker():
+    """No production call passes ``moa_marker_trusted`` other than forwarding it or False. A new
+    caller must build the marker itself, never forward message text, and update this test."""
+    root = Path(__file__).resolve().parents[2]
+    offenders = []
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root)
+        if rel.parts[0] in {"tests", "node_modules", ".venv", "venv", "build"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "moa_marker_trusted" not in text:
+            continue
+        for node in ast.walk(ast.parse(text)):
+            for kw in getattr(node, "keywords", []) if isinstance(node, ast.Call) else []:
+                if kw.arg not in {"moa_marker_trusted", "trusted"}:
+                    continue
+                value = kw.value
+                forwarded = isinstance(value, ast.Name) and value.id == "moa_marker_trusted"
+                if not forwarded and not (isinstance(value, ast.Constant) and value.value is False):
+                    offenders.append(f"{rel}:{node.lineno}")
+    assert offenders == []
+
+
+def test_inline_marker_key_is_gone():
+    """``moa.inline_marker`` was removed: no default, and normalize drops a leftover key."""
+    from hermes_cli import moa_config
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from hermes_cli.moa_config import normalize_moa_config
+
+    assert "inline_marker" not in DEFAULT_CONFIG["moa"]
+    assert "inline_marker" not in normalize_moa_config({"inline_marker": True})
+    assert not hasattr(moa_config, "moa_inline_marker_enabled")

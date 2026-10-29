@@ -183,18 +183,17 @@ delimited phone formats like `(555) 123-4567` or `555-123-4567` match.
 ### Inline turn markers
 
 A message that starts with `__HERMES_MOA_TURN_V1__` carries an encoded preset:
-its own advisor models and aggregator. Hermes decodes one only from a trusted
-internal caller, or on a local session when `moa.inline_marker` is on:
+its own advisor models and aggregator. Hermes decodes one only when an internal
+caller passes `moa_marker_trusted=True`, and no built-in caller does so today.
+No config key turns decoding on.
 
-```yaml
-moa:
-  inline_marker: false   # the default
-```
-
-The API server and gateway platforms such as Discord never decode the marker,
-whatever this key says. There the marker stays plain user text: the turn runs
-on the session's model, no advisor runs and Hermes logs a warning. `/moa`
-and the model picker do not use the marker, so they work with the key off.
+Every other marker stays plain user text. That covers the CLI, the TUI,
+gateway platforms such as Discord, the API server, kanban workers, tool and
+oneshot sources and plugin-injected messages. The turn runs on the session's
+model and no advisor runs. Hermes logs a warning without the payload for the
+first blocked marker on an agent. A trusted marker that lists more than 8
+reference models is rejected the same way. `/moa` and the model picker do not
+use the marker.
 
 ### Per-slot reasoning effort
 

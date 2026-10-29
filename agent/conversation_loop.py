@@ -1419,46 +1419,32 @@ def _notify_context_engine_turn_complete(
         )
 
 
-# Agent ``platform`` values of a local session: the gateway maps ``Platform.LOCAL`` to "cli"
-# (gateway/run_turn_runner.py) and the classic CLI builds its agent with platform="cli".
-_LOCAL_SESSION_PLATFORMS = frozenset({"cli", "local"})
-
-
-def _inline_moa_marker_allowed(agent, trusted: bool) -> bool:
-    """Whether this turn may decode an inline MoA marker: a trusted caller always may, and a
-    local session may when ``moa.inline_marker`` is on. Gateway platforms (Discord and the
-    others) and the API server never may, because their message text comes from remote users."""
-    if trusted:
-        return True
-    platform = str(getattr(agent, "platform", None) or "").strip().lower()
-    if platform not in _LOCAL_SESSION_PLATFORMS:
-        return False
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.moa_config import moa_inline_marker_enabled
-        cfg = load_config()
-        return moa_inline_marker_enabled(cfg.get("moa") if isinstance(cfg, dict) else None)
-    except Exception:
-        logger.debug("moa.inline_marker could not be read; treating it as off", exc_info=True)
-        return False
-
-
 def _decode_inline_moa_turn(agent, user_message, persist_user_message, *, trusted: bool = False):
     """Decode a MoA preset encoded into ``user_message``; returns ``(user_message,
     moa_config, persist_user_message)``, unchanged with ``moa_config=None`` otherwise.
 
-    A marker the turn may not decode (see ``_inline_moa_marker_allowed``) stays plain user
-    text: no preset is applied and no advisor runs."""
+    Only a trusted internal caller (``moa_marker_trusted=True``) may decode a marker, and no
+    in-tree caller sets that flag today. Every other marker stays plain user text: no preset is
+    applied and no advisor runs, because message text from a gateway platform, the API server,
+    a kanban worker, a tool or oneshot source or a plugin injection must not pick the providers
+    a turn fans out to. The first blocked marker on an agent logs a warning without the payload;
+    later ones log at debug, so a remote sender cannot flood the log."""
     try:
         from hermes_cli.moa_config import decode_moa_turn, is_moa_turn_marker
         if not is_moa_turn_marker(user_message):
             return user_message, None, persist_user_message
-        if not _inline_moa_marker_allowed(agent, trusted):
-            logger.warning(
-                "Inline MoA marker on a %s turn (session=%s) kept as plain user text: only a trusted "
-                "caller or a local session with moa.inline_marker on may apply a preset",
+        if not trusted:
+            warned = bool(getattr(agent, "_moa_marker_blocked_warned", False))
+            (logger.debug if warned else logger.warning)(
+                "Inline MoA marker on a %s turn (session=%s) kept as plain user text: only a "
+                "trusted internal caller may apply a preset",
                 getattr(agent, "platform", None) or "unknown", getattr(agent, "session_id", None) or "-",
             )
+            if not warned:
+                try:
+                    agent._moa_marker_blocked_warned = True
+                except Exception:
+                    pass
             return user_message, None, persist_user_message
         _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
         if _decoded_moa_config is not None:
@@ -1685,7 +1671,7 @@ def _run_conversation_turn(
     display-only event rendering; the model still receives the message unchanged.
     ``prelude``: scripted tool calls played before the first model call (``agent/turn_scripted_prelude.py``).
     ``moa_marker_trusted``: set only by internal callers that built an inline MoA marker
-    themselves; without it, only a local session with ``moa.inline_marker`` on decodes one."""
+    themselves; without it, no turn decodes one."""
     if moa_config is None:
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
             agent, user_message, persist_user_message, trusted=moa_marker_trusted,
