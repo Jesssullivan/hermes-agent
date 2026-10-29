@@ -362,6 +362,8 @@ compression:
 
 The key covers only the explicit-slot nets. A slot left on `provider: auto`, including every slot you never pinned and every plugin-registered task that stays on auto, still sends its requests to the main model, because auto means the main model by design. To keep all side traffic off the main model, pin every slot you use to an explicit provider, `vision`, `review`, `moa_reference` and `moa_aggregator` included.
 
+The key does not cover the curator and background review forks. They resolve their own `auxiliary.curator` and `auxiliary.background_review` runtimes, and when that resolution fails they log a WARNING and run on the main model whatever the key says. Disable those features, or pin them to a provider that resolves.
+
 For users on `provider: auto` (no explicit aux provider), the existing auto-detection chain runs in place of steps 2–3. Its first step is already the main agent model, so `auto` users get the same outcome with zero config.
 
 ### Optional: per-task fallback chain
