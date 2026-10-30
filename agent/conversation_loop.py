@@ -1419,11 +1419,33 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def _decode_inline_moa_turn(user_message, persist_user_message):
+def _decode_inline_moa_turn(agent, user_message, persist_user_message, *, trusted: bool = False):
     """Decode a MoA preset encoded into ``user_message``; returns ``(user_message,
-    moa_config, persist_user_message)``, unchanged with ``moa_config=None`` otherwise."""
+    moa_config, persist_user_message)``, unchanged with ``moa_config=None`` otherwise.
+
+    Only a trusted internal caller (``moa_marker_trusted=True``) may decode a marker, and no
+    in-tree caller sets that flag today. Every other marker stays plain user text: no preset is
+    applied and no advisor runs, because message text from a gateway platform, the API server,
+    a kanban worker, a tool or oneshot source or a plugin injection must not pick the providers
+    a turn fans out to. The first blocked marker on an agent logs a warning without the payload;
+    later ones log at debug, so a remote sender cannot flood the log."""
     try:
-        from hermes_cli.moa_config import decode_moa_turn
+        from hermes_cli.moa_config import decode_moa_turn, is_moa_turn_marker
+        if not is_moa_turn_marker(user_message):
+            return user_message, None, persist_user_message
+        if not trusted:
+            warned = bool(getattr(agent, "_moa_marker_blocked_warned", False))
+            (logger.debug if warned else logger.warning)(
+                "Inline MoA marker on a %s turn (session=%s) kept as plain user text: only a "
+                "trusted internal caller may apply a preset",
+                getattr(agent, "platform", None) or "unknown", getattr(agent, "session_id", None) or "-",
+            )
+            if not warned:
+                try:
+                    agent._moa_marker_blocked_warned = True
+                except Exception:
+                    pass
+            return user_message, None, persist_user_message
         _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
         if _decoded_moa_config is not None:
             if persist_user_message is None:
@@ -1636,6 +1658,7 @@ def _run_conversation_turn(
     moa_config: Optional[dict[str, Any]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
+    moa_marker_trusted: bool = False,
 ) -> dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1646,10 +1669,12 @@ def _run_conversation_turn(
     model-facing message; an empty string suppresses titling for this turn).
     ``persist_user_display_*``:
     display-only event rendering; the model still receives the message unchanged.
-    ``prelude``: scripted tool calls played before the first model call (``agent/turn_scripted_prelude.py``)."""
+    ``prelude``: scripted tool calls played before the first model call (``agent/turn_scripted_prelude.py``).
+    ``moa_marker_trusted``: set only by internal callers that built an inline MoA marker
+    themselves; without it, no turn decodes one."""
     if moa_config is None:
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
-            user_message, persist_user_message
+            agent, user_message, persist_user_message, trusted=moa_marker_trusted,
         )
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
@@ -1798,6 +1823,7 @@ def run_conversation(
     turn_author: Optional[dict[str, Any]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
+    moa_marker_trusted: bool = False,
 ) -> dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1832,6 +1858,7 @@ def run_conversation(
                 turn_author=turn_author,
                 title_user_message=title_user_message,
                 prelude=prelude,
+                moa_marker_trusted=moa_marker_trusted,
             )
         finally:
             end_voice_turn_route(agent)

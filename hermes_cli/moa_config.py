@@ -10,6 +10,8 @@ from typing import Any
 
 MOA_MARKER_PREFIX = "__HERMES_MOA_TURN_V1__"
 DEFAULT_MOA_PRESET_NAME = "default"
+# Most reference models a decoded inline marker may list; a longer list rejects the marker.
+MAX_DECODED_REFERENCE_MODELS = 8
 
 DEFAULT_MOA_REFERENCE_MODELS: list[dict[str, str]] = [
     {"provider": "openai-codex", "model": "gpt-5.5"},
@@ -339,16 +341,32 @@ def exact_moa_preset_name(config: Any, text: str) -> str | None:
     return None if preset is None or not preset.get("enabled", True) else wanted
 
 
+def is_moa_turn_marker(message: Any) -> bool:
+    """True when ``message`` is text that starts with the inline MoA turn marker."""
+    return isinstance(message, str) and message.startswith(MOA_MARKER_PREFIX)
+
+
 def decode_moa_turn(message: Any) -> tuple[str, dict[str, Any] | None]:
-    """Decode a hidden /moa one-shot marker."""
-    if not isinstance(message, str) or not message.startswith(MOA_MARKER_PREFIX):
+    """Decode a hidden /moa one-shot marker.
+
+    The caller decides whether the message came from a trusted source; ``run_conversation``
+    decodes only for a caller that passes ``moa_marker_trusted=True``. A marker whose preset lists
+    more than ``MAX_DECODED_REFERENCE_MODELS`` reference models is rejected and stays plain text,
+    so one turn cannot fan out to an unbounded number of advisor calls.
+    """
+    if not is_moa_turn_marker(message):
         return message, None
     encoded = message[len(MOA_MARKER_PREFIX):].strip()
     try:
         payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
     except Exception:
         return message, None
-    return str(payload.get("prompt") or ""), _normalize_preset(payload.get("config") or {})
+    if not isinstance(payload, dict):
+        return message, None
+    config = payload.get("config") or {}
+    if isinstance(config, dict) and len(_reference_slots(config.get("reference_models"))) > MAX_DECODED_REFERENCE_MODELS:
+        return message, None
+    return str(payload.get("prompt") or ""), _normalize_preset(config)
 
 
 def moa_usage() -> str:
