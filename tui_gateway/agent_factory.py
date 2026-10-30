@@ -513,10 +513,17 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
-        for entry in _load_fallback_model() or []:
-            fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
-            fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
+        from agent.route_hooks import resolution_refuses
+        chain, route_labels = [e for e in _load_fallback_model() or [] if isinstance(e, dict)], {}
+        primary_route = {"provider": str((resolve_kwargs or {}).get("requested") or "").strip().lower(),
+                         "model": str((resolve_kwargs or {}).get("target_model") or "").strip()}
+        for entry in chain:
+            fb_provider = str(entry.get("provider") or "").strip()
+            fb_model = str(entry.get("model") or "").strip()
             if not fb_provider or not fb_model:
+                continue
+            # turn_route and route_custody (agent/route_hooks.py): a gate may refuse this entry before any turn exists.
+            if resolution_refuses(entry, primary=primary_route, chain=chain, labels_cache=route_labels):
                 continue
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key

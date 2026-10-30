@@ -473,6 +473,9 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_session_reset` | Observer | CLI/TUI session boundary and gateway after the replacement session exists; return ignored. | CLI: `session_id`, `platform`, `reason`; TUI: `session_id`, `platform`; gateway: those plus `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
 | `on_session_delete` | Observer | After a session delete or deliberate archive commits (CLI, TUI, Desktop/dashboard, gateway API, sweeps, prune); return ignored. | `session_id`, `reason`, `profile`, optional `deleted_ids` (full set when more than one row went), `sessions_dir` | Session identifiers only; no message content. |
 | `post_compaction` | Observer | Once per committed compaction, on every path: automatic and manual compaction in the agent loop (CLI, TUI, Desktop, gateway hygiene, overflow recovery), the gateway's `/compress` (`session.mutate compress`), Codex app-server compactions, micro-compaction and proactive tool-result pruning. Not fired for attempts that changed nothing (aborted, blocked, refused). Timeout-bounded; return ignored. | `session_id`, `old_session_id`, `kind`, `reason`, `before_tokens`, `after_tokens`, `messages_removed` | Identifiers and counts only. |
+| [`turn_route`](#route-hooks-turn_route-route_custody-on_routes_exhausted) | Directive/control | Once per turn before the first API call (`phase="turn"`), and when the resolution-time walker picks a fallback for a primary whose credentials failed (`phase="resolve"`). `{"labels": [...]}` adds session labels for `route_custody`. Timeout-bounded; a failure adds no labels. Python plugins only. | `phase`, `route`, `chain`, `messages`, `data_use`, `labels`, `session_id`, `turn_id`, `platform`, `reason`, `call_id` | `messages` is the full turn transcript (empty at `resolve`). Routes carry provider and model only. |
+| [`route_custody`](#route-hooks-turn_route-route_custody-on_routes_exhausted) | Directive/control | Per fallback candidate that passed the built-in skips, per resolution-time candidate, and at turn start for a fallback kept from an earlier turn. Any `skip`/`block`/`deny` refuses the candidate for this turn; an entry with `route_custody: required` also needs an `allow`. Fails closed: a callback that raises or times out refuses. Python plugins only. | `phase`, `candidate`, `current`, `messages`, `data_use`, `labels`, `required`, `session_id`, `turn_id`, `platform`, `call_id` | `messages` is the full turn transcript (empty at `resolve`). |
+| [`on_routes_exhausted`](#route-hooks-turn_route-route_custody-on_routes_exhausted) | Directive/control | Once when a turn ends on a provider error with no fallback left. The first non-empty `{"reply": ...}` or string replaces `final_response`. Timeout-bounded; a failure keeps the default copy. Python plugins only. | `route`, `reason`, `retryable`, `reset_at`, `reset_in_seconds`, `primary`, `chain`, `data_use`, `labels`, `session_id`, `turn_id`, `platform`, `call_id` | Routes, labels and timing only; no message body. |
 | `agent_loop_stopped` | Observer | Immediately after a real running agent is interrupted — gateway `_interrupt_and_clear_session` or TUI/desktop `session.interrupt`; return ignored. | `session_key`, `platform`, `reason`, `invalidation_reason` | Session/routing identifiers and interruption reasons; no message body. |
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
@@ -1139,6 +1142,34 @@ def my_callback(session_id: str, kind: str, reason: str, **kwargs):
 **Return value:** Ignored. A callback that raises is logged and skipped; the compaction is already committed and is unaffected. Callbacks are bounded by `plugins.hook_callback_timeout`.
 
 **Use cases:** Re-inject session context after compaction, refresh an external index, count compactions.
+
+### Route hooks: `turn_route`, `route_custody`, `on_routes_exhausted`
+
+Three hooks let a deployment decide which model route may carry a turn, for example to keep a turn that holds client data off a hosted fallback. Nothing changes until a plugin registers one of them or a `fallback_providers` entry sets `route_custody: required`. `agent.route_hooks.HERMES_ROUTE_CAPABILITIES` names what a build provides.
+
+**`turn_route`** fires once per turn, after turn-start compaction and before `pre_llm_call`, with `phase="turn"`. It also fires with `phase="resolve"` when `resolve_runtime_with_fallback` (gateway, one-shot, TUI) is about to pick a fallback because the primary's credentials failed; no turn exists yet, so `messages` and `data_use` are empty. Return `{"labels": ["..."]}` to label the session. Labels are your plugin's own strings: Hermes keeps them for the session (they only grow) and hands them to `route_custody`.
+
+**`route_custody`** decides whether a fallback `candidate` may carry this turn. It fires for every chain entry that passed the built-in skips (unavailable, unentitled, exhausted pool, same backend), for every resolution-time candidate, and at turn start when the agent still sits on a fallback from an earlier turn. `data_use` is the union of the connector requirements stamped on the turn's messages.
+
+| Return | Effect |
+|---|---|
+| `{"action": "skip", "reason": "..."}` (or `block`, `deny`) | The candidate is skipped for this turn only; the next turn asks again. |
+| `{"action": "allow"}` | Admits the candidate. Needed for an entry with `route_custody: required`. |
+| `None` | No opinion. A plain entry is admitted; a `required` entry is skipped unless another callback allows it. |
+
+A callback that raises or times out refuses the candidate. With no `route_custody` plugin loaded, a `required` entry is always skipped, so a hosted fallback never runs without its gate. When a kept fallback is refused at turn start, Hermes restores the primary for the turn; if the primary cannot be restored, the turn stops with `RouteCustodyRefused` before any request is sent.
+
+**`on_routes_exhausted`** fires once when a turn ends on a provider error (retries spent, or a non-retryable error) and no fallback is left in the chain. A route gate can treat it as the "every route exhausted" event: record it, page someone, and return `{"reply": "Back at 14:05."}` (or a plain string, up to 2,000 characters) to replace the turn's `final_response`. The result also carries `routes_exhausted: True`, and `routes_exhausted_reply: True` when a reply replaced the copy. It does not fire when a fallback switch was deferred until a near reset, or for a terminal path that never walked the chain.
+
+```python
+def register(ctx):
+    ctx.register_hook("turn_route", lambda phase, data_use, **kw: {"labels": ["acme:client"]} if "acme:client-raw" in data_use else None)
+    ctx.register_hook("route_custody", lambda candidate, labels, **kw:
+        {"action": "skip", "reason": "client data"} if "acme:client" in labels and candidate["provider"] == "hosted" else {"action": "allow"})
+    ctx.register_hook("on_routes_exhausted", lambda reset_in_seconds, **kw: {"reply": "Every model route is busy. Try again shortly."})
+```
+
+The three hooks are Python-only: shell hooks have no response channel for labels, allow or reply.
 
 ### `agent_loop_stopped`
 

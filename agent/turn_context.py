@@ -25,6 +25,7 @@ from agent.message_content import flatten_message_text
 from agent.lsp.deferred import forward_to_agent as forward_lsp_verdicts
 from agent.plugin_live_notes import pop_plugin_notices
 from agent.skills_index_delta import stage_skills_index_note
+from agent.route_hooks import begin_turn as begin_route_turn
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -1178,6 +1179,8 @@ def build_turn_context(
     active_system_prompt = compaction.active_system_prompt
     conversation_history = compaction.conversation_history
     current_turn_user_idx = compaction.current_turn_user_idx
+    # Route hooks (agent/route_hooks.py): turn_route labels the turn, route_custody re-checks a kept fallback.
+    begin_route_turn(agent, messages=messages, turn_id=turn_id)
 
     plugin_user_context = _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,

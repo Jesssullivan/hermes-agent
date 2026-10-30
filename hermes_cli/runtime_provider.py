@@ -1168,11 +1168,17 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
         return resolve_runtime_provider(requested=requested, target_model=target_model,
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
     except AuthError as primary_exc:
+        from agent.route_hooks import resolution_refuses
         from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
-        for entry in get_fallback_chain(config):
+        chain, route_labels = get_fallback_chain(config), {}
+        primary_route = {"provider": str(requested or "").strip().lower(), "model": str(target_model or "").strip()}
+        for entry in chain:
             provider = (entry.get("provider") or "").strip().lower()
             model = (entry.get("model") or "").strip()
             if not provider or not model:
+                continue
+            # turn_route and route_custody (agent/route_hooks.py): a gate may refuse this entry before any turn exists.
+            if resolution_refuses(entry, primary=primary_route, chain=chain, labels_cache=route_labels):
                 continue
             kwargs: dict[str, Any] = {"requested": provider, "target_model": model}
             if entry.get("base_url"):

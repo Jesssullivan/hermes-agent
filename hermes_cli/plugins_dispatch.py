@@ -49,15 +49,20 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_command",
     # Fires inside the compression commit window (lease held): a hung plugin must not wedge the session.
     "post_compaction",
+    # Route hooks (agent/route_hooks.py) on the turn path: turn_route adds no labels on a timeout, and
+    # on_routes_exhausted keeps the default copy. route_custody is in the fail-closed set below.
+    "turn_route", "on_routes_exhausted",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
 _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "pre_command": ("session_key",), "post_compaction": ("session_id",),
+    # Each route-hook call carries its own call_id, so one session's call never skips another's.
+    "turn_route": ("call_id",), "route_custody": ("call_id",), "on_routes_exhausted": ("call_id",),
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call"}
+# Policy hooks: timeout / still-running must fail closed (block the tool, refuse the route).
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call", "route_custody"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
@@ -65,6 +70,13 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+
+
+def _timeout_block_message(hook_name: str) -> str:
+    """The block message for a fail-closed hook whose callback timed out or is still running."""
+    if hook_name == "pre_tool_call":
+        return _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+    return f"{hook_name} plugin callback timed out or is still running"
 
 
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> dict[str, str]:
@@ -281,7 +293,7 @@ class PluginDispatchMixin:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
                         if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                            results.append({"action": "block", "message": _timeout_block_message(hook_name)})
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -563,7 +575,7 @@ class PluginDispatchMixin:
             except TimeoutError:
                 logger.warning("Hook '%s' callback %s timed out after %.0fs", hook_name, callback_name, timeout)
                 if fail_closed:  # policy hook: fail closed with a block directive
-                    results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                    results.append({"action": "block", "message": _timeout_block_message(hook_name)})
             except (Exception, SystemExit) as exc:
                 # Same isolation + failure contract as the sync path (#111922 warn-once, #109624
                 # a raising policy guard fails closed).
