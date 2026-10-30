@@ -2204,6 +2204,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
         from run_agent import AIAgent
+        from agent.route_hooks import ROUTE_ENTRY_KEY, bind_resolution_entry
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
             _resolve_gateway_model, _load_gateway_config, GatewayRunner)
@@ -2214,10 +2215,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
-        # A fallback-provider runtime carries its own ``model``: pop it (overrides config, and
-        # must not collide with the ``**runtime_kwargs`` spread).
+        # A fallback-provider runtime carries its own ``model`` (overrides config) and private keys: pop them.
         model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
         runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
+        route_entry = runtime_kwargs.pop(ROUTE_ENTRY_KEY, None)  # custody record, bound below (route_hooks)
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
         model, session_override, request_model, request_provider = self._select_agent_runtime(
@@ -2265,6 +2266,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         agent = AIAgent(**agent_kwargs)
+        bind_resolution_entry(agent, route_entry)  # a runtime lock passes no chain; the record still holds
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
@@ -3119,8 +3121,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         events = _SessionEventQueue(session_id, run_id)
         queue, _event_payload = events.queue, events.payload
         # Claim ownership inside the request's profile scope before any run-keyed state
-        # exists, so /v1/runs/{id}* control is confined to the starting profile.
-        # See #93689.
+        # exists, so /v1/runs/{id}* control is confined to the starting profile (#93689).
         self._run_owners[run_id] = self._run_idempotency_scope(request)
         self._set_run_status(
             run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
@@ -3648,8 +3649,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         usage = {"input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                  "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                  "total_tokens": getattr(agent, "session_total_tokens", 0) or 0}
-        # Effective session id lets callers track compression-triggered rotations.
-        # (#16938)
+        # Effective session id lets callers track compression-triggered rotations (#16938).
         _eff_sid = getattr(agent, "session_id", session_id)
         if isinstance(_eff_sid, str) and _eff_sid:
             result["session_id"] = _eff_sid

@@ -2317,11 +2317,11 @@ def _resolve_runtime_agent_kwargs() -> dict:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     if fallback_entry is not None:
-        # The entry's model is the one this agent must send (#112600). Carry the fallback notice so the
-        # gateway can surface a user-visible provider switch (#74349); the caller must pop
-        # ``_fallback_notice`` before forwarding kwargs to AIAgent.
+        # The entry's model is the one this agent must send (#112600). The fallback notice (#74349) and the entry's
+        # custody record (agent/route_hooks.py) are private: the caller pops both before an AIAgent(**kwargs) spread.
+        from agent.route_hooks import ROUTE_ENTRY_KEY, resolution_record
         return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
-                "_fallback_notice": pre_agent_fallback_notice(
+                ROUTE_ENTRY_KEY: resolution_record(fallback_entry, runtime), "_fallback_notice": pre_agent_fallback_notice(
                     _primary_provider, _primary_model,
                     runtime.get("provider") or fallback_entry.get("provider") or "unknown",
                     fallback_entry.get("model") or "default")}

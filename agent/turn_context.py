@@ -1170,8 +1170,10 @@ def build_turn_context(
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
     # Route hooks (agent/route_hooks.py), before turn-start compaction can send this turn to the
-    # active route: turn_route labels the turn, route_custody re-checks a fallback route.
-    begin_route_turn(agent, messages=messages, turn_id=turn_id)
+    # active route: turn_route labels the turn, route_custody re-checks a fallback route. A custody
+    # restore moved the agent back to its primary, so auxiliary ``auto`` calls must learn it too.
+    if begin_route_turn(agent, messages=messages, turn_id=turn_id):
+        _publish_runtime_main(agent)
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,

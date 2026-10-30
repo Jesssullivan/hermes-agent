@@ -122,7 +122,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
-from agent.route_hooks import auxiliary_refuses
+from agent.route_hooks import auxiliary_refuses, auxiliary_request
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -8032,6 +8032,7 @@ def call_llm(
     try:
         with (
             scoped_runtime_main(main_runtime),
+            auxiliary_request(messages),  # route_custody (F3) sees the request's own data use
             aux_progress_hook(
                 prior_progress_hook
                 if callable(prior_progress_hook)
@@ -8320,7 +8321,7 @@ async def async_call_llm(
     if semaphore is not None:
         await semaphore.acquire()
     try:
-        with scoped_runtime_main(main_runtime):
+        with scoped_runtime_main(main_runtime), auxiliary_request(messages):
             return await _async_call_llm_impl(
                 task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
                 main_runtime=main_runtime, messages=messages, temperature=temperature,
@@ -8350,8 +8351,7 @@ async def _async_call_llm_impl(
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
     try:
-        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()).
-        # (PR #16587)
+        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm(), PR #16587).
         _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
 
         async def _acreate(_kwargs: dict[str, Any]) -> Any:

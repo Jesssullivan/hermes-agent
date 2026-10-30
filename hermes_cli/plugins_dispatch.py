@@ -49,9 +49,9 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_command",
     # Fires inside the compression commit window (lease held): a hung plugin must not wedge the session.
     "post_compaction",
-    # Route hooks (agent/route_hooks.py) on the turn path: turn_route adds no labels on a timeout, and
-    # on_routes_exhausted keeps the default copy. route_custody is in the fail-closed set below.
-    "turn_route", "on_routes_exhausted",
+    # Route hooks (agent/route_hooks.py) on the turn path: on_routes_exhausted keeps the default copy on
+    # a timeout. turn_route and route_custody are in the fail-closed set below.
+    "on_routes_exhausted",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
@@ -61,8 +61,9 @@ _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "turn_route": ("call_id",), "route_custody": ("call_id",), "on_routes_exhausted": ("call_id",),
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool, refuse the route).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call", "route_custody"}
+# Policy hooks: timeout / still-running must fail closed (block the tool, refuse the route). A failed
+# turn_route leaves the turn's labels unknown, and custody then refuses every candidate it would judge.
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call", "route_custody", "turn_route"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
