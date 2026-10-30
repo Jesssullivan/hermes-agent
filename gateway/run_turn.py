@@ -490,8 +490,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         )
         from run_agent import AIAgent
         from agent.route_hooks import bind_resolution_entry, take_resolution_entry
-        media_urls = media_urls or []
-        media_types = media_types or []
+        from gateway.route_vision import vision_under_custody
+        media_urls, media_types = media_urls or [], media_types or []
         adapter = self._delivery_adapter_for(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
@@ -508,8 +508,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
             platform_key = _platform_config_key(source.platform)
             enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
-            pr = self._provider_routing
-            max_iterations = _current_max_iterations()
+            pr, max_iterations = self._provider_routing, _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
@@ -517,13 +516,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
-            image_paths = [
-                path for i, path in enumerate(media_urls)
-                if (media_types[i] if i < len(media_types) else "").startswith("image/")
-            ]
+            image_paths = [path for i, path in enumerate(media_urls)
+                           if (media_types[i] if i < len(media_types) else "").startswith("image/")]
             if image_paths:
-                try:
-                    enriched_prompt = await self._enrich_message_with_vision(prompt, image_paths)
+                try:  # route custody checks a resolution-time entry before an image leaves
+                    enriched_prompt = await vision_under_custody(
+                        lambda: self._enrich_message_with_vision(prompt, image_paths), route_entry,
+                        {**turn_route["runtime"], "model": turn_route["model"]}, session_id=task_id,
+                        messages=[{"role": "user", "content": prompt}], message_text=prompt, image_paths=image_paths)
                 except Exception as e:
                     logger.warning("Background task vision enrichment failed: %s", e)
 

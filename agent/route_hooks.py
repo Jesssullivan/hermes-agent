@@ -22,7 +22,10 @@ required``.
   Each walker records that entry on the agent (:func:`bind_resolution_entry`); the turn-start
   check reads the record and never infers it from the agent's own chain. A compaction outside a
   turn on such a route is checked first (``phase="compaction"``) and binds its session for the
-  auxiliary gate (:func:`enter_compaction_scope`, :func:`detached_compaction`).
+  auxiliary gate (:func:`enter_compaction_scope`, :func:`detached_compaction`). Gateway vision
+  enrichment before a turn checks such a route with ``phase="auxiliary"`` and ``task="vision"``
+  before an image leaves (:func:`detached_auxiliary`). :data:`HERMES_ROUTE_CUSTODY_PHASES` lists
+  every phase.
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
   required`` also needs an explicit ``{"action": "allow"}``; any other value that is not an
@@ -63,6 +66,9 @@ HERMES_ROUTE_CAPABILITIES: Mapping[str, str] = MappingProxyType({
     "F3": ROUTE_CUSTODY_HOOK,
     "F6": ROUTES_EXHAUSTED_HOOK,
 })
+# Every ``phase`` a ``route_custody`` callback may receive from this build. A gate that pins a
+# revision checks that each phase it handles is listed here, and refuses a phase it does not know.
+HERMES_ROUTE_CUSTODY_PHASES: frozenset[str] = frozenset({"failover", "resolve", "turn", "auxiliary", "compaction"})
 
 # Fallback-entry key: ``route_custody: required`` admits the entry only on an explicit allow.
 ROUTE_CUSTODY_KEY = "route_custody"
@@ -148,6 +154,16 @@ def entry_requires_custody(entry: Mapping[str, Any]) -> bool:
 def _gated(entry: Mapping[str, Any]) -> bool:
     """Whether any custody decision applies to *entry*: a loaded gate or a custody key."""
     return _has_hook(ROUTE_CUSTODY_HOOK) or entry_requires_custody(entry)
+
+
+def _hooks_loaded() -> bool:
+    return _has_hook(TURN_ROUTE_HOOK) or _has_hook(ROUTE_CUSTODY_HOOK)
+
+
+def custody_applies(record: Any) -> bool:
+    """Whether a route hook is loaded or the resolution-time *record* needs custody. ``False`` means
+    every path behaves as if this module did not exist."""
+    return _hooks_loaded() or (isinstance(record, Mapping) and entry_requires_custody(record))
 
 
 def _chain_routes(chain: Any) -> list[dict[str, str]]:
@@ -322,6 +338,16 @@ def carry_session_route_state(agent: Any, old_session_id: Any) -> None:
     _grow_session(agent, labels=labels, data_use=data_use)
 
 
+def carry_route_state(old_session_id: Any, new_session_id: Any) -> None:
+    """A compaction with no agent (``session.mutate compress``) rotated *old_session_id* to
+    *new_session_id*: carry the parent's labels and data use to the child. An in-place compaction
+    keeps the id and carries nothing."""
+    if not old_session_id or not new_session_id or str(old_session_id) == str(new_session_id):
+        return
+    labels, data_use = _session_state(old_session_id)
+    _remember_session(new_session_id, labels=labels, data_use=data_use)
+
+
 # -- agent-side wiring ---------------------------------------------------------------------------
 
 
@@ -352,13 +378,33 @@ def auxiliary_request(messages: Any) -> Iterator[None]:
         _AUX_REQUEST.reset(token)
 
 
+def in_turn(agent: Any) -> bool:
+    """Whether this context serves a turn of *agent* that has begun and not ended."""
+    turn = getattr(agent, "_route_turn", None)
+    return _scope_agent() is agent and isinstance(turn, Mapping) and not turn.get("ended")
+
+
+def end_turn(agent: Any) -> None:
+    """Turn end. The scope stays bound, so a later auxiliary call in this context still reports
+    the session; a later compaction counts as outside a turn (:func:`in_turn`)."""
+    turn = getattr(agent, "_route_turn", None)
+    if isinstance(turn, dict):
+        turn["ended"] = True
+
+
 def enter_compaction_scope(agent: Any, messages: Any) -> tuple[Any, Any]:
     """Bind *agent* as the route scope of a compaction and the *messages* it summarizes. Out of a
     turn no scope is bound (the gateway runs each compaction in a fresh copied context), so the
-    auxiliary gate on any worker the compaction starts would see no session. Returns the tokens
-    for :func:`exit_compaction_scope`; the first is ``None`` when *agent* already held the scope."""
+    auxiliary gate on any worker the compaction starts would see no session. The summary rows
+    carry no ``data_use`` stamp, so the session keeps the data use of what it summarizes. Returns
+    the tokens for :func:`exit_compaction_scope`; the first is ``None`` when *agent* already held
+    the scope."""
+    source = messages if isinstance(messages, list) else None
+    if source and _hooks_loaded():
+        from agent.message_metadata import data_use_requirement
+        _grow_session(agent, data_use=data_use_requirement(source))
     scope_token = None if _scope_agent() is agent else _ROUTE_SCOPE.set(_scope_ref(agent))
-    return scope_token, _COMPACTION_SOURCE.set(messages if isinstance(messages, list) else None)
+    return scope_token, _COMPACTION_SOURCE.set(source)
 
 
 def exit_compaction_scope(tokens: tuple[Any, Any]) -> None:
@@ -368,11 +414,27 @@ def exit_compaction_scope(tokens: tuple[Any, Any]) -> None:
         _ROUTE_SCOPE.reset(scope_token)
 
 
-class _CompactionRoute:
-    """The route and session of a compaction that runs with no agent (``session.mutate compress``)."""
+class _DetachedRoute:
+    """The route and session of a call that runs with no agent: a ``session.mutate compress``
+    summary, or gateway vision enrichment before the turn's agent exists."""
 
     def __init__(self, *, session_id: str, provider: str, model: str, platform: str = "") -> None:
         self.session_id, self.provider, self.model, self.platform = session_id, provider, model, platform
+
+
+@contextmanager
+def _detached_scope(record: Any, *, session_id: Any, provider: Any, model: Any, messages: list, platform: str,
+                    phase: str, task: str = "", check: bool = True) -> Iterator[None]:
+    route = _DetachedRoute(session_id=str(session_id or ""), provider=str(provider or ""), model=str(model or ""),
+                           platform=platform)
+    bind_resolution_entry(route, record)
+    tokens = enter_compaction_scope(route, messages)
+    try:
+        if check:
+            check_out_of_turn_route(route, phase=phase, task=task)
+        yield
+    finally:
+        exit_compaction_scope(tokens)
 
 
 @contextmanager
@@ -381,15 +443,34 @@ def detached_compaction(record: Any, *, session_id: str, provider: str, model: s
     """Route scope and custody for a compaction that summarizes *messages* on a resolved runtime
     with no agent: the auxiliary gate sees the session's labels and the messages' data use, and a
     gated resolution-time *record* is checked first. Raises :class:`RouteCustodyRefused`."""
-    route = _CompactionRoute(session_id=str(session_id or ""), provider=str(provider or ""), model=str(model or ""),
-                             platform=platform)
-    bind_resolution_entry(route, record)
-    tokens = enter_compaction_scope(route, messages)
-    try:
-        check_out_of_turn_route(route)
+    with _detached_scope(record, session_id=session_id, provider=provider, model=model, messages=messages,
+                         platform=platform, phase="compaction"):
         yield
-    finally:
-        exit_compaction_scope(tokens)
+
+
+@contextmanager
+def detached_auxiliary(record: Any, *, task: str, session_id: Any, provider: Any, model: Any, messages: list,
+                       rides_main: bool = True, platform: str = "") -> Iterator[None]:
+    """Route scope and custody for an auxiliary call made before any turn or agent exists, such as
+    gateway vision enrichment. *messages* is the session transcript and the inbound message. When
+    the call rides the session's resolved main route (*rides_main*) and that route is a gated
+    resolution-time *record*, the entry is checked first (``phase="auxiliary"``, *task*), with the
+    session's labels and the transcript's data use. Raises :class:`RouteCustodyRefused`."""
+    with _detached_scope(record, session_id=session_id, provider=provider, model=model, messages=messages,
+                         platform=platform, phase="auxiliary", task=task, check=rides_main):
+        yield
+
+
+def vision_rides_main_route() -> bool:
+    """Whether the ``vision`` auxiliary slot sends images on the main route: ``provider: auto``
+    with no ``base_url``. ``True`` when the slot cannot be read (fail closed)."""
+    try:
+        from agent.auxiliary_client import _normalize_vision_provider, _resolve_task_provider_model
+        requested, _model, base_url, _key, _mode = _resolve_task_provider_model("vision", None, None, None, None)
+        return not base_url and _normalize_vision_provider(requested) == "auto"
+    except Exception:  # health: allow BLE001 -- an unreadable slot is treated as the main route
+        logger.debug("vision slot lookup failed; treating it as the main route", exc_info=True)
+        return True
 
 
 def _turn_messages(agent: Any) -> list:
@@ -433,7 +514,7 @@ def _current_route(agent: Any) -> dict[str, str]:
 
 
 def fallback_custody_refuses(agent: Any, fb: Mapping[str, Any], fb_provider: str, fb_model: str, *,
-                             phase: str = "failover") -> bool:
+                             phase: str = "failover", task: str = "") -> bool:
     """F3 at failover: ``True`` skips *fb* for this turn. Not added to the unavailable set: the
     next turn may carry different data."""
     if not _gated(fb):
@@ -442,7 +523,7 @@ def fallback_custody_refuses(agent: Any, fb: Mapping[str, Any], fb_provider: str
     return custody_refuses(
         {**fb, "provider": fb_provider, "model": fb_model}, phase=phase, current=_current_route(agent),
         messages=messages, data_use=_turn_data_use(agent, messages), labels=_session_labels(agent),
-        labels_known=_labels_known(agent), **_agent_context(agent))
+        labels_known=_labels_known(agent), task=task, **_agent_context(agent))
 
 
 def begin_turn(agent: Any, *, messages: list, turn_id: str) -> bool:
@@ -637,11 +718,12 @@ def _recheck_kept_fallback(agent: Any) -> bool:
     return True
 
 
-def check_out_of_turn_route(agent: Any) -> None:
-    """F3 before a compaction outside a turn sends the transcript on the agent's own route: a kept
-    fallback or a resolution-time entry is checked with ``phase="compaction"``, the session's
-    labels and the transcript's data use. Nothing is restored outside a turn: a refusal raises
-    :class:`RouteCustodyRefused` and the compaction does not run."""
+def check_out_of_turn_route(agent: Any, *, phase: str = "compaction", task: str = "") -> None:
+    """F3 before a call outside a turn sends the transcript on the agent's own route: a kept
+    fallback or a resolution-time entry is checked with *phase* (``compaction``, or ``auxiliary``
+    with *task* for vision enrichment), the session's labels and the transcript's data use.
+    Nothing is restored outside a turn: a refusal raises :class:`RouteCustodyRefused` and the call
+    does not run."""
     if getattr(agent, "_provider_fallback_active", False):
         entry = getattr(agent, "_route_fallback_entry", None)
         entry = entry if isinstance(entry, Mapping) and _gated(entry) else None
@@ -650,9 +732,9 @@ def check_out_of_turn_route(agent: Any) -> None:
     if entry is None:
         return
     if fallback_custody_refuses(agent, entry, str(entry.get("provider") or ""), str(entry.get("model") or ""),
-                                phase="compaction"):
-        raise RouteCustodyRefused(
-            f"route custody refused {entry.get('provider')}/{entry.get('model')} for a compaction outside a turn")
+                                phase=phase, task=task):
+        raise RouteCustodyRefused(f"route custody refused {entry.get('provider')}/{entry.get('model')} for "
+                                  f"{'a ' + task + ' call' if task else 'a compaction'} outside a turn")
 
 
 @contextmanager

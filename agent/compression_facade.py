@@ -278,10 +278,11 @@ class CompressionFacadeMixin:
         registration = _CommitFenceRegistration(active_fence)
         # Route hooks (agent/route_hooks.py): outside a turn no route scope is bound, so bind this agent and
         # the transcript for the auxiliary gate, and check custody for the route the summary may ride.
-        from agent.route_hooks import check_out_of_turn_route, enter_compaction_scope, exit_compaction_scope
+        from agent.route_hooks import check_out_of_turn_route, enter_compaction_scope, exit_compaction_scope, in_turn
+        outside_turn = not in_turn(self)  # no turn began here, or it ended (agent/route_hooks.py end_turn)
         route_tokens = enter_compaction_scope(self, messages)
         try:
-            if route_tokens[0] is not None:
+            if outside_turn:
                 check_out_of_turn_route(self)
             with fence_registration_lock:
                 fence_stack = vars(self).setdefault("_compression_commit_fence_stack", [])

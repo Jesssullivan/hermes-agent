@@ -30,7 +30,7 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
-from agent.route_hooks import RouteCustodyRefused, route_custody_refused_result
+from agent.route_hooks import RouteCustodyRefused, end_turn as end_route_turn, route_custody_refused_result
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
@@ -1871,6 +1871,7 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            end_route_turn(agent)  # a later compaction in this context is outside the turn (route_custody)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
