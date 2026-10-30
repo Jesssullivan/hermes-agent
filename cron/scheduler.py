@@ -1788,7 +1788,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        from agent.route_hooks import resolution_refuses
+        from agent.route_hooks import mark_resolution_entry, resolution_refuses
         chain, route_labels = _job_fallback_chain(job, jc.cfg) or [], {}
         primary_route = {"provider": str(requested or "").strip().lower(), "model": str(model or "").strip()}
         logger.warning(
@@ -1805,7 +1805,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                     entry, primary=primary_route, chain=chain, labels_cache=route_labels):
                 continue
             try:
-                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+                from hermes_cli.fallback_config import effective_runtime_provider, pre_agent_fallback_notice, resolve_entry_api_key
                 fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
@@ -1816,10 +1816,10 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 # Named custom entries resolve to the bare "custom" billing class; keep the configured
                 # identity so job sessions record the provider name (#98739).
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
+                mark_resolution_entry(runtime, entry)  # run_job binds it: custody re-checks the turn
                 logger.info("Job '%s': fallback resolved to %s model %s", job_id, runtime.get("provider"), fb_model)
                 # Delivered with the job output (#74349): a cron agent has no status rail, so the
                 # switch would otherwise stay in the scheduler log only. run_job pops it.
-                from hermes_cli.fallback_config import pre_agent_fallback_notice
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
                     model, runtime.get("provider"), fb_model)
@@ -2079,12 +2079,14 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     # interrupt), do not silently mark the job as successful. run_agent populates
     # `failed=True`/`completed=False` on these paths and may put the error into `final_response`, which
     # would otherwise be delivered as if it were the agent's reply and the job's `last_status` set to "ok".
-    # Raise so the except handler below builds the proper failure tuple. (issue #17855)
+    # Raise so the except handler below builds the proper failure tuple (issue #17855); an
+    # on_routes_exhausted reply (agent/route_hooks.py) is the copy that handler delivers.
     turn_exit_reason = str(result.get("turn_exit_reason") or "")
     final_response_text = (result.get("final_response") or "").strip()
     max_iteration_summary = is_max_iteration_handoff(result)
     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
-        raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
+        raise RuntimeError((result.get("routes_exhausted_reply") and final_response_text) or result.get("error")
+                           or final_response_text or "agent reported failure")
     if max_iteration_summary:
         logger.warning(
             "Job '%s' reached the iteration limit but produced a final fallback response; "
@@ -2217,8 +2219,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         # finalizes owned session rows by default; once the shared SessionDB is
         # released below, that second end_session() would reopen the just-closed
         # SQLite handle (#94736). The reason is durably booked, so disarm only the
-        # agent's redundant row-finalization; its resource teardown still runs in
-        # _teardown_cron_agent.
+        # agent's redundant row-finalization; its resource teardown still runs in _teardown_cron_agent.
         if agent is not None:
             agent._end_session_on_close = False
     except (Exception, KeyboardInterrupt) as e:
@@ -2620,9 +2621,10 @@ def run_job(
 
         # Open state.db only after every early-return gate has passed.
         _session_db = _open_cron_session_db(job)
-        agent = _construct_cron_agent(
-            AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
-            session_db=_session_db)
+        agent = _construct_cron_agent(AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
+                                      session_db=_session_db)
+        from agent.route_hooks import ROUTE_ENTRY_KEY, bind_resolution_entry
+        bind_resolution_entry(agent, setup.runtime.get(ROUTE_ENTRY_KEY))  # custody re-checks a fallback entry
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
@@ -3538,8 +3540,7 @@ def _wait_for_external_cron_worker_body(
                 reap_terminal_worker_in_background(process)
                 return True
         # The worker can commit its terminal row and exit between the first
-        # read and wait(). Re-read the exact attempt before declaring that
-        # it died without terminalizing.
+        # read and wait(). Re-read the exact attempt before declaring that it died without terminalizing.
         current = get_execution(execution_id)
         if current and current.get("status") in ("completed", "failed"):
             return True
@@ -3748,8 +3749,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
 
     # Same window the dead-owner recovery ledger grants a pending handoff: a cold
     # worker start (imports + secret hydration) measures ~10-12s in the field, and
-    # a dispatch deadline shorter than the adoption grace made the two guards
-    # around one handoff disagree.
+    # a dispatch deadline shorter than the adoption grace made the two guards around one handoff disagree.
     deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
     while time.monotonic() < deadline:
         if ack_path.exists():

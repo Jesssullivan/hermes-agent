@@ -36,6 +36,14 @@ def hooks(monkeypatch):
     return mgr._hooks
 
 
+@pytest.fixture(autouse=True)
+def _fresh_route_scope():
+    """``begin_turn`` binds the turn's agent in a ContextVar; keep one test's agent out of the next."""
+    token = route_hooks._ROUTE_SCOPE.set(None)
+    yield
+    route_hooks._ROUTE_SCOPE.reset(token)
+
+
 def _make_agent(fallback_model):
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
@@ -71,19 +79,20 @@ def _tool_message(requires):
 class TestCapabilities:
     def test_each_route_hook_is_advertised_and_registered(self):
         caps = route_hooks.HERMES_ROUTE_CAPABILITIES
-        assert set(caps) == {"F1", "F2", "F3", "F6"}
+        # F1 is not advertised: a provider: auto slot still walks the main model and its chain.
+        assert set(caps) == {"F2", "F3", "F6"}
         assert (caps["F2"], caps["F3"], caps["F6"]) == ("turn_route", "route_custody", "on_routes_exhausted")
         for hook in route_hooks.ROUTE_HOOKS:
             assert hook in VALID_HOOKS
             assert hook in SHELL_UNSUPPORTED_HOOKS  # no shell channel for labels, allow or reply
-        assert "route_custody" in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        assert {"turn_route", "on_routes_exhausted"} <= _HOOK_TIMEOUT_BOUNDED_HOOKS
+        assert {"route_custody", "turn_route"} <= _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
+        assert "on_routes_exhausted" in _HOOK_TIMEOUT_BOUNDED_HOOKS
         with pytest.raises(TypeError):
             caps["F4"] = "x"  # read-only
 
     def test_f1_keys_exist_and_default_to_the_old_behaviour(self):
-        """F1 is hermes#1: two keys that keep auxiliary and compression traffic off the main model.
-        Both default true (unchanged behaviour); a home that needs F1 must render them false."""
+        """hermes#1 adds two keys that keep explicit auxiliary and compression slots off the main
+        model. Both default true (unchanged behaviour); they do not cover provider: auto slots."""
         from hermes_cli.config_defaults import DEFAULT_CONFIG
         from agent.auxiliary_task_config import main_model_fallback_refused
 
@@ -126,7 +135,7 @@ class TestTurnRoute:
 
         def turn_route(phase, data_use, labels, messages, **kw):
             seen.append((phase, data_use, labels, len(messages), kw["turn_id"]))
-            return {"labels": ["acme:client"]} if "acme:client-raw" in data_use else {"labels": "acme:seen"}
+            return {"labels": [f"acme:{kw['turn_id']}"]}
 
         hooks["turn_route"] = [turn_route]
         agent = _make_agent([HOSTED])
@@ -134,8 +143,9 @@ class TestTurnRoute:
         route_hooks.begin_turn(agent, messages=messages, turn_id="t1")
         route_hooks.begin_turn(agent, messages=[{"role": "user", "content": "q2"}], turn_id="t2")
         assert seen[0] == ("turn", ["acme:client-raw"], [], 2, "t1")
-        assert seen[1][2] == ["acme:client"]  # labels from the first turn reach the second
-        assert route_hooks._session_labels(agent) == {"acme:client", "acme:seen"}
+        # Labels and data use from the first turn reach the second: both only grow.
+        assert seen[1][1:3] == (["acme:client-raw"], ["acme:t1"])
+        assert route_hooks._session_labels(agent) == {"acme:t1", "acme:t2"}
         agent.session_id = "another-session"
         assert route_hooks._session_labels(agent) == frozenset()
 
@@ -147,6 +157,35 @@ class TestTurnRoute:
         agent = _make_agent([HOSTED])
         route_hooks.begin_turn(agent, messages=[], turn_id="t1")
         assert route_hooks._session_labels(agent) == frozenset()
+
+    @pytest.mark.parametrize("failure", ["raise", "timeout"])
+    def test_a_failing_turn_route_fails_closed(self, hooks, monkeypatch, failure):
+        """Earlier finding 3: with labels unknown, the gate cannot tell a client turn from any
+        other, so every candidate it would judge is refused and the turn stays on the primary."""
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1)
+        hang = threading.Event()
+
+        def turn_route(**_kw):
+            if failure == "raise":
+                raise RuntimeError("classifier down")
+            hang.wait(timeout=10.0)
+
+        asked = []
+        hooks["turn_route"] = [turn_route]
+        hooks["route_custody"] = [lambda candidate, **_kw: asked.append(candidate) or {"action": "allow"}]
+        agent = _make_agent([HOSTED, LOCAL])
+        primary = agent.provider
+        try:
+            route_hooks.begin_turn(agent, messages=[_tool_message(["acme:client-raw"])], turn_id="t1")
+            assert _activate(agent) is False and agent.provider == primary
+            assert asked == []  # refused without asking the gate
+            hang.set()
+            hooks["turn_route"] = [lambda **_kw: None]
+            route_hooks.begin_turn(agent, messages=[], turn_id="t2")  # the next turn answers again
+            agent._fallback_index = 0  # as the turn-start primary restore leaves it
+            assert _activate(agent) is True and agent.provider == "openai"
+        finally:
+            hang.set()
 
 
 # ── F3: route_custody ──────────────────────────────────────────────────────────────────
@@ -384,26 +423,24 @@ class TestAuxiliaryCustody:
     def test_task_chain_and_gate_see_the_task_and_session_labels(self, hooks):
         seen = []
 
-        def custody(phase, candidate, task, labels, **_kw):
-            seen.append((phase, candidate["provider"], task, labels))
+        def custody(phase, candidate, task, labels, session_id, **_kw):
+            seen.append((phase, candidate["provider"], task, labels, session_id))
             return {"action": "skip"} if candidate["provider"] == "openai" else None
 
         hooks["route_custody"] = [custody]
+        agent = _make_agent([HOSTED, LOCAL])
+        agent.session_id = "aux-session"
         route_hooks._remember_session_labels("aux-session", frozenset({"acme:client"}))
-        from hermes_logging import clear_session_context, set_session_context
-        set_session_context("aux-session")
-        try:
-            with (
-                patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": [HOSTED, LOCAL]}),
-                patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=lambda e: _client_for(e["provider"], e["model"])),
-                patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
-            ):
-                from agent.auxiliary_client import _try_configured_fallback_chain
-                _client, model, label = _try_configured_fallback_chain("compression", "anthropic", reason="rate limit")
-        finally:
-            clear_session_context()
+        route_hooks.begin_turn(agent, messages=[], turn_id="t1")  # binds the turn's agent as the scope
+        with (
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": [HOSTED, LOCAL]}),
+            patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=lambda e: _client_for(e["provider"], e["model"])),
+            patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
+        ):
+            from agent.auxiliary_client import _try_configured_fallback_chain
+            _client, model, label = _try_configured_fallback_chain("compression", "anthropic", reason="rate limit")
         assert model == "glm-4.7" and "zai" in label
-        assert seen[0] == ("auxiliary", "openai", "compression", ["acme:client"])
+        assert seen[0] == ("auxiliary", "openai", "compression", ["acme:client"], "aux-session")
 
     def test_compression_stall_retry_route_skips_a_required_entry(self, hooks):
         with (
@@ -479,13 +516,14 @@ class TestTurnStartOrder:
 
 
 class TestResolutionTimeAgent:
-    """An agent built on a fallback before it existed (gateway, one-shot, TUI, cron): its active
-    route is an entry of its own chain and nothing marks a fallback as active."""
+    """An agent built on a fallback before it existed (gateway, one-shot, TUI, cron): the walker
+    records the entry on the agent, and nothing marks a fallback as active."""
 
     @staticmethod
     def _built_on(entry, chain, session_id="s1"):
         agent = _make_agent(chain)
         agent.provider, agent.model, agent.session_id = entry["provider"], entry["model"], session_id
+        route_hooks.bind_resolution_entry(agent, route_hooks.resolution_record(entry, {"provider": entry["provider"]}))
         assert not getattr(agent, "_provider_fallback_active", False)
         return agent
 
@@ -517,7 +555,8 @@ class TestResolutionTimeAgent:
         rebuilt = self._built_on(HOSTED, [HOSTED, LOCAL], session_id="gw-session")
         with pytest.raises(route_hooks.RouteCustodyRefused):
             route_hooks.begin_turn(rebuilt, messages=[{"role": "user", "content": "plain"}], turn_id="t2")
-        assert seen[-1] == ("turn", "openai", ["acme:client"], [], 1)
+        # The earlier turn's data use is the session's too: it only grows.
+        assert seen[-1] == ("turn", "openai", ["acme:client"], ["acme:client-raw"], 1)
 
     def test_resolve_phase_gate_sees_labels_of_a_named_session_only(self, hooks):
         seen = []

@@ -55,7 +55,10 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str
     runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
                                             fallback=fallback)
     if fallback_entry is not None:
+        from agent.route_hooks import resolution_record
         from hermes_cli.fallback_config import pre_agent_fallback_notice
+        # The turn runner binds the entry's custody record to the agent (agent/route_hooks.py).
+        runner._pre_agent_fallback_entry = resolution_record(fallback_entry, runtime)
         runner._pre_agent_fallback_notice = pre_agent_fallback_notice(
             provider or '', model or '',
             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
@@ -107,7 +110,7 @@ class GatewayTurnPrepareMixin:
         from gateway.session_policy import policy_for_source
         # Every exit path starts clean: a stale notice must never attach to another session's next
         # turn (#74349). Set again below only when THIS resolution fell back.
-        self._pre_agent_fallback_notice = None
+        self._pre_agent_fallback_notice = self._pre_agent_fallback_entry = None
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
             return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
@@ -168,6 +171,8 @@ class GatewayTurnPrepareMixin:
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
         # runner surfaces it through the agent's one-shot fallback notice (#74349).
         self._pre_agent_fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+        from agent.route_hooks import ROUTE_ENTRY_KEY
+        self._pre_agent_fallback_entry = runtime_kwargs.pop(ROUTE_ENTRY_KEY, None)
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)

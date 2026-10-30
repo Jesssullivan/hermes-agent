@@ -3212,14 +3212,15 @@ def _parent_deliberately_ended(session_db: Any, session_id: str) -> bool:
 
 
 def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: Any) -> None:
-    """Migrate /goal, /heartbeat, /loop state, rejected-thinking fingerprints and the title from the parent to the child.
-    Each lookup is a flat per-session read with no parent walk, so state would silently die at the boundary. The title
-    is carried unchanged (renumbering per rotation made one session look like many); its provenance is read BEFORE the
-    transfer clears the ancestor's row, then restored so an inherited auto-title stays upgradeable.
-    """
+    """Migrate /goal, /heartbeat, /loop state, rejected-thinking fingerprints, route-hook labels and the title from the
+    parent to the child. Each lookup is a flat per-session read with no parent walk, so state would silently die at the
+    boundary. The title is carried unchanged (renumbering per rotation made one session look like many); its provenance
+    is read BEFORE the transfer clears the ancestor's row, then restored so an inherited auto-title stays upgradeable."""
     # /goal, /heartbeat, /loop: carried locally, or atomically by the owner on a RuntimeSessionStore.
     from agent.compression_automation import carry_compression_automation
     carry_compression_automation(agent, old_session_id)
+    from agent.route_hooks import carry_session_route_state  # turn_route labels and data use only grow
+    carry_session_route_state(agent, old_session_id)
     with _swallow('Could not carry rejected thinking on compression: %s'):
         from agent.anthropic_thinking_replay import carry_rejected_thinking_to_session
         carry_rejected_thinking_to_session(agent, old_session_id)
@@ -3298,8 +3299,7 @@ def _publish_rotated_compaction(
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),
         watermark_ceiling=_foreign_tail_ceiling,
     )
-    # `already_present` stamping is done by run_agent's _sync_persisted_markers;
-    # this branch covers inserted/merged only; direct callers must use that wrapper.
+    # Only inserted/merged are stamped here; `already_present` is run_agent's _sync_persisted_markers, which direct callers must use.
     if compressed_user_turn_outcome in {"inserted", "merged"}:
         # Stamp the anchor source row itself, not the (drifted, possibly out-of-range)
         # persist index; don't match the HANDOFF row — for `merged` it is a superset.
