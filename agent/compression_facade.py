@@ -276,7 +276,13 @@ class CompressionFacadeMixin:
         active_fence = commit_fence or CompressionCommitFence()
         fence_registration_lock = vars(self).setdefault("_compression_commit_fence_lock", threading.RLock())
         registration = _CommitFenceRegistration(active_fence)
+        # Route hooks (agent/route_hooks.py): outside a turn no route scope is bound, so bind this agent and
+        # the transcript for the auxiliary gate, and check custody for the route the summary may ride.
+        from agent.route_hooks import check_out_of_turn_route, enter_compaction_scope, exit_compaction_scope
+        route_tokens = enter_compaction_scope(self, messages)
         try:
+            if route_tokens[0] is not None:
+                check_out_of_turn_route(self)
             with fence_registration_lock:
                 fence_stack = vars(self).setdefault("_compression_commit_fence_stack", [])
                 fence_stack.append(registration)
@@ -328,6 +334,7 @@ class CompressionFacadeMixin:
                 else:
                     vars(self).pop("_active_compression_commit_fence", None)
             # Restore whatever the caller had, so a compaction never leaks its tag into the surrounding scope.
+            exit_compaction_scope(route_tokens)
             if token is not None:
                 reset_conversation_context(token)
             if affinity_token is not None:

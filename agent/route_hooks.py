@@ -20,7 +20,9 @@ required``.
   (``phase="auxiliary"``), and at turn start (``phase="turn"``) when the agent sits on a
   fallback kept from an earlier turn or on the entry a resolution-time walker built it on.
   Each walker records that entry on the agent (:func:`bind_resolution_entry`); the turn-start
-  check reads the record and never infers it from the agent's own chain.
+  check reads the record and never infers it from the agent's own chain. A compaction outside a
+  turn on such a route is checked first (``phase="compaction"``) and binds its session for the
+  auxiliary gate (:func:`enter_compaction_scope`, :func:`detached_compaction`).
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
   required`` also needs an explicit ``{"action": "allow"}``; any other value that is not an
@@ -92,6 +94,13 @@ _warned_values: set[str] = set()
 _ROUTE_SCOPE: ContextVar[Optional[Callable[[], Any]]] = ContextVar("hermes_route_scope", default=None)
 # The messages of the auxiliary request in flight, for the data use its custody check reports.
 _AUX_REQUEST: ContextVar[Optional[list]] = ContextVar("hermes_route_aux_request", default=None)
+# The messages a compaction summarizes. Out of a turn they are the only record of the session's data.
+_COMPACTION_SOURCE: ContextVar[Optional[list]] = ContextVar("hermes_route_compaction_source", default=None)
+# The entry record of the latest runtime resolution in this context. The gateway resolves in each
+# turn's own copied context, so concurrent sessions never read each other's record.
+_RESOLVED_ENTRY: ContextVar[Optional[Mapping[str, Any]]] = ContextVar("hermes_route_resolved_entry", default=None)
+# The session a caller is resolving a runtime for, bound only for that resolution (:func:`resolving_session`).
+_RESOLVING_SESSION: ContextVar[str] = ContextVar("hermes_route_resolving_session", default="")
 
 
 class RouteCustodyRefused(RuntimeError):
@@ -316,12 +325,15 @@ def carry_session_route_state(agent: Any, old_session_id: Any) -> None:
 # -- agent-side wiring ---------------------------------------------------------------------------
 
 
-def _bind_scope(agent: Any) -> None:
+def _scope_ref(agent: Any) -> Callable[[], Any]:
     try:
-        ref: Callable[[], Any] = weakref.ref(agent)
+        return weakref.ref(agent)
     except TypeError:  # a stand-in without weakref support
-        ref = lambda: agent
-    _ROUTE_SCOPE.set(ref)
+        return lambda: agent
+
+
+def _bind_scope(agent: Any) -> None:
+    _ROUTE_SCOPE.set(_scope_ref(agent))
 
 
 def _scope_agent() -> Any:
@@ -340,6 +352,46 @@ def auxiliary_request(messages: Any) -> Iterator[None]:
         _AUX_REQUEST.reset(token)
 
 
+def enter_compaction_scope(agent: Any, messages: Any) -> tuple[Any, Any]:
+    """Bind *agent* as the route scope of a compaction and the *messages* it summarizes. Out of a
+    turn no scope is bound (the gateway runs each compaction in a fresh copied context), so the
+    auxiliary gate on any worker the compaction starts would see no session. Returns the tokens
+    for :func:`exit_compaction_scope`; the first is ``None`` when *agent* already held the scope."""
+    scope_token = None if _scope_agent() is agent else _ROUTE_SCOPE.set(_scope_ref(agent))
+    return scope_token, _COMPACTION_SOURCE.set(messages if isinstance(messages, list) else None)
+
+
+def exit_compaction_scope(tokens: tuple[Any, Any]) -> None:
+    scope_token, source_token = tokens
+    _COMPACTION_SOURCE.reset(source_token)
+    if scope_token is not None:
+        _ROUTE_SCOPE.reset(scope_token)
+
+
+class _CompactionRoute:
+    """The route and session of a compaction that runs with no agent (``session.mutate compress``)."""
+
+    def __init__(self, *, session_id: str, provider: str, model: str, platform: str = "") -> None:
+        self.session_id, self.provider, self.model, self.platform = session_id, provider, model, platform
+
+
+@contextmanager
+def detached_compaction(record: Any, *, session_id: str, provider: str, model: str, messages: list,
+                        platform: str = "") -> Iterator[None]:
+    """Route scope and custody for a compaction that summarizes *messages* on a resolved runtime
+    with no agent: the auxiliary gate sees the session's labels and the messages' data use, and a
+    gated resolution-time *record* is checked first. Raises :class:`RouteCustodyRefused`."""
+    route = _CompactionRoute(session_id=str(session_id or ""), provider=str(provider or ""), model=str(model or ""),
+                             platform=platform)
+    bind_resolution_entry(route, record)
+    tokens = enter_compaction_scope(route, messages)
+    try:
+        check_out_of_turn_route(route)
+        yield
+    finally:
+        exit_compaction_scope(tokens)
+
+
 def _turn_messages(agent: Any) -> list:
     turn = getattr(agent, "_route_turn", None) or {}
     messages = turn.get("messages")
@@ -347,13 +399,22 @@ def _turn_messages(agent: Any) -> list:
     out = list(messages) if isinstance(messages, list) else []
     if isinstance(live, list) and live is not messages:
         out.extend(live)
-    return out
+    source = _COMPACTION_SOURCE.get()
+    # Out of a turn the agent may hold no messages: the transcript being compacted stands in.
+    return out or (list(source) if isinstance(source, list) else [])
+
+
+def _compaction_data_use() -> frozenset[str]:
+    from agent.message_metadata import data_use_requirement
+    source = _COMPACTION_SOURCE.get()
+    return data_use_requirement(source) if isinstance(source, list) else frozenset()
 
 
 def _turn_data_use(agent: Any, messages: list) -> frozenset[str]:
     from agent.message_metadata import data_use_requirement
     turn = getattr(agent, "_route_turn", None) or {}
-    return data_use_requirement(messages) | frozenset(turn.get("data_use") or ()) | _session_data_use(agent)
+    return (data_use_requirement(messages) | frozenset(turn.get("data_use") or ()) | _session_data_use(agent)
+            | _compaction_data_use())
 
 
 def _labels_known(agent: Any) -> bool:
@@ -433,16 +494,59 @@ def mark_resolution_entry(runtime: dict[str, Any], entry: Mapping[str, Any]) -> 
     return runtime
 
 
+def stash_resolution_entry(record: Any) -> None:
+    """Hold the entry record of the resolution just made (``None`` when the primary resolved) for
+    the caller that builds on it, in this context only."""
+    _RESOLVED_ENTRY.set(dict(record) if isinstance(record, Mapping) else None)
+
+
+def take_resolution_entry() -> Optional[dict[str, Any]]:
+    """The record :func:`stash_resolution_entry` held in this context, once."""
+    record = _RESOLVED_ENTRY.get()
+    _RESOLVED_ENTRY.set(None)
+    return dict(record) if isinstance(record, Mapping) else None
+
+
+def _bound_route(agent: Any) -> dict[str, str]:
+    """The route the agent was built on: its primary while a kept fallback is active."""
+    primary = getattr(agent, "_primary_runtime", None)
+    if getattr(agent, "_provider_fallback_active", False) and isinstance(primary, Mapping):
+        return _route(primary.get("provider"), primary.get("model"))
+    return _current_route(agent)
+
+
 def bind_resolution_entry(agent: Any, record: Any, *, source: str = "resolve") -> None:
     """Record on *agent* the fallback entry a resolution-time walker built it on, so each turn
-    start re-checks custody for it. A ``None`` record clears an earlier record of the same
-    *source* (the gateway resolves again every turn). The record does not depend on the agent's
-    own chain, which a safe-mode or API-locked session leaves empty."""
+    start re-checks custody for it. The record keeps the agent's own route as built
+    (``bound_route``), so a model the agent rewrote after resolution still matches. A ``None``
+    record clears an earlier record of the same *source* (the gateway resolves again every turn).
+    The record does not depend on the agent's own chain, which a safe-mode or API-locked session
+    leaves empty."""
     current = getattr(agent, "_route_resolution_entry", None)
     if isinstance(record, Mapping) and (record.get("provider") or record.get("resolved_provider")):
-        agent._route_resolution_entry = {**record, "source": source}
+        bound = {**record, "source": source}
+        _snapshot_bound_route(agent, bound)
+        agent._route_resolution_entry = bound
     elif isinstance(current, Mapping) and current.get("source") == source:
         agent._route_resolution_entry = None
+
+
+def _snapshot_bound_route(agent: Any, record: dict[str, Any]) -> None:
+    """Keep the agent's route as ``bound_route`` when its provider is the entry's: a model the agent
+    rewrote (``nous/welcome``) then still matches. A route on another provider is not the entry."""
+    bound = _bound_route(agent)
+    entry_forms = _provider_forms(record.get("provider")) | _provider_forms(record.get("resolved_provider"))
+    if entry_forms & _provider_forms(bound["provider"]):
+        record["bound_route"] = bound
+
+
+def settle_init_resolution_route(agent: Any) -> None:
+    """Agent construction finished: the init-time record takes the route the agent will send on,
+    once. A later deliberate model switch leaves it alone and so reads as a move off the entry."""
+    record = getattr(agent, "_route_resolution_entry", None)
+    if isinstance(record, dict) and record.get("source") == "init" and not record.get("settled"):
+        _snapshot_bound_route(agent, record)
+        record["settled"] = True
 
 
 def _provider_forms(name: Any) -> frozenset[str]:
@@ -474,18 +578,26 @@ def _same_model(wanted: Iterable[str], model: str, provider: str) -> bool:
 
 def _resolution_fallback_entry(agent: Any) -> Optional[Mapping[str, Any]]:
     """The recorded resolution-time entry when a custody decision applies to it and the agent
-    still runs on it: provider names compared in canonical form on both sides, model as
-    configured or as resolved. ``None`` with no record, no gate, or after the agent moved off the
-    entry (``/model``, a request route)."""
+    still runs on it. The agent's route matches the entry as configured, as resolved, or as the
+    agent was built on it (``bound_route``), with provider names in canonical form on every side.
+    ``None`` with no record, no gate, or after the agent moved off the entry (``/model``, a request
+    route), which is logged once at warning."""
     record = getattr(agent, "_route_resolution_entry", None)
     if not isinstance(record, Mapping) or not _gated(record):
         return None
     current = _current_route(agent)
-    wanted = _provider_forms(record.get("provider")) | _provider_forms(record.get("resolved_provider"))
-    if not wanted & _provider_forms(current["provider"]):
-        return None
-    models = (str(record.get("model") or ""), str(record.get("resolved_model") or ""))
-    return record if _same_model(models, current["model"], current["provider"]) else None
+    bound = record.get("bound_route") if isinstance(record.get("bound_route"), Mapping) else {}
+    wanted = (_provider_forms(record.get("provider")) | _provider_forms(record.get("resolved_provider"))
+              | _provider_forms(bound.get("provider")))
+    models = (str(record.get("model") or ""), str(record.get("resolved_model") or ""), str(bound.get("model") or ""))
+    if wanted & _provider_forms(current["provider"]) and _same_model(models, current["model"], current["provider"]):
+        return record
+    if isinstance(record, dict) and not record.get("left_warned"):
+        record["left_warned"] = True
+        logger.warning("Route custody: the agent left the resolution-time entry %s/%s (now %s/%s); "
+                       "turn starts no longer check it", record.get("provider"), record.get("model"),
+                       current["provider"], current["model"])
+    return None
 
 
 def _recheck_resolution_fallback(agent: Any) -> None:
@@ -525,17 +637,47 @@ def _recheck_kept_fallback(agent: Any) -> bool:
     return True
 
 
+def check_out_of_turn_route(agent: Any) -> None:
+    """F3 before a compaction outside a turn sends the transcript on the agent's own route: a kept
+    fallback or a resolution-time entry is checked with ``phase="compaction"``, the session's
+    labels and the transcript's data use. Nothing is restored outside a turn: a refusal raises
+    :class:`RouteCustodyRefused` and the compaction does not run."""
+    if getattr(agent, "_provider_fallback_active", False):
+        entry = getattr(agent, "_route_fallback_entry", None)
+        entry = entry if isinstance(entry, Mapping) and _gated(entry) else None
+    else:
+        entry = _resolution_fallback_entry(agent)
+    if entry is None:
+        return
+    if fallback_custody_refuses(agent, entry, str(entry.get("provider") or ""), str(entry.get("model") or ""),
+                                phase="compaction"):
+        raise RouteCustodyRefused(
+            f"route custody refused {entry.get('provider')}/{entry.get('model')} for a compaction outside a turn")
+
+
+@contextmanager
+def resolving_session(session_id: Any) -> Iterator[None]:
+    """Name the session a runtime resolution serves, so its resolve-phase custody check reads the
+    labels earlier turns gave that session. Bound by the caller for that resolution only."""
+    token = _RESOLVING_SESSION.set(str(session_id or ""))
+    try:
+        yield
+    finally:
+        _RESOLVING_SESSION.reset(token)
+
+
 def resolution_refuses(entry: Mapping[str, Any], *, primary: dict[str, str], chain: Iterable[Mapping[str, Any]],
                        labels_cache: dict[str, Any], session_id: str = "") -> bool:
     """F2 and F3 for a resolution-time walker, which runs before any agent or turn exists: the
     custody gate sees no messages and no data use, so it decides from labels: the resolve-phase
-    labels plus, when the caller passes *session_id*, the labels earlier turns gave that session
-    in this process. The thread's bound session is not used: a resolving thread may still carry
-    another session's binding. The agent built on the chosen entry is checked again at each turn
-    start with the turn's messages and the session's labels."""
+    labels plus, when the caller names the session (*session_id* or :func:`resolving_session`),
+    the labels earlier turns gave that session in this process. The thread's bound session is not
+    used: a resolving thread may still carry another session's binding. The agent built on the
+    chosen entry is checked again at each turn start with the turn's messages and the session's
+    labels."""
     if not (_gated(entry) or _has_hook(TURN_ROUTE_HOOK)):
         return False
-    session_id = str(session_id or "")
+    session_id = str(session_id or _RESOLVING_SESSION.get() or "")
     if "labels" not in labels_cache:
         prior = session_labels(session_id)
         labels, known = announce_route(phase="resolve", route=primary, chain=_chain_routes(chain), labels=prior,

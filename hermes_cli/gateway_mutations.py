@@ -46,7 +46,7 @@ class PreparedMutations:
                 if str(exc) in {'invalid_params', 'revision_conflict', 'stale_generation',
                                 'session_busy', 'unknown_execution', 'permission_denied',
                                 'model_resolution_failed', 'nothing_to_compress',
-                                'unsupported_compress_options'}:
+                                'unsupported_compress_options', 'route_custody_refused'}:
                     self.pending.pop(key)
                 raise
             refusal = entry['result']

@@ -1597,17 +1597,17 @@ def _adopt_live_compression_child(
     recovered = loader(session_db, child_session_id)
     if not (isinstance(recovered, list) and recovered):
         return None
-    # Revalidate after loading: the tip may have rotated or a competing
-    # continuation may have appeared between the two DB reads.
+    # Revalidate after loading: the tip may have rotated or a competing continuation may have appeared between the two reads.
     confirmed = resolver(session_db, parent_session_id)
     if not confirmed or str(confirmed) != child_session_id:
         return None
     agent.session_id = child_session_id
     _rebind_session_context(child_session_id)
+    from agent.route_hooks import carry_session_route_state  # turn_route labels and data use follow the tip
+    carry_session_route_state(agent, parent_session_id)
     _hand_off_metrics_segment(parent_session_id, child_session_id)
     agent._session_db_created = True
-    # The turn skips restore/rebuild while this slot is set, so it may hold only the child's own
-    # prompt, and only when that prompt matches the current runtime (otherwise None -> rebuild).
+    # The turn skips restore/rebuild while this slot is set, so it may hold only the child's own prompt, and only when that prompt matches the current runtime (otherwise None -> rebuild).
     # Turn-start adoption runs before _restore_primary_runtime on purpose; a reject here is re-checked by the normal restore.
     from agent.conversation_loop import _stored_prompt_matches_runtime
     child_prompt = child.get("system_prompt")

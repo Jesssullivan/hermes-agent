@@ -503,6 +503,9 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             logger.info("[Feishu-Comment] _run_comment_agent: loaded %d history messages from session %s", len(history), session_key)
         agent = AIAgent(model=model, **{k: runtime_kwargs.get(k) for k in ("base_url", "api_key", "provider", "api_mode", "credential_pool", "reasoning_config")},
                         quiet_mode=True, skip_context_files=True, skip_memory=True, max_iterations=15, enabled_toolsets=["feishu_doc", "feishu_drive"])
+        from agent.route_hooks import ROUTE_ENTRY_KEY, bind_resolution_entry
+        # A resolution-time fallback entry is re-checked by route custody at each turn start (agent/route_hooks.py).
+        bind_resolution_entry(agent, runtime_kwargs.get(ROUTE_ENTRY_KEY))
         try:
             logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)", len(prompt), len(history))
             result = agent.run_conversation(prompt, conversation_history=history or None)

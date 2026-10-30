@@ -1243,8 +1243,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
             # fallback was resolved before any agent exists (#74349); one-shot per turn.
             pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
-            pending_route_entry = getattr(runner, "_pre_agent_fallback_entry", None)
-            runner._pre_agent_fallback_notice = runner._pre_agent_fallback_entry = None
+            runner._pre_agent_fallback_notice = None
+            from agent.route_hooks import take_resolution_entry  # this context's record, never another session's
+            pending_route_entry = take_resolution_entry()
             from gateway.session_api_turn import prepare_api_runtime
             model, runtime_kwargs = prepare_api_runtime(model, runtime_kwargs)
             if policy and policy.model and not pending_fallback_notice:
