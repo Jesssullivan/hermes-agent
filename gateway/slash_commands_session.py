@@ -718,6 +718,8 @@ class GatewaySessionCommandsMixin:
         # the original conversation, not a default "cli" host.
         platform_key = _platform_config_key(source.platform) if source.platform else None
         model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, session_key=session_key)
+        from agent.route_hooks import bind_resolution_entry, take_resolution_entry
+        route_entry = take_resolution_entry()  # custody record of a resolution-time fallback (agent/route_hooks.py)
         if str(runtime_kwargs.get("api_mode") or "").lower() == "codex_app_server":
             # Context lives in the server-side thread of the LIVE cached agent; a temporary agent
             # has none (and finally-eviction would destroy the real context).
@@ -737,6 +739,7 @@ class GatewaySessionCommandsMixin:
         runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
 
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
+        bind_resolution_entry(tmp_agent, route_entry)  # _compress_context checks it before any summary request
         try:
             # Not a bare run_in_executor: the profile secret scope is a contextvar the default
             # executor hop would drop, failing aux-client credential resolution closed.

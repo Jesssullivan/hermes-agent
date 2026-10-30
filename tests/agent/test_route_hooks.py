@@ -333,14 +333,20 @@ class TestRoutesExhausted:
             return {"reply": "  Back at 14:05.  "}
 
         hooks["on_routes_exhausted"] = [exhausted]
-        result = route_hooks.routes_exhausted(
-            self._exhausted_agent(), {"final_response": "Rate limited after 3 retries", "error": "429"},
-            classified=self.CLASSIFIED, provider="openai", model="gpt-4o")
+        now = 1_800_000_000.0
+        classified = SimpleNamespace(reason=FailoverReason.rate_limit, retryable=True,
+                                     error_context={"reset_at": now + 3600})
+        agent = self._exhausted_agent()
+        # Frozen clock: the reset is an hour away however long the suite has been running.
+        with patch("agent.route_hooks.time", SimpleNamespace(time=lambda: now)):
+            result = route_hooks.routes_exhausted(
+                agent, {"final_response": "Rate limited after 3 retries", "error": "429"},
+                classified=classified, provider="openai", model="gpt-4o")
         assert result["final_response"] == "Back at 14:05."
         assert result["routes_exhausted"] is True and result["routes_exhausted_reply"] is True
         assert result["error"] == "429"
         event = events[0]
-        assert event["reason"] == "rate_limit" and 3500 < event["reset_in_seconds"] <= 3600
+        assert event["reason"] == "rate_limit" and event["reset_in_seconds"] == 3600
         assert event["route"] == {"provider": "openai", "model": "gpt-4o"}
         assert "messages" not in event  # values-free: routes, labels and timing only
 

@@ -44,6 +44,8 @@ async def prepare_compress(authority, live, payload, prepared):
     if options.get('checkpoint_required'):
         raise RuntimeStoreError('compression_checkpoint_required')
     model, runtime = authority.runner._resolve_session_agent_runtime(source=live.source, session_key=live.route)
+    from agent.route_hooks import RouteCustodyRefused, detached_compaction, take_resolution_entry
+    route_entry = take_resolution_entry()  # custody record of a resolution-time fallback (agent/route_hooks.py)
     if runtime.get('api_mode') == 'codex_app_server':
         raise RuntimeStoreError('runtime_coordination_required')
     history = authority.db.get_messages_as_conversation(snapshot['target'])
@@ -66,7 +68,11 @@ async def prepare_compress(authority, live, payload, prepared):
     resident = cached_agent(live.route) if callable(cached_agent) else None
 
     def summarize():
-        with policy_scope(policy, authority=authority):
+        # Route custody: the summary rides this runtime with no agent, so check its entry with the session's
+        # labels and the transcript's data use, and give the auxiliary gate the same scope.
+        with policy_scope(policy, authority=authority), detached_compaction(
+                route_entry, session_id=snapshot['target'], provider=runtime.get('provider') or '', model=model,
+                messages=head):
             from agent.conversation_compression import _pre_compress_memory_context
             memory_context = _pre_compress_memory_context(resident, head, False) if resident is not None else ''
             compressor = ContextCompressor(model, base_url=runtime.get('base_url') or '',
@@ -81,7 +87,10 @@ async def prepare_compress(authority, live, payload, prepared):
             if not any(m.get('_compressed_summary') for m in compressed):
                 return None, compressor
             return rejoin_compressed_head_and_tail(compressed, tail), compressor
-    compressed, compressor = await asyncio.to_thread(summarize)
+    try:
+        compressed, compressor = await asyncio.to_thread(summarize)
+    except RouteCustodyRefused as exc:
+        raise RuntimeStoreError('route_custody_refused', detail=str(exc)) from exc
     # The same report every native /compress prints ("Compressed: N → M messages").
     from agent.manual_compression_feedback import summarize_manual_compression
     if compressed is None:

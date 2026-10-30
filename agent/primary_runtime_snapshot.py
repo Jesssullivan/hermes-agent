@@ -44,6 +44,9 @@ def _snapshot_primary_runtime(agent):
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+    # Construction is done: an init-time custody record takes the route the agent sends on (agent/route_hooks.py).
+    from agent.route_hooks import settle_init_resolution_route
+    settle_init_resolution_route(agent)
 
 
 def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
