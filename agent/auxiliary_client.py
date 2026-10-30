@@ -122,6 +122,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
+from agent.route_hooks import auxiliary_refuses
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4337,10 +4338,6 @@ def _try_main_agent_model_fallback(
     return client, resolved_model or main_model, label
 
 
-# Context-window screening for runtime fallback chains: the startup feasibility check filters
-# too-small aux models; runtime chains must too, or compression stops at a reachable-but-too-small
-# candidate. ``None`` (unknown) passes through.
-
 # ── Context-window screening for runtime fallback chains (issue #52392) ── When the runtime auxiliary
 # fallback chain selects a candidate that is reachable but has a context window smaller than the compression
 # task requires, the call errors out instead of continuing to the next, viable candidate. The startup
@@ -4413,7 +4410,8 @@ def _try_configured_fallback_chain(
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
-        if skip(fb_provider, fb_model_raw, fb_base_url):
+        if skip(fb_provider, fb_model_raw, fb_base_url) or auxiliary_refuses(  # route_custody (F3)
+                entry, task=task, failed_provider=failed_provider, failed_model=failed_model):
             continue
         if _is_provider_unhealthy(fb_provider, fb_base_url):
             _log_skip_unhealthy(fb_provider, task, base_url=fb_base_url)
@@ -4502,10 +4500,10 @@ def _try_main_fallback_chain(
         fb_model = str(entry.get("model") or "").strip()
         if not fb_provider or not fb_model:
             continue
-        fb_norm = fb_provider.lower()
-        label = f"fallback_providers[{i}]({fb_provider})"
+        fb_norm, label = fb_provider.lower(), f"fallback_providers[{i}]({fb_provider})"
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
-        if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
+        if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url) or auxiliary_refuses(  # route_custody (F3)
+                entry, task=task, failed_provider=failed_provider, failed_model=failed_model):
             tried.append(f"{label} (skipped)")
             continue
         if _is_provider_unhealthy(fb_norm, fb_base_url):

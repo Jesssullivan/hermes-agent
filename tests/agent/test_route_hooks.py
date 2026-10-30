@@ -327,3 +327,290 @@ class TestRoutesExhausted:
         result = route_hooks.routes_exhausted(self._exhausted_agent(), {"final_response": "default"},
                                               classified=self.CLASSIFIED, provider="openai", model="gpt-4o")
         assert result["final_response"] == "default"
+
+
+# ── Review fixes: custody on every path that can reach a required entry ─────────────────
+
+
+def _client_for(provider=None, model=None, **_kw):
+    client = MagicMock()
+    client.base_url, client.api_key = f"https://{provider}.example/v1", "k"
+    return client, model
+
+
+class TestCustodyValue:
+    @pytest.mark.parametrize("value", ["required", " Required ", True, "yes", "true", 1, "requierd"])
+    def test_required_or_unrecognised_values_gate_the_entry(self, value):
+        assert route_hooks.entry_requires_custody({**HOSTED, "route_custody": value}) is True
+
+    @pytest.mark.parametrize("value", [None, False, "", "optional", "off", "none", "no", "false"])
+    def test_off_values_leave_the_entry_ungated(self, value):
+        assert route_hooks.entry_requires_custody({**HOSTED, "route_custody": value}) is False
+
+    def test_an_unrecognised_value_warns_and_fails_closed(self, hooks, caplog):
+        route_hooks._warned_values.discard("yes")
+        agent = _make_agent([{**HOSTED, "route_custody": "yes"}, LOCAL])
+        with caplog.at_level("WARNING", logger="agent.route_hooks"):
+            assert _activate(agent) is True
+        assert agent.provider == "zai"
+        assert "unrecognised route_custody value" in caplog.text
+
+
+class TestAuxiliaryCustody:
+    CHAIN = [{**HOSTED, "route_custody": "required"}, LOCAL]
+
+    def test_auto_auxiliary_call_skips_a_required_main_chain_entry(self, hooks):
+        """A provider: auto auxiliary call whose main route fails walks fallback_providers; the
+        required entry carries none of it while no gate is loaded."""
+        resolved = []
+
+        def resolve_entry(entry):
+            resolved.append(entry["provider"])
+            return _client_for(entry["provider"], entry["model"])
+
+        with (
+            patch("agent.auxiliary_client._try_main_provider_route", return_value=None),
+            patch("hermes_cli.config.load_config_readonly", return_value={"fallback_providers": self.CHAIN}),
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={}),
+            patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=resolve_entry),
+            patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
+            patch("agent.auxiliary_client._context_too_small", return_value=None),
+        ):
+            from agent.auxiliary_client import _resolve_auto_route
+            _client, model, provider = _resolve_auto_route({"provider": "anthropic", "model": "opus"}, task="compression")
+        assert (provider, model) == ("zai", "glm-4.7")
+        assert resolved == ["zai"]
+
+    def test_task_chain_and_gate_see_the_task_and_session_labels(self, hooks):
+        seen = []
+
+        def custody(phase, candidate, task, labels, **_kw):
+            seen.append((phase, candidate["provider"], task, labels))
+            return {"action": "skip"} if candidate["provider"] == "openai" else None
+
+        hooks["route_custody"] = [custody]
+        route_hooks._remember_session_labels("aux-session", frozenset({"acme:client"}))
+        from hermes_logging import clear_session_context, set_session_context
+        set_session_context("aux-session")
+        try:
+            with (
+                patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": [HOSTED, LOCAL]}),
+                patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=lambda e: _client_for(e["provider"], e["model"])),
+                patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
+            ):
+                from agent.auxiliary_client import _try_configured_fallback_chain
+                _client, model, label = _try_configured_fallback_chain("compression", "anthropic", reason="rate limit")
+        finally:
+            clear_session_context()
+        assert model == "glm-4.7" and "zai" in label
+        assert seen[0] == ("auxiliary", "openai", "compression", ["acme:client"])
+
+    def test_compression_stall_retry_route_skips_a_required_entry(self, hooks):
+        with (
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": self.CHAIN}),
+            patch("agent.auxiliary_client._fallback_entry_api_key", return_value="k"),
+        ):
+            from agent.conversation_compression import resolve_compression_fallback_route
+            route = resolve_compression_fallback_route()
+        assert (route["provider"], route["model"]) == ("zai", "glm-4.7")
+
+
+class _KeptFallbackAgent:
+    """Stand-in for an agent kept on a fallback while its primary cools down. Records the route
+    each turn-start compression request would have gone to."""
+
+    def __new__(cls, *, restorable):
+        from tests.agent.test_turn_context import _FakeAgent
+
+        agent = _FakeAgent()
+        agent.provider, agent.model = "openai", "gpt-4o"
+        agent._fallback_chain, agent._fallback_index = [HOSTED], 1
+        agent._provider_fallback_active, agent._route_fallback_entry = True, dict(HOSTED)
+        agent._rate_limited_until = time.monotonic() + 600
+        agent.compression_routes = []
+
+        def restore():
+            if agent._rate_limited_until > time.monotonic() or not restorable:
+                return False
+            agent.provider, agent.model, agent._provider_fallback_active = "anthropic", "opus", False
+            return True
+
+        def compress(messages, *_a, **_kw):
+            agent.compression_routes.append((agent.provider, agent.model))
+            return messages, "SYSTEM"
+
+        agent._restore_primary_runtime = restore
+        agent._compress_context = compress
+        agent.compression_enabled = True
+        agent.max_compression_attempts = 3
+        agent.context_compressor = SimpleNamespace(
+            protect_first_n=2, protect_last_n=2, threshold_tokens=1_000, context_length=200_000,
+            summary_target_ratio=0.3, last_prompt_tokens=0, should_compress=lambda tokens=None: True,
+            should_compress_info=lambda tokens=None: (True, None),
+            get_active_compression_failure_cooldown=lambda: None)
+        return agent
+
+
+class TestTurnStartOrder:
+    HISTORY = [{"role": "user", "content": "client rows"}, {"role": "assistant", "content": "x" * 8_000}]
+
+    @pytest.fixture(autouse=True)
+    def _quiet_runtime_main(self):
+        with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+            yield
+
+    def _turn(self, agent):
+        from tests.agent.test_turn_context import _build
+        return _build(agent, conversation_history=list(self.HISTORY))
+
+    def test_refused_kept_fallback_never_receives_turn_start_compaction(self, hooks):
+        hooks["route_custody"] = [lambda candidate, **_kw: {"action": "skip"} if candidate["provider"] == "openai" else None]
+        agent = _KeptFallbackAgent(restorable=False)
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            self._turn(agent)
+        assert agent.compression_routes == []
+
+    def test_compaction_runs_on_the_restored_primary(self, hooks):
+        hooks["route_custody"] = [lambda candidate, **_kw: {"action": "skip"} if candidate["provider"] == "openai" else None]
+        agent = _KeptFallbackAgent(restorable=True)
+        self._turn(agent)
+        assert agent.compression_routes and set(agent.compression_routes) == {("anthropic", "opus")}
+        assert agent._rate_limited_until > time.monotonic()  # the primary keeps its cooldown
+
+
+class TestResolutionTimeAgent:
+    """An agent built on a fallback before it existed (gateway, one-shot, TUI, cron): its active
+    route is an entry of its own chain and nothing marks a fallback as active."""
+
+    @staticmethod
+    def _built_on(entry, chain, session_id="s1"):
+        agent = _make_agent(chain)
+        agent.provider, agent.model, agent.session_id = entry["provider"], entry["model"], session_id
+        assert not getattr(agent, "_provider_fallback_active", False)
+        return agent
+
+    def test_required_entry_stops_the_turn_without_a_gate(self, hooks):
+        required = {**HOSTED, "route_custody": "required"}
+        agent = self._built_on(required, [required, LOCAL])
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            route_hooks.begin_turn(agent, messages=[{"role": "user", "content": "hi"}], turn_id="t1")
+
+    def test_plain_entry_is_untouched_without_a_gate(self, hooks):
+        agent = self._built_on(HOSTED, [HOSTED, LOCAL])
+        with patch.object(route_hooks, "_invoke") as invoke:
+            route_hooks.begin_turn(agent, messages=[{"role": "user", "content": "hi"}], turn_id="t1")
+        invoke.assert_not_called()
+
+    def test_gate_sees_the_turn_and_earlier_session_labels(self, hooks):
+        seen = []
+        hooks["turn_route"] = [lambda data_use, **_kw: {"labels": ["acme:client"]} if data_use else None]
+
+        def custody(phase, candidate, labels, data_use, messages, **_kw):
+            seen.append((phase, candidate["provider"], labels, data_use, len(messages)))
+            return {"action": "skip"} if "acme:client" in labels and candidate["provider"] == "openai" else None
+
+        hooks["route_custody"] = [custody]
+        first = _make_agent([HOSTED, LOCAL])
+        first.session_id = "gw-session"
+        route_hooks.begin_turn(first, messages=[_tool_message(["acme:client-raw"])], turn_id="t1")
+        # The primary then fails; the gateway builds a new agent for the same session on HOSTED.
+        rebuilt = self._built_on(HOSTED, [HOSTED, LOCAL], session_id="gw-session")
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            route_hooks.begin_turn(rebuilt, messages=[{"role": "user", "content": "plain"}], turn_id="t2")
+        assert seen[-1] == ("turn", "openai", ["acme:client"], [], 1)
+
+    def test_resolve_phase_gate_sees_labels_of_a_named_session_only(self, hooks):
+        seen = []
+        hooks["route_custody"] = [lambda labels, session_id, **_kw: seen.append((labels, session_id))]
+        route_hooks._remember_session_labels("gw-2", frozenset({"acme:client"}))
+        primary = {"provider": "anthropic", "model": "opus"}
+        route_hooks.resolution_refuses(HOSTED, primary=primary, chain=[HOSTED], labels_cache={}, session_id="gw-2")
+        from hermes_logging import clear_session_context, set_session_context
+        set_session_context("gw-2")  # a stale thread binding is not trusted at resolve time
+        try:
+            route_hooks.resolution_refuses(HOSTED, primary=primary, chain=[HOSTED], labels_cache={})
+        finally:
+            clear_session_context()
+        assert seen == [(["acme:client"], "gw-2"), ([], "")]
+
+    def test_refusal_ends_the_turn_with_the_routes_exhausted_reply(self, hooks):
+        events = []
+        hooks["on_routes_exhausted"] = [lambda **kw: events.append(kw) or {"reply": "Holding: no cleared route."}]
+        agent = self._built_on(HOSTED, [HOSTED])
+        result = route_hooks.route_custody_refused_result(
+            agent, route_hooks.RouteCustodyRefused("refused"), [{"role": "user", "content": "earlier"}])
+        assert result["final_response"] == "Holding: no cleared route."
+        assert (result["failure_reason"], result["api_calls"], result["failed"]) == ("route_custody", 0, True)
+        assert result["messages"] == [{"role": "user", "content": "earlier"}]
+        assert events[0]["reason"] == "route_custody" and "messages" not in events[0]
+
+    def test_conversation_loop_returns_the_refusal_result(self, hooks):
+        agent = _make_agent([HOSTED])
+        with patch("agent.conversation_loop.build_turn_context",
+                   side_effect=route_hooks.RouteCustodyRefused("refused")):
+            result = agent.run_conversation("hi")
+        assert result["failure_reason"] == "route_custody" and result["api_calls"] == 0
+
+    def test_init_time_walker_skips_a_required_entry(self, hooks):
+        from agent.agent_init import _routed_client_kwargs
+
+        def resolve(provider, model=None, **_kw):
+            return (None, None) if provider == "anthropic" else _client_for(provider, model)
+
+        agent = SimpleNamespace(provider="anthropic", requested_provider="anthropic", model="opus",
+                                api_mode="chat_completions", _fallback_activated=False)
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve):
+            kwargs = _routed_client_kwargs(agent, [{**HOSTED, "route_custody": "required"}, LOCAL], None)
+        assert (agent.provider, agent.model) == ("zai", "glm-4.7")
+        assert kwargs["base_url"] == "https://zai.example/v1"
+
+
+class TestCronCustody:
+    def test_cron_walker_skips_a_required_entry_with_no_plugin(self, hooks):
+        from cron.scheduler import _CronJobConfig, _resolve_job_runtime
+
+        chain = [{"provider": "openai", "model": "gpt-4o", "route_custody": "required"},
+                 {"provider": "zai", "model": "glm-4.7"}]
+        jc = _CronJobConfig(cfg={"fallback_providers": chain}, model="opus", model_cfg={}, cron_default_provider="")
+
+        def resolve(**kw):
+            if kw.get("requested") in (None, "anthropic"):
+                raise AuthError("No credentials stored")
+            return {"api_key": "k", "base_url": "https://x.example/v1", "provider": kw["requested"],
+                    "api_mode": "chat_completions"}
+
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve):
+            runtime, model = _resolve_job_runtime({"id": "j1", "prompt": "p"}, "j1", jc)
+        assert (runtime["provider"], model) == ("zai", "glm-4.7")
+
+
+class TestRoutesExhaustedReplyScope:
+    def _agent(self):
+        agent = _make_agent([HOSTED])
+        assert _activate(agent) is True
+        assert agent._try_activate_fallback(reason=FailoverReason.rate_limit) is False
+        return agent
+
+    def test_auth_copy_keeps_its_relogin_guidance(self, hooks):
+        hooks["on_routes_exhausted"] = [lambda **_kw: {"reply": "busy"}]
+        classified = SimpleNamespace(reason=FailoverReason.auth_permanent, retryable=False, error_context={})
+        result = route_hooks.routes_exhausted(self._agent(), {"final_response": "Run hermes login"},
+                                              classified=classified, provider="openai", model="gpt-4o")
+        assert result["final_response"] == "Run hermes login" and result["routes_exhausted"] is True
+        assert "routes_exhausted_reply" not in result
+
+    def test_delivered_partial_text_stays_in_front_of_the_reply(self, hooks):
+        hooks["on_routes_exhausted"] = [lambda **_kw: {"reply": "Back at 14:05."}]
+        classified = SimpleNamespace(reason=FailoverReason.rate_limit, retryable=True, error_context={})
+        result = route_hooks.routes_exhausted(
+            self._agent(), {"final_response": "Half an answer\n\nRate limited", "partial": True},
+            classified=classified, provider="openai", model="gpt-4o", delivered="Half an answer")
+        assert result["final_response"] == "Half an answer\n\nBack at 14:05."
+
+    def test_free_tier_card_keeps_its_copy(self, hooks):
+        hooks["on_routes_exhausted"] = [lambda **_kw: {"reply": "busy"}]
+        classified = SimpleNamespace(reason=FailoverReason.rate_limit, retryable=True, error_context={})
+        result = route_hooks.routes_exhausted(
+            self._agent(), {"final_response": "Sign in", "free_tier": {"kind": "refused", "message": "Sign in"}},
+            classified=classified, provider="openai", model="gpt-4o")
+        assert result["final_response"] == "Sign in"
