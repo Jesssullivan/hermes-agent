@@ -262,6 +262,11 @@ async def write_mutation(authority, ref, params, editor_servers, *, principal_id
                 from gateway.session_onboarding import ending_run_on_delete
                 commit = partial(ending_run_on_delete, authority.db, ref.session_id, commit)
             result = await asyncio.to_thread(commit)
+        if operation == 'compress' and isinstance(result, dict):
+            # Route hooks (agent/route_hooks.py): a rotated child keeps the session's labels and data use,
+            # before any turn can start on it. Idempotent, so an exact retry repeats it.
+            from agent.route_hooks import carry_route_state
+            carry_route_state(result.get('previous_target_session_id'), result.get('target_session_id'))
         try:
             await _project_result(authority, ref, live, params, result, editor_servers, applied=applied)
         finally:
