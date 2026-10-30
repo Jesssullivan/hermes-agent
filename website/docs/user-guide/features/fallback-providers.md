@@ -122,7 +122,7 @@ fallback_providers:
 
 ### Custody-Gated Fallback
 
-An entry with `route_custody: required` is used only when a `route_custody` plugin hook allows it for the current turn. With no such plugin loaded the entry is always skipped, so a hosted fallback never carries a turn its gate has not seen. Entries without the key behave as before; a loaded `route_custody` hook may still skip them. The hook and its companions `turn_route` and `on_routes_exhausted` are described in [Hooks](./hooks.md#route-hooks-turn_route-route_custody-on_routes_exhausted).
+An entry with `route_custody: required` is used only when a `route_custody` plugin hook allows it. The check covers turn failover, the resolution-time walkers (gateway, one-shot, TUI, cron and agent init), auxiliary and compression calls that walk this chain, and each turn start while the agent runs on the entry. With no such plugin loaded the entry is always skipped. Any value other than `required` or an off value (`optional`, `off`, `none`, `no`, `false`) counts as `required`, with a warning. Entries without the key behave as before; a loaded `route_custody` hook may still skip them. The hook and its companions `turn_route` and `on_routes_exhausted` are described in [Hooks](./hooks.md#route-hooks-turn_route-route_custody-on_routes_exhausted).
 
 ```yaml
 fallback_providers:

@@ -863,16 +863,18 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
         if is_actual_route(effective_provider):
             agent.provider = normalize_provider(effective_provider)
         return _client_kwargs_from_routed(_routed_client, _provider_timeout)
-    # No credentials: try the fallback chain BEFORE failing (an exhausted single-entry pool
-    # must not die with a misleading "No LLM provider configured"); only explicitly named
-    # providers keep the missing-key diagnostic.
-    # An exhausted single-entry pool (typically ``openrouter`` under free-tier daily quotas) must still
-    # reach the chain instead of dying at init with a misleading "No LLM provider configured" error. See
-    # #17929.
+    # No credentials: try the fallback chain BEFORE failing. An exhausted single-entry pool (typically ``openrouter``
+    # under free-tier daily quotas) must not die with a misleading "No LLM provider configured" error (#17929);
+    # only explicitly named providers keep the missing-key diagnostic.
+    from agent.route_hooks import resolution_refuses
     _explicit = (agent.provider or "").strip().lower()
-    _refused_entries = []
-    for _fb in _fallback_entries(fallback_model):
+    _refused_entries, _chain, _route_labels = [], _fallback_entries(fallback_model), {}
+    for _fb in _chain:
         _fb_provider = str(_fb["provider"])
+        if resolution_refuses(_fb, primary={"provider": _explicit, "model": str(agent.model or "")}, chain=_chain,
+                              labels_cache=_route_labels):  # route_custody (F3): no turn exists yet
+            _refused_entries.append((_fb_provider, "refused by route_custody"))
+            continue
         try:
             from hermes_cli.fallback_config import resolve_entry_api_key
             _fb_explicit_key = resolve_entry_api_key(_fb)
@@ -886,11 +888,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             _refused_entries.append((_fb_provider, str(_fb_exc) or type(_fb_exc).__name__))
             continue
         if _fb_client is None:
-            # The router returns None when no credentials are usable for the entry — a skip
-            # that leaves no trace otherwise, hiding key-less fallback entries from the log.
-            logger.debug(
-                "Init-time fallback entry %s resolved no usable credentials", _fb_provider
-            )
+            # The router returns None when no credentials are usable: log it, or key-less entries leave no trace.
+            logger.debug("Init-time fallback entry %s resolved no usable credentials", _fb_provider)
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
         agent._fallback_activated = True

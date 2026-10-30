@@ -1788,7 +1788,9 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        chain = _job_fallback_chain(job, jc.cfg) or []
+        from agent.route_hooks import resolution_refuses
+        chain, route_labels = _job_fallback_chain(job, jc.cfg) or [], {}
+        primary_route = {"provider": str(requested or "").strip().lower(), "model": str(model or "").strip()}
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), %s",
             job_id, "auth" if is_auth else "transient network", resolve_exc,
@@ -1799,11 +1801,11 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 continue
             fb_provider = str(entry.get("provider") or "").strip()
             fb_model = str(entry.get("model") or "").strip()
-            if not fb_provider or not fb_model:
+            if not fb_provider or not fb_model or resolution_refuses(  # route_custody (F3), before the agent exists
+                    entry, primary=primary_route, chain=chain, labels_cache=route_labels):
                 continue
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
-
                 fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
@@ -1814,9 +1816,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 # Named custom entries resolve to the bare "custom" billing class; keep the configured
                 # identity so job sessions record the provider name (#98739).
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
-                logger.info(
-                    "Job '%s': fallback resolved to %s model %s",
-                    job_id, runtime.get("provider"), fb_model)
+                logger.info("Job '%s': fallback resolved to %s model %s", job_id, runtime.get("provider"), fb_model)
                 # Delivered with the job output (#74349): a cron agent has no status rail, so the
                 # switch would otherwise stay in the scheduler log only. run_job pops it.
                 from hermes_cli.fallback_config import pre_agent_fallback_notice

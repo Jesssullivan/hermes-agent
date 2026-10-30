@@ -861,6 +861,7 @@ def resolve_compression_fallback_route() -> Optional[dict]:
     client's own exception path walks the rest. ``None`` when none is usable (skip compression)."""
     try:
         from agent.auxiliary_client import _fallback_entry_api_key, _get_auxiliary_task_config
+        from agent.route_hooks import auxiliary_refuses
         chain = _get_auxiliary_task_config("compression").get("fallback_chain")
     except Exception:
         logger.debug("compression fallback_chain lookup failed", exc_info=True)
@@ -872,9 +873,8 @@ def resolve_compression_fallback_route() -> Optional[dict]:
             continue
         provider = str(entry.get("provider") or "").strip()
         model = str(entry.get("model") or "").strip()
-        # Both are required to name a route. _resolve_fallback_entry applies
-        # the same rule when the aux client walks this chain itself.
-        if not provider or not model:
+        # Both name a route (the aux client's own walk applies the same rule); route_custody (F3) may refuse it.
+        if not provider or not model or auxiliary_refuses(entry, task="compression", failed_provider=""):
             continue
         try:
             api_key = _fallback_entry_api_key(entry)

@@ -365,7 +365,7 @@ def settle_unrecovered_error(
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
-        ), classified=classified, provider=_provider, model=_model))
+        ), classified=classified, provider=_provider, model=_model, delivered=_delivered))
 
     # An attended session on the free model does not sit through a long cooldown: end the attempt
     # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
@@ -415,7 +415,7 @@ def settle_unrecovered_error(
             messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
-        ), classified=classified, provider=_provider, model=_model))
+        ), classified=classified, provider=_provider, model=_model, delivered=_delivered))
 
     wait_time = compute_error_backoff(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,

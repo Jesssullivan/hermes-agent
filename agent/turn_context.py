@@ -1169,6 +1169,9 @@ def build_turn_context(
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
+    # Route hooks (agent/route_hooks.py), before turn-start compaction can send this turn to the
+    # active route: turn_route labels the turn, route_custody re-checks a fallback route.
+    begin_route_turn(agent, messages=messages, turn_id=turn_id)
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,
@@ -1179,8 +1182,6 @@ def build_turn_context(
     active_system_prompt = compaction.active_system_prompt
     conversation_history = compaction.conversation_history
     current_turn_user_idx = compaction.current_turn_user_idx
-    # Route hooks (agent/route_hooks.py): turn_route labels the turn, route_custody re-checks a kept fallback.
-    begin_route_turn(agent, messages=messages, turn_id=turn_id)
 
     plugin_user_context = _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
