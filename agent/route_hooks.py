@@ -6,7 +6,8 @@ changes anything until a plugin registers for it, or a fallback entry sets ``rou
 required``.
 
 - ``turn_route`` (F2) runs once per turn before turn-start compaction and the first API call
-  (``phase="turn"``), and when a resolution-time walker is about to pick a fallback for a
+  (``phase="turn"``), before vision enrichment on the main route ahead of the turn (``phase="turn"``,
+  ``reason="vision"``), and when a resolution-time walker is about to pick a fallback for a
   primary whose credentials failed (``phase="resolve"``). A callback may return
   ``{"labels": [...]}``. Labels are plugin-defined strings, sticky for the session within this
   process, and handed to ``route_custody``. Hermes never interprets them. A compaction that
@@ -22,10 +23,11 @@ required``.
   Each walker records that entry on the agent (:func:`bind_resolution_entry`); the turn-start
   check reads the record and never infers it from the agent's own chain. A compaction outside a
   turn on such a route is checked first (``phase="compaction"``) and binds its session for the
-  auxiliary gate (:func:`enter_compaction_scope`, :func:`detached_compaction`). Gateway vision
-  enrichment before a turn checks such a route with ``phase="auxiliary"`` and ``task="vision"``
-  before an image leaves (:func:`detached_auxiliary`). :data:`HERMES_ROUTE_CUSTODY_PHASES` lists
-  every phase.
+  auxiliary gate (:func:`enter_compaction_scope`, :func:`detached_compaction`). Vision enrichment
+  before a turn (gateway, ``/background``, the CLI's text image mode) checks such a route with
+  ``phase="auxiliary"`` and ``task="vision"`` before an image leaves, after ``turn_route`` has
+  labelled the inbound message (:func:`detached_auxiliary`, :func:`agent_vision_scope`).
+  :data:`HERMES_ROUTE_CUSTODY_PHASES` lists every phase.
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
   required`` also needs an explicit ``{"action": "allow"}``; any other value that is not an
@@ -107,6 +109,9 @@ _COMPACTION_SOURCE: ContextVar[Optional[list]] = ContextVar("hermes_route_compac
 _RESOLVED_ENTRY: ContextVar[Optional[Mapping[str, Any]]] = ContextVar("hermes_route_resolved_entry", default=None)
 # The session a caller is resolving a runtime for, bound only for that resolution (:func:`resolving_session`).
 _RESOLVING_SESSION: ContextVar[str] = ContextVar("hermes_route_resolving_session", default="")
+# False while a pre-turn vision call runs after ``turn_route`` failed on its inbound message, so its
+# auxiliary fallback walk refuses every judged candidate as a turn with unknown labels does.
+_INBOUND_LABELS_KNOWN: ContextVar[bool] = ContextVar("hermes_route_inbound_labels_known", default=True)
 
 
 class RouteCustodyRefused(RuntimeError):
@@ -338,13 +343,17 @@ def carry_session_route_state(agent: Any, old_session_id: Any) -> None:
     _grow_session(agent, labels=labels, data_use=data_use)
 
 
-def carry_route_state(old_session_id: Any, new_session_id: Any) -> None:
+def carry_route_state(old_session_id: Any, new_session_id: Any, *, resident: Any = None) -> None:
     """A compaction with no agent (``session.mutate compress``) rotated *old_session_id* to
-    *new_session_id*: carry the parent's labels and data use to the child. An in-place compaction
-    keeps the id and carries nothing."""
+    *new_session_id*: carry the parent's labels and data use to the child, from the process
+    registry and from the session's *resident* agent, whose held copies outlive a registry
+    eviction. An in-place compaction keeps the id and carries nothing."""
     if not old_session_id or not new_session_id or str(old_session_id) == str(new_session_id):
         return
     labels, data_use = _session_state(old_session_id)
+    if resident is not None:
+        labels |= _held(resident, "_route_labels", old_session_id)
+        data_use |= _held(resident, "_route_data_use", old_session_id)
     _remember_session(new_session_id, labels=labels, data_use=data_use)
 
 
@@ -428,12 +437,16 @@ def _detached_scope(record: Any, *, session_id: Any, provider: Any, model: Any, 
     route = _DetachedRoute(session_id=str(session_id or ""), provider=str(provider or ""), model=str(model or ""),
                            platform=platform)
     bind_resolution_entry(route, record)
-    tokens = enter_compaction_scope(route, messages)
+    tokens, known_token = enter_compaction_scope(route, messages), None
     try:
         if check:
-            check_out_of_turn_route(route, phase=phase, task=task)
+            known = check_out_of_turn_route(route, phase=phase, task=task,
+                                            inbound=messages if phase == "auxiliary" else None)
+            known_token = _INBOUND_LABELS_KNOWN.set(known)
         yield
     finally:
+        if known_token is not None:
+            _INBOUND_LABELS_KNOWN.reset(known_token)
         exit_compaction_scope(tokens)
 
 
@@ -454,20 +467,34 @@ def detached_auxiliary(record: Any, *, task: str, session_id: Any, provider: Any
     """Route scope and custody for an auxiliary call made before any turn or agent exists, such as
     gateway vision enrichment. *messages* is the session transcript and the inbound message. When
     the call rides the session's resolved main route (*rides_main*) and that route is a gated
-    resolution-time *record*, the entry is checked first (``phase="auxiliary"``, *task*), with the
-    session's labels and the transcript's data use. Raises :class:`RouteCustodyRefused`."""
+    resolution-time *record*, ``turn_route`` labels *messages* first, then the entry is checked
+    (``phase="auxiliary"``, *task*) with the session's labels and the transcript's data use.
+    Raises :class:`RouteCustodyRefused`."""
     with _detached_scope(record, session_id=session_id, provider=provider, model=model, messages=messages,
                          platform=platform, phase="auxiliary", task=task, check=rides_main):
         yield
 
 
-def vision_rides_main_route() -> bool:
-    """Whether the ``vision`` auxiliary slot sends images on the main route: ``provider: auto``
-    with no ``base_url``. ``True`` when the slot cannot be read (fail closed)."""
+_MAIN_SLOT_PROVIDERS = frozenset({"auto", "main", "custom:main"})
+
+
+def vision_rides_main_route(runtime: Optional[Mapping[str, Any]] = None) -> bool:
+    """Whether the ``vision`` auxiliary slot sends images on the main route. A slot with no
+    ``base_url`` does when its provider is ``auto``, ``main`` or ``custom:main``, read before
+    normalization turns ``main`` into the main provider's name, or names the main route's own
+    provider (*runtime*, else the bound main runtime). ``True`` when the slot cannot be read
+    (fail closed)."""
     try:
-        from agent.auxiliary_client import _normalize_vision_provider, _resolve_task_provider_model
+        from agent.auxiliary_client import _normalize_vision_provider, _read_main_provider, _resolve_task_provider_model
         requested, _model, base_url, _key, _mode = _resolve_task_provider_model("vision", None, None, None, None)
-        return not base_url and _normalize_vision_provider(requested) == "auto"
+        if base_url:
+            return False
+        raw = "".join(str(requested or "auto").split()).lower()
+        if raw in _MAIN_SLOT_PROVIDERS:
+            return True
+        normalized = _normalize_vision_provider(raw)
+        main = (runtime or {}).get("provider") or _read_main_provider()
+        return normalized == "auto" or bool(_provider_forms(normalized) & _provider_forms(main))
     except Exception:  # health: allow BLE001 -- an unreadable slot is treated as the main route
         logger.debug("vision slot lookup failed; treating it as the main route", exc_info=True)
         return True
@@ -500,7 +527,7 @@ def _turn_data_use(agent: Any, messages: list) -> frozenset[str]:
 
 def _labels_known(agent: Any) -> bool:
     turn = getattr(agent, "_route_turn", None) or {}
-    return turn.get("labels_known", True) is not False
+    return turn.get("labels_known", True) is not False and _INBOUND_LABELS_KNOWN.get()
 
 
 def _agent_context(agent: Any) -> dict[str, Any]:
@@ -514,16 +541,19 @@ def _current_route(agent: Any) -> dict[str, str]:
 
 
 def fallback_custody_refuses(agent: Any, fb: Mapping[str, Any], fb_provider: str, fb_model: str, *,
-                             phase: str = "failover", task: str = "") -> bool:
+                             phase: str = "failover", task: str = "", inbound: Optional[list] = None,
+                             labels_known: Optional[bool] = None) -> bool:
     """F3 at failover: ``True`` skips *fb* for this turn. Not added to the unavailable set: the
-    next turn may carry different data."""
+    next turn may carry different data. A pre-turn call passes its *inbound* messages and the
+    *labels_known* of its own ``turn_route`` call, and has no turn id."""
     if not _gated(fb):
         return False
-    messages = _turn_messages(agent)
+    messages = _turn_messages(agent) if inbound is None else list(inbound)
+    context = _agent_context(agent) if inbound is None else {**_agent_context(agent), "turn_id": ""}
     return custody_refuses(
         {**fb, "provider": fb_provider, "model": fb_model}, phase=phase, current=_current_route(agent),
         messages=messages, data_use=_turn_data_use(agent, messages), labels=_session_labels(agent),
-        labels_known=_labels_known(agent), task=task, **_agent_context(agent))
+        labels_known=_labels_known(agent) if labels_known is None else labels_known, task=task, **context)
 
 
 def begin_turn(agent: Any, *, messages: list, turn_id: str) -> bool:
@@ -718,23 +748,72 @@ def _recheck_kept_fallback(agent: Any) -> bool:
     return True
 
 
-def check_out_of_turn_route(agent: Any, *, phase: str = "compaction", task: str = "") -> None:
+def _out_of_turn_record(agent: Any) -> Any:
+    """The entry record the agent's own route came from: its kept fallback while one is active,
+    else its resolution-time record."""
+    if getattr(agent, "_provider_fallback_active", False):
+        return getattr(agent, "_route_fallback_entry", None)
+    return getattr(agent, "_route_resolution_entry", None)
+
+
+def check_out_of_turn_route(agent: Any, *, phase: str = "compaction", task: str = "",
+                            inbound: Optional[list] = None) -> bool:
     """F3 before a call outside a turn sends the transcript on the agent's own route: a kept
     fallback or a resolution-time entry is checked with *phase* (``compaction``, or ``auxiliary``
-    with *task* for vision enrichment), the session's labels and the transcript's data use.
-    Nothing is restored outside a turn: a refusal raises :class:`RouteCustodyRefused` and the call
-    does not run."""
+    with *task* for vision enrichment), the session's labels and the transcript's data use. A
+    pre-turn call passes its *inbound* messages (the transcript and the inbound message):
+    ``turn_route`` labels them first (``phase="turn"``, ``reason="vision"``), so labels drawn from
+    the inbound message reach the check and the call's own fallback walk, and unknown labels
+    refuse. Returns whether the labels are known. Nothing is restored outside a turn: a refusal
+    raises :class:`RouteCustodyRefused` and the call does not run."""
+    known = None
+    if inbound is not None:
+        labels, known = announce_route(
+            phase="turn", route=_current_route(agent), chain=_chain_routes(getattr(agent, "_fallback_chain", None)),
+            messages=inbound, data_use=_turn_data_use(agent, inbound), labels=_session_labels(agent),
+            reason="vision", **{**_agent_context(agent), "turn_id": ""})
+        _grow_session(agent, labels=labels)
     if getattr(agent, "_provider_fallback_active", False):
         entry = getattr(agent, "_route_fallback_entry", None)
         entry = entry if isinstance(entry, Mapping) and _gated(entry) else None
     else:
         entry = _resolution_fallback_entry(agent)
-    if entry is None:
-        return
-    if fallback_custody_refuses(agent, entry, str(entry.get("provider") or ""), str(entry.get("model") or ""),
-                                phase=phase, task=task):
+    if entry is not None and fallback_custody_refuses(
+            agent, entry, str(entry.get("provider") or ""), str(entry.get("model") or ""), phase=phase, task=task,
+            inbound=inbound, labels_known=known):
         raise RouteCustodyRefused(f"route custody refused {entry.get('provider')}/{entry.get('model')} for "
                                   f"{'a ' + task + ' call' if task else 'a compaction'} outside a turn")
+    return known is not False
+
+
+_AGENT_RUNTIME_FIELDS = ("provider", "model", "requested_provider", "base_url", "api_key", "api_mode", "auth_mode",
+                         "session_id")
+
+
+@contextmanager
+def agent_vision_scope(agent: Any, *, messages: list) -> Iterator[None]:
+    """Route custody for vision enrichment a front end runs on *agent*'s route before its turn
+    (the CLI's text image mode). *messages* is the transcript and the inbound message. While a
+    route hook is loaded or the agent's kept fallback or resolution-time record carries a custody
+    key, the call is bound to the agent's own runtime and route scope, and a vision slot that rides
+    that route is checked as :func:`detached_auxiliary` does. With neither, or with no agent, the
+    call runs unchanged. Raises :class:`RouteCustodyRefused` before any image leaves."""
+    if agent is None or not custody_applies(_out_of_turn_record(agent)):
+        yield
+        return
+    from agent.auxiliary_client import scoped_runtime_main
+    runtime = {field: getattr(agent, field, "") or "" for field in _AGENT_RUNTIME_FIELDS}
+    with scoped_runtime_main(runtime):
+        tokens, known_token = enter_compaction_scope(agent, messages), None
+        try:
+            if vision_rides_main_route(runtime):
+                known = check_out_of_turn_route(agent, phase="auxiliary", task="vision", inbound=messages)
+                known_token = _INBOUND_LABELS_KNOWN.set(known)
+            yield
+        finally:
+            if known_token is not None:
+                _INBOUND_LABELS_KNOWN.reset(known_token)
+            exit_compaction_scope(tokens)
 
 
 @contextmanager

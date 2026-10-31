@@ -6910,7 +6910,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             image_bytes = await file_obj.download_as_bytearray()
             cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=".webp")
             logger.info("[Telegram] Analyzing sticker at %s", cached_path)
-            from tools.vision_tools import vision_analyze_tool
+            from gateway.route_vision import sessionless_vision_analyze as vision_analyze_tool  # route custody
             self._accept_update()  # Cancellation cannot undo an already submitted auxiliary LLM request.
             result = json.loads(await vision_analyze_tool(image_url=cached_path, user_prompt=STICKER_VISION_PROMPT))
             if result.get("success"):

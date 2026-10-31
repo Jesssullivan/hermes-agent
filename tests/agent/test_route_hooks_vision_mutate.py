@@ -131,7 +131,8 @@ class TestVisionEnrichment:
         record = route_hooks.resolution_record(HOSTED, {"provider": "openrouter"})  # a plain hosted entry
         _text, recorder = _prepare(_vision_runner(record), _transcript())
         assert recorder.calls == []
-        assert seen == [("auxiliary", "openai", [], ["acme:client-raw"], "vision-session", "vision")]
+        # turn_route labels the transcript and the inbound message before the check.
+        assert seen == [("auxiliary", "openai", ["acme:client"], ["acme:client-raw"], "vision-session", "vision")]
 
     def test_an_admitted_entry_enriches_on_the_sessions_runtime(self, hooks):
         seen = []
@@ -216,7 +217,7 @@ class TestBackgroundVision:
 # -- C2: a rotating session.mutate compress -------------------------------------------------------
 
 
-def _write_rotating_compress(parent, child):
+def _write_rotating_compress(parent, child, *, resident=None):
     from gateway import session_mutations
 
     result = {"target_session_id": child, "previous_target_session_id": parent, "execution_generation": 2,
@@ -232,7 +233,9 @@ def _write_rotating_compress(parent, child):
         return dict(prepared, messages=[{"role": "user", "content": "summary"}], post_compaction=None, in_place=False)
 
     authority = MagicMock()
-    authority.sessions = {}
+    # A resident agent is cached under the live session's route, as the gateway keeps it.
+    authority.sessions = {"logical": MagicMock(route="tg:1")} if resident is not None else {}
+    authority.runner._cached_agent_for = lambda key: resident if key == "tg:1" else None
     authority.db.get_session.return_value = None
     ref = SimpleNamespace(session_id="logical")
     params = {"operation": "compress", "request_id": "r1", "expected_revision": 1, "expected_generation": 1,
