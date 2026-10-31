@@ -8,6 +8,7 @@ never imports ``cli`` at module load time (import cycle).
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import textwrap
@@ -635,7 +636,22 @@ class CLIStreamMixin:
     def _preprocess_images_with_vision(self, text: str, images: list, *, announce: bool = True) -> str:
         """Describe attached images via the auxiliary vision model and prepend the descriptions
         to the user's text (works with non-vision models; same approach as the gateway). The
-        local path is included so the agent can re-examine via ``vision_analyze``."""
+        local path is included so the agent can re-examine via ``vision_analyze``. Route custody
+        (agent/route_hooks.py) checks the agent's route before an image leaves; a refusal sends
+        nothing and leaves a note with each image's path."""
+        from agent.route_hooks import RouteCustodyRefused, agent_vision_scope
+        from gateway.route_vision import not_analyzed_note
+        user_text = text if isinstance(text, str) and text else ""
+        inbound = [*(getattr(self, "conversation_history", None) or ()), {"role": "user", "content": user_text}]
+        try:
+            with agent_vision_scope(getattr(self, "agent", None), messages=inbound):
+                return self._describe_images_with_vision(text, images, announce=announce)
+        except RouteCustodyRefused as exc:
+            logging.warning("Vision pre-analysis skipped, no image sent: %s", exc)
+            return not_analyzed_note(user_text, [str(path) for path in images])
+
+    def _describe_images_with_vision(self, text: str, images: list, *, announce: bool = True) -> str:
+        """The vision calls of :meth:`_preprocess_images_with_vision`, inside its custody scope."""
         from cli import _DIM, _RST, _cprint
         import asyncio as _asyncio
         from gateway.warning_notifications import render_notification
@@ -672,6 +688,7 @@ class CLIStreamMixin:
                         render_notification(lambda: _cprint(f"  {_DIM}{t('cli.stream.vision_failed')}{_RST}"),
                                             platform="cli", user_config=getattr(getattr(self, "agent", None), "_notification_config", None))
             except Exception as e:
+                logging.debug("Vision pre-analysis of %s failed", img_path, exc_info=True)
                 enriched_parts.append(
                     f"[The user attached an image but analysis failed ({e}). "
                     f"You can try examining it with vision_analyze using "

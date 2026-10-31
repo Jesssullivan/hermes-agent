@@ -486,12 +486,12 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from gateway.run import (
-            _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config,
-            _platform_config_key,
+            _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config, _platform_config_key,
         )
         from run_agent import AIAgent
-        media_urls = media_urls or []
-        media_types = media_types or []
+        from agent.route_hooks import bind_resolution_entry, take_resolution_entry
+        from gateway.route_vision import vision_under_custody
+        media_urls, media_types = media_urls or [], media_types or []
         adapter = self._delivery_adapter_for(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
@@ -501,14 +501,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
+            route_entry = take_resolution_entry()  # route custody re-checks a resolution-time fallback at turn start
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(source.chat_id, t("gateway.background.no_credentials"), metadata=_thread_metadata)
                 return
 
             platform_key = _platform_config_key(source.platform)
             enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
-            pr = self._provider_routing
-            max_iterations = _current_max_iterations()
+            pr, max_iterations = self._provider_routing, _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
@@ -516,13 +516,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
-            image_paths = [
-                path for i, path in enumerate(media_urls)
-                if (media_types[i] if i < len(media_types) else "").startswith("image/")
-            ]
+            image_paths = [path for i, path in enumerate(media_urls)
+                           if (media_types[i] if i < len(media_types) else "").startswith("image/")]
             if image_paths:
-                try:
-                    enriched_prompt = await self._enrich_message_with_vision(prompt, image_paths)
+                try:  # route custody checks a resolution-time entry before an image leaves
+                    enriched_prompt = await vision_under_custody(
+                        lambda: self._enrich_message_with_vision(prompt, image_paths), route_entry,
+                        {**turn_route["runtime"], "model": turn_route["model"]}, session_id=task_id,
+                        messages=[{"role": "user", "content": prompt}], message_text=prompt, image_paths=image_paths)
                 except Exception as e:
                     logger.warning("Background task vision enrichment failed: %s", e)
 
@@ -551,10 +552,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                         "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
                     )},
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot.
-                    # See #60955.
+                    # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                bind_resolution_entry(agent, route_entry)
                 try:
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
                 finally:
@@ -587,8 +588,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     await adapter.send_image(
                         chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
                     )
-            # Route each media file by type (voice bubble / video / image / document), as the
-            # streaming + kanban paths do.
+            # Route each media file by type (voice bubble / video / image / document), as the streaming + kanban paths do.
             from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
             from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
             for media_path, _is_voice in (media_files or []):

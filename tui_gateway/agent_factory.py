@@ -513,10 +513,17 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
-        for entry in _load_fallback_model() or []:
-            fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
-            fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
+        from agent.route_hooks import mark_resolution_entry, resolution_refuses
+        chain, route_labels = [e for e in _load_fallback_model() or [] if isinstance(e, dict)], {}
+        primary_route = {"provider": str((resolve_kwargs or {}).get("requested") or "").strip().lower(),
+                         "model": str((resolve_kwargs or {}).get("target_model") or "").strip()}
+        for entry in chain:
+            fb_provider = str(entry.get("provider") or "").strip()
+            fb_model = str(entry.get("model") or "").strip()
             if not fb_provider or not fb_model:
+                continue
+            # turn_route and route_custody (agent/route_hooks.py): a gate may refuse this entry before any turn exists.
+            if resolution_refuses(entry, primary=primary_route, chain=chain, labels_cache=route_labels):
                 continue
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
@@ -528,6 +535,7 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
                 # Named custom entries resolve to the bare "custom" billing class; keep the configured
                 # identity so the session/UI shows the provider name, matching the manual-switch path (#98739).
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
+                mark_resolution_entry(runtime, entry)  # _make_agent binds it: custody re-checks each turn
                 from hermes_cli.auth import primary_failure_wording
                 logging.getLogger(__name__).warning(
                     "Primary %s (%s), falling back to %s model %s",
@@ -648,6 +656,8 @@ def _make_agent(
     system_prompt = _startup_system_prompt(cfg, session_id or key)
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     fallback_notice = runtime.pop("_fallback_notice", None)
+    from agent.route_hooks import ROUTE_ENTRY_KEY, bind_resolution_entry
+    route_entry = runtime.pop(ROUTE_ENTRY_KEY, None)
     _pr = _load_provider_routing()
     platform = _resolve_agent_platform(platform_override)
     ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
@@ -684,6 +694,7 @@ def _make_agent(
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
+    bind_resolution_entry(agent, route_entry)  # the resolution-time entry, re-checked at each turn start
     if fallback_notice:
         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice

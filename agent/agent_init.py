@@ -863,16 +863,18 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
         if is_actual_route(effective_provider):
             agent.provider = normalize_provider(effective_provider)
         return _client_kwargs_from_routed(_routed_client, _provider_timeout)
-    # No credentials: try the fallback chain BEFORE failing (an exhausted single-entry pool
-    # must not die with a misleading "No LLM provider configured"); only explicitly named
-    # providers keep the missing-key diagnostic.
-    # An exhausted single-entry pool (typically ``openrouter`` under free-tier daily quotas) must still
-    # reach the chain instead of dying at init with a misleading "No LLM provider configured" error. See
-    # #17929.
+    # No credentials: try the fallback chain BEFORE failing. An exhausted single-entry pool (typically ``openrouter``
+    # under free-tier daily quotas) must not die with a misleading "No LLM provider configured" error (#17929);
+    # only explicitly named providers keep the missing-key diagnostic.
+    from agent.route_hooks import bind_resolution_entry, resolution_record, resolution_refuses
     _explicit = (agent.provider or "").strip().lower()
-    _refused_entries = []
-    for _fb in _fallback_entries(fallback_model):
+    _refused_entries, _chain, _route_labels = [], _fallback_entries(fallback_model), {}
+    for _fb in _chain:
         _fb_provider = str(_fb["provider"])
+        if resolution_refuses(_fb, primary={"provider": _explicit, "model": str(agent.model or "")}, chain=_chain,
+                              labels_cache=_route_labels):  # route_custody (F3): no turn exists yet
+            _refused_entries.append((_fb_provider, "refused by route_custody"))
+            continue
         try:
             from hermes_cli.fallback_config import resolve_entry_api_key
             _fb_explicit_key = resolve_entry_api_key(_fb)
@@ -886,11 +888,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             _refused_entries.append((_fb_provider, str(_fb_exc) or type(_fb_exc).__name__))
             continue
         if _fb_client is None:
-            # The router returns None when no credentials are usable for the entry — a skip
-            # that leaves no trace otherwise, hiding key-less fallback entries from the log.
-            logger.debug(
-                "Init-time fallback entry %s resolved no usable credentials", _fb_provider
-            )
+            # The router returns None when no credentials are usable: log it, or key-less entries leave no trace.
+            logger.debug("Init-time fallback entry %s resolved no usable credentials", _fb_provider)
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
         agent._fallback_activated = True
@@ -903,6 +902,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             return None
         agent.provider = agent.requested_provider = _fb["provider"]
         agent.model = _fb_model or _fb["model"]
+        # Custody re-checks this entry at each turn start (agent/route_hooks.py).
+        bind_resolution_entry(agent, resolution_record(_fb, {"provider": agent.provider}, model=agent.model), source="init")
         recompute_init_fallback_api_mode(agent, _fb_client)
         return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
@@ -1125,8 +1126,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
-    # expose kanban_show interactively, and children/cron runs inherit the env var, without
-    # owning a task.
+    # expose kanban_show interactively, and children/cron runs inherit the env var, without owning a task.
     from agent.delegation_context import owned_kanban_task
     from agent.prompt_builder import KANBAN_GUIDANCE
     agent._kanban_worker_guidance = (

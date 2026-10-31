@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+from agent.route_hooks import routes_exhausted
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, free_tier_cooldown_ends_turn,
@@ -359,12 +360,12 @@ def settle_unrecovered_error(
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
-        return _verdict("return", nonretryable_client_error_result(
+        return _verdict("return", routes_exhausted(agent, nonretryable_client_error_result(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
-        ))
+        ), classified=classified, provider=_provider, model=_model, delivered=_delivered))
 
     # An attended session on the free model does not sit through a long cooldown: end the attempt
     # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
@@ -408,13 +409,13 @@ def settle_unrecovered_error(
                 retry_count = 0
             return _verdict(_ladder["action"], _ladder.get("result"))
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
-        return _verdict("return", max_retries_exhausted_result(
+        return _verdict("return", routes_exhausted(agent, max_retries_exhausted_result(
             agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
             messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
-        ))
+        ), classified=classified, provider=_provider, model=_model, delivered=_delivered))
 
     wait_time = compute_error_backoff(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,

@@ -39,6 +39,15 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _resolution_session_id(runner, source, session_key) -> str:
+    """The session id whose ``turn_route`` labels a resolve-phase custody check reads (agent/route_hooks.py);
+    "" when the runner cannot tell (bare test runners, a source with no session yet)."""
+    with suppress(Exception):
+        skey = runner._resolve_session_key_or_none(source, session_key)
+        return str(runner.session_store.peek_session_id(skey) or "") if skey else ""
+    return ""
+
+
 def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str, dict]:
     """``_resolve_session_agent_runtime`` for a session bound to a launch policy: the route's FROZEN
     config and launch credential, walking its own fallback chain on an AuthError unless
@@ -55,7 +64,10 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str
     runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
                                             fallback=fallback)
     if fallback_entry is not None:
+        from agent.route_hooks import resolution_record, stash_resolution_entry
         from hermes_cli.fallback_config import pre_agent_fallback_notice
+        # The caller binds the entry's custody record to the agent it builds (agent/route_hooks.py).
+        stash_resolution_entry(resolution_record(fallback_entry, runtime))
         runner._pre_agent_fallback_notice = pre_agent_fallback_notice(
             provider or '', model or '',
             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
@@ -106,11 +118,16 @@ class GatewayTurnPrepareMixin:
         )
         from gateway.session_policy import policy_for_source
         # Every exit path starts clean: a stale notice must never attach to another session's next
-        # turn (#74349). Set again below only when THIS resolution fell back.
+        # turn (#74349). Set again below only when THIS resolution fell back. The custody record lives
+        # in this context, not on the runner: concurrent sessions resolve in their own copied contexts.
+        from agent.route_hooks import ROUTE_ENTRY_KEY, resolving_session, stash_resolution_entry
         self._pre_agent_fallback_notice = None
+        stash_resolution_entry(None)
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
-            return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
+            # A resolve-phase custody check reads this session's earlier labels.
+            with resolving_session(_resolution_session_id(self, source, session_key)):
+                return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
         skey = self._resolve_session_key_or_none(source, session_key)
         model = _resolve_gateway_model(user_config)
         if skey:
@@ -164,10 +181,12 @@ class GatewayTurnPrepareMixin:
                                exc_info=True)
                 unavailable_override, override = override, None
         if runtime_kwargs is None:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            with resolving_session(_resolution_session_id(self, source, skey)):
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
         # runner surfaces it through the agent's one-shot fallback notice (#74349).
         self._pre_agent_fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
+        stash_resolution_entry(runtime_kwargs.pop(ROUTE_ENTRY_KEY, None))
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
@@ -189,6 +208,7 @@ class GatewayTurnPrepareMixin:
                     model = ch.model
                 if ch.provider:
                     runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(ch.provider, target_model=model or None)
+                    stash_resolution_entry(None)  # the channel's own provider replaces any fallback entry
                     ch_runtime_model = runtime_kwargs.pop("model", None)
                     # Adopt the provider's bundled model only when the override named none.
                     if ch_runtime_model and not ch.model:

@@ -30,6 +30,7 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
+from agent.route_hooks import RouteCustodyRefused, end_turn as end_route_turn, route_custody_refused_result
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
@@ -1475,6 +1476,14 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> dict[str, Any
     )
 
 
+def _turn_start_stop_result(agent, exc, conversation_history) -> dict[str, Any]:
+    """A turn stopped during setup with no request sent: a preflight compression timeout, or
+    route custody refusing the only route (``agent/route_hooks.py``)."""
+    if isinstance(exc, RouteCustodyRefused):
+        return route_custody_refused_result(agent, exc, conversation_history)
+    return _preflight_timeout_result(agent, exc, conversation_history)
+
+
 @dataclass
 class _LoopState:
     """Every local the turn loop threads through the phase helpers in ``agent/turn_*.py``.
@@ -1711,8 +1720,8 @@ def _run_conversation_turn(
             moa_active=bool(moa_config),
             title_user_message=title_user_message,
         )
-    except PreflightCompressionTimedOut as _preflight_timeout_exc:
-        return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
+    except (PreflightCompressionTimedOut, RouteCustodyRefused) as _turn_start_exc:
+        return _turn_start_stop_result(agent, _turn_start_exc, conversation_history)
     # Voice turns may run on auxiliary.voice_chat: bound after the prompt/row/compaction were settled
     # against the main model, undone in finalize_turn (and run_conversation's finally on early exits).
     from agent.voice_turn_route import begin_voice_turn_route
@@ -1862,6 +1871,7 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            end_route_turn(agent)  # a later compaction in this context is outside the turn (route_custody)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

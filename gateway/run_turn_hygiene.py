@@ -698,13 +698,16 @@ class GatewayTurnHygieneMixin:
 
     async def _hmwa_hygiene_detached_attempt(
         self, attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
-        source, session_entry, session_key, _quick_key, run_generation,
+        source, session_entry, session_key, _quick_key, run_generation, route_entry=None,
     ):
         """Run one detached hygiene compression attempt end to end; publishes the transcript to
-        continue with (compressed or original) on ``attempt.history``."""
+        continue with (compressed or original) on ``attempt.history``. *route_entry* is the custody
+        record of a resolution-time fallback the runtime came from (agent/route_hooks.py)."""
         from gateway.run import HygieneTurnHoldExceeded
         from agent.conversation_compression import CompressionCommitFence
+        from agent.route_hooks import bind_resolution_entry
         _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
+        bind_resolution_entry(_hyg_agent, route_entry)  # _compress_context checks it before any summary request
         attempt.agent = _hyg_agent
         try:
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
@@ -788,6 +791,9 @@ class GatewayTurnHygieneMixin:
                 source=source, session_key=session_key,
                 user_config=hs.data if isinstance(hs.data, dict) else None,
             )
+            from agent.route_hooks import take_resolution_entry
+            # Bound to the hygiene agent: custody checks the route its summary rides (agent/route_hooks.py).
+            _hyg_route_entry = take_resolution_entry()
             if str(_hyg_runtime.get("api_mode") or "").lower() == "codex_app_server":
                 await self._hmwa_hygiene_codex_compaction(hs, plan, history, session_entry, session_key, _hyg_runtime)
             elif _hyg_runtime.get("api_key"):
@@ -798,6 +804,7 @@ class GatewayTurnHygieneMixin:
                     await self._hmwa_hygiene_detached_attempt(
                         attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
                         source, session_entry, session_key, _quick_key, run_generation,
+                        route_entry=_hyg_route_entry,
                     )
         except HygieneTurnHoldExceeded:
             # Availability boundary, not a failure — already logged at INFO by the turn-hold handler.
