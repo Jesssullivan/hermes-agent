@@ -489,7 +489,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config, _platform_config_key,
         )
         from run_agent import AIAgent
-        from agent.route_hooks import bind_resolution_entry, take_resolution_entry
+        from agent.route_hooks import inherit_route_custody, take_resolution_entry
         from gateway.route_vision import vision_under_custody
         media_urls, media_types = media_urls or [], media_types or []
         adapter = self._delivery_adapter_for(source)
@@ -501,7 +501,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
-            route_entry = take_resolution_entry()  # route custody re-checks a resolution-time fallback at turn start
+            route_entry, parent_id = take_resolution_entry(), self._route_session_id(source) or task_id  # route custody
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(source.chat_id, t("gateway.background.no_credentials"), metadata=_thread_metadata)
                 return
@@ -522,7 +522,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 try:  # route custody checks a resolution-time entry before an image leaves
                     enriched_prompt = await vision_under_custody(
                         lambda: self._enrich_message_with_vision(prompt, image_paths), route_entry,
-                        {**turn_route["runtime"], "model": turn_route["model"]}, session_id=task_id,
+                        {**turn_route["runtime"], "model": turn_route["model"]}, session_id=parent_id,
                         messages=[{"role": "user", "content": prompt}], message_text=prompt, image_paths=image_paths)
                 except Exception as e:
                     logger.warning("Background task vision enrichment failed: %s", e)
@@ -555,7 +555,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
-                bind_resolution_entry(agent, route_entry)
+                inherit_route_custody(agent, route_entry, session_id=parent_id)  # re-checked at turn start, with its labels
                 try:
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
                 finally:

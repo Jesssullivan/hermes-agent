@@ -868,6 +868,8 @@ class GatewaySlashCommandsMixin(
             model, rt = self._resolve_session_agent_runtime(source=source)
         except Exception:
             model, rt = None, {}
+        from agent.route_hooks import take_resolution_entry
+        route_entry = take_resolution_entry()  # custody record of a resolution-time fallback (agent/route_hooks.py)
         if not rt.get("api_key"):
             return t("gateway.btw.no_provider")
         main_runtime = {
@@ -891,8 +893,9 @@ class GatewaySlashCommandsMixin(
             from agent.side_question import answer_side_question
             try:
                 answer = await asyncio.to_thread(
-                    answer_side_question, question, history_snapshot,
-                    parent_agent=parent_agent, main_runtime=main_runtime)
+                    answer_side_question, question, history_snapshot, parent_agent=parent_agent,
+                    main_runtime=main_runtime, route={"record": route_entry, "session_id": session_entry.session_id,
+                                                      "platform": getattr(source.platform, "value", "")})
                 reply = t("gateway.btw.answer", preview=preview, answer=answer or "")
             except Exception as e:
                 logger.warning("/btw side question failed: %s", e)

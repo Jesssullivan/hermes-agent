@@ -1039,6 +1039,9 @@ def build_cache_parity_fork(
         review_agent._cached_conversation_root = agent._conversation_root_id()
         _inherit_parent_tool_surface(review_agent, agent)
     _detach_fork_compression(review_agent)
+    # A fork on the parent's route carries its custody record; every fork carries the session's labels.
+    from agent.route_hooks import inherit_route_custody, side_route_record
+    inherit_route_custody(review_agent, None if _routed else side_route_record(agent), parent=agent)
     # Compaction bounds a single request; this bounds the WHOLE review (checked in
     # conversation_loop via _review_input_budget_exhausted).
     review_agent._review_input_token_budget = _review_input_token_budget(task_cfg, review_agent)

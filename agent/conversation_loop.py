@@ -30,7 +30,10 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
-from agent.route_hooks import RouteCustodyRefused, end_turn as end_route_turn, route_custody_refused_result
+from agent.route_hooks import (
+    ROUTE_CUSTODY_REASON, RouteCustodyRefused, end_turn as end_route_turn, route_custody_refused_result,
+    route_custody_stopped,
+)
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
@@ -38,6 +41,7 @@ from agent.surface_switch import (
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_route_check import enforce_request_route
 from agent.turn_scripted_prelude import Prelude, play_prelude
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
@@ -1601,6 +1605,30 @@ def _run_phase(fn, agent, state: _LoopState, **extra):
     return verdict
 
 
+def _start_iteration(agent, s: _LoopState) -> bool:
+    """Open one iteration. ``False`` ends the turn: the loop's own stop, or route custody refusing
+    the route before this request (``agent/turn_route_check.py``)."""
+    if _run_phase(begin_iteration, agent, s).action == "break":
+        return False
+    _run_phase(prepare_iteration, agent, s)
+    return _run_phase(enforce_request_route, agent, s).action != "break"
+
+
+def _finish_turn(agent, s: _LoopState) -> dict[str, Any]:
+    """Post-loop finalization (agent/turn_finalizer.finalize_turn) and its typed endings."""
+    result = finalize_turn(agent, **{
+        name: getattr(s, name)
+        for name in inspect.signature(finalize_turn).parameters if name != "agent"
+    })
+    if s._turn_exit_reason == ROUTE_CUSTODY_REASON:
+        result = route_custody_stopped(agent, result)
+    if s._compression_timeout_exhausted:
+        # Reuse the gateway's context-recovery contract: transcript stays intact while
+        # future input can move to a clean session (#98722).
+        result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
+    return result
+
+
 def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
     """One API call with its retry/recovery loop (guard → build → call → check, error handlers).
 
@@ -1758,9 +1786,8 @@ def _run_conversation_turn(
     while _prelude_action != "break" and (
         (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call
     ):
-        if _run_phase(begin_iteration, agent, s).action == "break":
+        if not _start_iteration(agent, s):
             break
-        _run_phase(prepare_iteration, agent, s)
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
@@ -1804,16 +1831,7 @@ def _run_conversation_turn(
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
                 break
 
-    # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
-    result = finalize_turn(agent, **{
-        name: getattr(s, name)
-        for name in inspect.signature(finalize_turn).parameters if name != "agent"
-    })
-    if s._compression_timeout_exhausted:
-        # Reuse the gateway's context-recovery contract: transcript stays intact while
-        # future input can move to a clean session (#98722).
-        result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
-    return result
+    return _finish_turn(agent, s)
 
 
 def run_conversation(
