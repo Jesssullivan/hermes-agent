@@ -28,6 +28,10 @@ required``.
   ``phase="auxiliary"`` and ``task="vision"`` before an image leaves, after ``turn_route`` has
   labelled the inbound message (:func:`detached_auxiliary`, :func:`agent_vision_scope`).
   :data:`HERMES_ROUTE_CUSTODY_PHASES` lists every phase.
+  It also runs for every reference slot of a Mixture of Agents fan-out (``phase="moa"``,
+  ``task="moa_reference"``), before that slot's call, so a preset cannot send a turn to a route the
+  gate refuses (:func:`moa_reference_refuses`). A slot takes ``route_custody: required`` as a
+  fallback entry does.
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
   required`` also needs an explicit ``{"action": "allow"}``; any other value that is not an
@@ -67,10 +71,11 @@ HERMES_ROUTE_CAPABILITIES: Mapping[str, str] = MappingProxyType({
     "F2": TURN_ROUTE_HOOK,
     "F3": ROUTE_CUSTODY_HOOK,
     "F6": ROUTES_EXHAUSTED_HOOK,
+    "F12": ROUTE_CUSTODY_HOOK,  # the same hook, asked for each MoA reference slot (phase "moa")
 })
 # Every ``phase`` a ``route_custody`` callback may receive from this build. A gate that pins a
 # revision checks that each phase it handles is listed here, and refuses a phase it does not know.
-HERMES_ROUTE_CUSTODY_PHASES: frozenset[str] = frozenset({"failover", "resolve", "turn", "auxiliary", "compaction"})
+HERMES_ROUTE_CUSTODY_PHASES: frozenset[str] = frozenset({"failover", "resolve", "turn", "auxiliary", "compaction", "moa"})
 
 # Fallback-entry key: ``route_custody: required`` admits the entry only on an explicit allow.
 ROUTE_CUSTODY_KEY = "route_custody"
@@ -867,6 +872,25 @@ def auxiliary_refuses(entry: Mapping[str, Any], *, task: Optional[str], failed_p
         labels, known, context = _session_labels(agent), _labels_known(agent), _agent_context(agent)
     return custody_refuses(entry, phase="auxiliary", current=_route(failed_provider, failed_model),
                            data_use=data_use, labels=labels, labels_known=known, task=str(task or ""), **context)
+
+
+def moa_reference_refuses(agent: Any, slot: Mapping[str, Any]) -> bool:
+    """F12: ``True`` keeps a MoA reference *slot* off this turn, before its call. References read the
+    conversation's text view, and a slot's provider is explicit, so no fallback walk would ever ask
+    the gate. Same contract as a fallback candidate: a loaded gate is asked for every slot, a
+    ``route_custody: required`` slot needs an explicit allow, and a check that cannot run refuses."""
+    if not _gated(slot):
+        return False
+    provider, model = str(slot.get("provider") or ""), str(slot.get("model") or "")
+    try:
+        turn_agent = agent if agent is not None else _scope_agent()
+        if turn_agent is None:
+            logger.warning("Route custody: MoA reference %s/%s refused, no turn in scope", provider, model)
+            return True
+        return fallback_custody_refuses(turn_agent, slot, provider, model, phase="moa", task="moa_reference")
+    except Exception:  # health: allow BLE001 -- a custody check that cannot run refuses the route
+        logger.warning("Route custody: MoA reference %s/%s refused, the check raised", provider, model, exc_info=True)
+        return True
 
 
 def routes_exhausted(agent: Any, result: dict[str, Any], *, classified: Any, provider: Any,
