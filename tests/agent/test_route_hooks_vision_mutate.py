@@ -319,4 +319,4 @@ class TestEndOfTurn:
 class TestPhaseAdvertisement:
     def test_every_custody_phase_is_listed(self):
         assert route_hooks.HERMES_ROUTE_CUSTODY_PHASES == frozenset(
-            {"failover", "resolve", "turn", "request", "auxiliary", "compaction"})
+            {"failover", "resolve", "turn", "request", "auxiliary", "compaction", "moa"})

@@ -47,6 +47,10 @@ block sets ``route_custody: required``.
   (:func:`discovery_refused`), whose candidates the gate sees only when that mark covers them
   (:func:`discovery_mark_refuses`). An availability probe builds stubs that cannot send, so it
   asks no gate. :data:`HERMES_ROUTE_CUSTODY_PHASES` lists every phase.
+  It also runs for every reference slot of a Mixture of Agents fan-out (``phase="moa"``,
+  ``task="moa_reference"``), before that slot's call, so a preset cannot send a turn to a route the
+  gate refuses (:func:`moa_reference_refuses`). A slot takes ``route_custody: required`` as a
+  fallback entry does.
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
   required`` also needs an explicit ``{"action": "allow"}``; any other value that is not an
@@ -96,7 +100,7 @@ HERMES_ROUTE_CAPABILITIES: Mapping[str, str] = MappingProxyType({
 # Every ``phase`` a ``route_custody`` callback may receive from this build. A gate that pins a
 # revision checks that each phase it handles is listed here, and refuses a phase it does not know.
 HERMES_ROUTE_CUSTODY_PHASES: frozenset[str] = frozenset({"failover", "resolve", "turn", "request", "auxiliary",
-                                                        "compaction"})
+                                                        "compaction", "moa"})
 
 # Fallback-entry key: ``route_custody: required`` admits the entry only on an explicit allow.
 ROUTE_CUSTODY_KEY = "route_custody"
@@ -1574,6 +1578,25 @@ def judged_vision_client(provider: Any, client: Any, model: Any, judged: Any,
 def _availability_probe() -> bool:
     from agent.auxiliary_client import _aux_probe_active
     return _aux_probe_active()
+
+
+def moa_reference_refuses(agent: Any, slot: Mapping[str, Any]) -> bool:
+    """F12: ``True`` keeps a MoA reference *slot* off this turn, before its call. References read the
+    conversation's text view, and a slot's provider is explicit, so no fallback walk would ever ask
+    the gate. Same contract as a fallback candidate: a loaded gate is asked for every slot, a
+    ``route_custody: required`` slot needs an explicit allow, and a check that cannot run refuses."""
+    if not _gated(slot):
+        return False
+    provider, model = str(slot.get("provider") or ""), str(slot.get("model") or "")
+    try:
+        turn_agent = agent if agent is not None else _scope_agent()
+        if turn_agent is None:
+            logger.warning("Route custody: MoA reference %s/%s refused, no turn in scope", provider, model)
+            return True
+        return fallback_custody_refuses(turn_agent, slot, provider, model, phase="moa", task="moa_reference")
+    except Exception:  # health: allow BLE001 -- a custody check that cannot run refuses the route
+        logger.warning("Route custody: MoA reference %s/%s refused, the check raised", provider, model, exc_info=True)
+        return True
 
 
 def routes_exhausted(agent: Any, result: dict[str, Any], *, classified: Any, provider: Any,
