@@ -25,6 +25,7 @@ from agent.message_content import flatten_message_text
 from agent.lsp.deferred import forward_to_agent as forward_lsp_verdicts
 from agent.plugin_live_notes import pop_plugin_notices
 from agent.skills_index_delta import stage_skills_index_note
+from agent.fallback_cooldown import hold_walled_primary
 from agent.route_hooks import begin_turn as begin_route_turn
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -1173,6 +1174,11 @@ def build_turn_context(
     # active route: turn_route labels the turn, route_custody re-checks a fallback route. A custody
     # restore moved the agent back to its primary, so auxiliary ``auto`` calls must learn it too.
     if begin_route_turn(agent, messages=messages, turn_id=turn_id):
+        _publish_runtime_main(agent)
+    # After the labels, so the custody skip judges this turn. The cached prompt was built for the
+    # primary, and the walk rewrote its model and provider lines.
+    if hold_walled_primary(agent):
+        active_system_prompt = agent._cached_system_prompt
         _publish_runtime_main(agent)
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,

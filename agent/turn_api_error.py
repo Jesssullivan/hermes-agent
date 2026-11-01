@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
 from agent.route_hooks import routes_exhausted
+from agent.route_receipt import fire_route_receipt
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, free_tier_cooldown_ends_turn,
@@ -141,6 +142,10 @@ def handle_api_error(
         error_type=type(api_error).__name__, error_message=str(api_error), status_code=status_code,
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
+    )
+    fire_route_receipt(
+        agent, status=status_code, task_id=effective_task_id, turn_id=turn_id,
+        headers=getattr(getattr(api_error, "response", None), "headers", None) or {},
     )
 
     _recovered, recovered_with_pool = recover_after_classification(

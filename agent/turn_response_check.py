@@ -14,6 +14,9 @@ import time
 from typing import Any, Dict, Optional
 
 from agent.error_classifier import FailoverReason
+from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
+from agent.route_cooldown import clear_route_cooldown
+from agent.route_receipt import fire_route_receipt
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
@@ -211,6 +214,7 @@ def check_api_response(
             clear_nous_rate_limit(anonymous=is_anonymous_agent(agent))
         except Exception:
             pass
+    clear_route_cooldown(agent.provider, agent.model, agent.base_url, started_at=api_start_time)
     from agent import relay_llm
 
     relay_llm.complete_logical_call(api_request_id, outcome="success")
@@ -281,11 +285,17 @@ def retry_invalid_response(
             agent._buffer_diagnostic_status(f"🔄 Codex soft failure ({_soft.reason.value}) — switched to the next pool credential, retrying...")
             return _verdict("continue")
     retry_count += 1
+    # A quota wall that arrives as HTTP 200 ``status=failed`` is a 429 to the cooldown and the
+    # receipt. A receipt with status 200 would tell a quota watch this route is open.
+    _soft_reason = _soft.reason if _soft is not None else None
+    _soft_reset = _soft_ctx.get("reset_at")
+    if _soft_reason in _RATE_LIMIT_FAILOVER_REASONS:
+        fire_route_receipt(agent, status=429, task_id=effective_task_id, turn_id=turn_id)
 
     # Eager fallback: empty/malformed responses often mean rate limiting.
     if agent._fallback_index < len(agent._fallback_chain):
         agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
-    if agent._try_activate_fallback():
+    if agent._try_activate_fallback(reason=_soft_reason, reset_at=_soft_reset):
         active_system_prompt = _arm_fallback_restart(
             agent, api_messages, active_system_prompt, _retry)
         retry_count = 0
@@ -303,7 +313,7 @@ def retry_invalid_response(
     if retry_count >= max_retries:
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-        if agent._try_activate_fallback():
+        if agent._try_activate_fallback(reason=_soft_reason, reset_at=_soft_reset):
             active_system_prompt = _arm_fallback_restart(
                 agent, api_messages, active_system_prompt, _retry)
             retry_count = 0

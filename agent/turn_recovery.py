@@ -1521,19 +1521,30 @@ def free_tier_cooldown_ends_turn(agent: Any, api_error: Exception, base_url: Any
     return cooldown is not None and cooldown > LIVE_RETRY_WAIT_CAP_S
 
 
+# The reset fields ``extract_api_error_context`` reads. A window's ``resets_in_seconds`` is a number.
+_SOFT_FAILURE_RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")
+
+
 def _codex_soft_failure_error(response: Any) -> dict[str, Any]:
-    """``response.error`` of a Codex ``failed``/``cancelled`` Response as ``{"code", "message"}``
-    (the SDK types it as ``ResponseError``; the raw-SSE assembler keeps the dict); ``{}`` when absent."""
+    """``response.error`` of a Codex ``failed``/``cancelled`` Response as ``{"code", "message"}`` plus
+    any reset field (the SDK types it as ``ResponseError``; the raw-SSE assembler keeps the dict);
+    ``{}`` when absent."""
     error_obj = getattr(response, "error", None)
     if not error_obj:
         return {}
     if isinstance(error_obj, dict):
         fields = error_obj
     elif hasattr(error_obj, "code") or hasattr(error_obj, "message"):
-        fields = {"code": getattr(error_obj, "code", None), "message": getattr(error_obj, "message", None)}
+        fields = {k: getattr(error_obj, k, None) for k in ("code", "message", *_SOFT_FAILURE_RESET_FIELDS)}
     else:
         fields = {"message": str(error_obj)}
-    return {k: v for k, v in fields.items() if isinstance(v, str) and v.strip()}
+
+    def _keep(key: str, value: Any) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip())
+        return key in _SOFT_FAILURE_RESET_FIELDS and isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    return {k: v for k, v in fields.items() if _keep(k, v)}
 
 
 class _CodexSoftFailure(Exception):

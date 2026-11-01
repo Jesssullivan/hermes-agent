@@ -50,6 +50,8 @@ fallback:
 |-----|---------|--------|
 | `fallback.min_switch_reset_seconds` | `0` (off) | A rate-limited primary whose declared reset is sooner than this many seconds is not swapped for a fallback; the retry backoff waits out the window instead. |
 
+The cooldown is stored per route under `~/.hermes/rate_limits/`, so it holds across sessions, gateway restarts, `/v1/runs` and cron jobs of the same profile. A turn that starts on a route in cooldown moves down the chain before its first call, and a chain entry in cooldown is skipped. When no other route will take the turn, the primary keeps it. A response served by the route clears its cooldown. Two profiles keep separate cooldowns, even on one subscription.
+
 Gemini fallback entries accept `gemini`, `google`, `google-gemini`, and
 `google-ai-studio`. On Google's native API endpoint, all use the native Gemini
 client, including its `generationConfig.thinkingConfig` translation. A custom

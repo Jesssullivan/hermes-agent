@@ -198,7 +198,7 @@ VALID_HOOKS: set[str] = {
     # hatches. Kwargs: surface, command (canonical), alias_used, args_raw, session_key, platform.
     # Observer-first (#64204, #64182 rule 3); a directive-shaped return gets a debug log so future
     # block/rewrite adopters are discoverable once the middleware variant ships (#64231 taxonomy).
-    "pre_command", "turn_route", "route_custody", "on_routes_exhausted",  # route hooks: agent/route_hooks.py
+    "pre_command", "turn_route", "route_custody", "on_routes_exhausted", "post_api_response",  # route hooks: agent/route_hooks.py, agent/route_receipt.py
     "post_compaction",  # once per committed compaction on every path; observer (hooks.md, #118382)
 }
 

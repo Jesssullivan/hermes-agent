@@ -52,6 +52,8 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     # Route hooks (agent/route_hooks.py) on the turn path: on_routes_exhausted keeps the default copy on
     # a timeout. turn_route and route_custody are in the fail-closed set below.
     "on_routes_exhausted",
+    # Observer on every provider response (agent/route_receipt.py): it must not stall a turn.
+    "post_api_response",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.

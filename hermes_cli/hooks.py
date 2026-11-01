@@ -135,6 +135,16 @@ _DEFAULT_PAYLOADS = {
         "api_call_count": 1, "message_count": 4, "tool_count": 12,
         "approx_input_tokens": 2048, "request_char_count": 8192, "max_tokens": 4096,
     },
+    "post_api_response": {
+        "session_id": "test-session", "task_id": "test-task", "turn_id": "test-turn", "platform": "cli",
+        "model": "claude-sonnet-4-6",
+        "receipt": {
+            "schema": "cade.route-receipt/v0", "home": "default", "provider": "anthropic", "status": 200,
+            "headers": {"anthropic-ratelimit-unified-status": "allowed"},
+            "usage": {"input": 2048, "output": 512, "cacheRead": 0, "cacheWrite": 0},
+            "at": "2026-10-31T12:00:00.000Z",
+        },
+    },
     "post_api_request": {
         "session_id": "test-session", "task_id": "test-task", "platform": "cli",
         "model": "claude-sonnet-4-6", "provider": "anthropic",

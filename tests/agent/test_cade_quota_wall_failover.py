@@ -7,13 +7,14 @@ The public-home chain is what the cade launcher renders at Anthropic stage ``act
 main turns with one Kimi Code fallback (xoxd-ai/cade ``scripts/hermes-profiles.py``
 ``public_model_blocks``).
 
-The three-route chain is Sol through the SIWC relay, then Opus 5.5, then Kimi. SPR-301 names these
-three routes and no order, so this order is the one under test and not a ruled one. Sol is the cade
-home's live route. Cade does not render this chain: ``interim_model_blocks`` sets
-``fallback_providers: []``. The chain here shows what Hermes would do with it. It says nothing about
-custody, and it leaves out the on-prem tail that xoxd-ai/cade ``route-gate.ts`` ``homeChain`` gives
-the cade home. A cade-home Kimi entry also needs the F1, F2, F3 and F6 gate in
-``docs/ROUTE_FAILOVER.md``, and these tests load no route hook.
+Two more chains run the three routes SPR-301 names. The ruled one is Kimi, then Opus 5.5, then Sol
+through the SIWC relay (J160(a), TIN-7765 ``bdb14417``). The other starts on Sol, the cade home's
+live route today, then Opus, then Kimi, because that is where a wall lands until the render moves.
+Cade renders neither yet: ``interim_model_blocks`` sets ``fallback_providers: []``. These chains
+show what Hermes does with them and say nothing about custody. J160(b) keeps the on-prem tail, for
+C1 and C2 turns first, and TestRuledOrder pins the turn falling through it while no local model
+answers. A cade-home Kimi entry also needs the F1, F2, F3 and F6 gate in
+``docs/ROUTE_FAILOVER.md``. These tests load no route hook unless they say so.
 
 The error bodies and headers are synthetic. The live shapes of a Claude Max plan-window 429, a Kimi
 Code 429 and a ChatGPT plan wall are not measured (xoxd-ai/cade ``docs/ROUTE_FAILOVER.md`` section
@@ -37,10 +38,12 @@ per-test wall-clock alarm. Each raises ``HarnessBound``, a ``BaseException``, so
 
 from __future__ import annotations
 
+import json
 import signal
 import threading
 import time
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -57,13 +60,20 @@ OPUS = ("anthropic", "claude-opus-5-5")
 KIMI = ("kimi-coding", "k3.1-pro")
 # The public-home fallback block as cade renders it at stage active.
 PUBLIC_FALLBACK = [{"provider": KIMI[0], "model": KIMI[1]}]
-# SPR-301's three routes in the order under test. SPR-301 sets no order. Cade renders no such block
-# today: the interim relay route has ``fallback_providers: []``. ``homeChain`` ends the cade home's
-# chain on on-prem, and this chain has no such entry, so a wall on all three ends the turn here.
-# Whether a rendered chain keeps that tail is an open custody question.
+# The chain behind a Sol primary, the live route today. Cade renders no such block yet: the interim
+# relay route has ``fallback_providers: []``.
 THREE_ROUTE_CHAIN = [{"provider": OPUS[0], "model": OPUS[1]}, {"provider": KIMI[0], "model": KIMI[1]}]
 # The relay is a loopback listener. No test connects, so a reserved name stands in for its address.
 SIWC_BASE_URL = "http://siwc-relay.invalid/v1"
+# J160(a): Kimi, then Opus, then Sol. The primary is Kimi, so these are the entries behind it.
+RULED_CHAIN = [
+    {"provider": OPUS[0], "model": OPUS[1]},
+    {"provider": SOL[0], "model": SOL[1], "base_url": SIWC_BASE_URL, "api_mode": "codex_responses"},
+]
+ONPREM = ("cade-onprem", "local-model")
+ONPREM_BASE_URL = "http://onprem.invalid/v1"
+# J160(b): the on-prem tail stays. Its chain entry is a stand-in, because cade names no route yet.
+RULED_CHAIN_WITH_TAIL = [*RULED_CHAIN, {"provider": ONPREM[0], "model": ONPREM[1], "base_url": ONPREM_BASE_URL}]
 # A plan window that reopens in four hours, as on 2026-10-29 when a Kimi plan hit its 5 h window.
 FOUR_HOURS = 4 * 3600
 
@@ -83,6 +93,14 @@ BACKOFF_SITES = (
 
 
 REAL_SLEEP = time.sleep
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_model_ids():
+    """These model ids are synthetic, so the catalog must not rename them between a write to the
+    shared store and a read of it. ``drive`` patches the same name for its turn."""
+    with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
+        yield
 
 
 class HarnessBound(BaseException):
@@ -169,10 +187,10 @@ def relay_stream_broken():
         return frame_error
 
 
-def responses_failed(code):
+def responses_failed(code, **fields):
     """A ``response.failed`` terminal. The relay forwards this frame, so its code reaches Hermes."""
     return SimpleNamespace(
-        output=[], output_text="", status="failed", incomplete_details=None, error={"code": code},
+        output=[], output_text="", status="failed", incomplete_details=None, error={"code": code, **fields},
         usage=None, model="fake", id="resp_fake", service_tier=None,
     )
 
@@ -238,11 +256,17 @@ def _sol_home_agent(fallback=THREE_ROUTE_CHAIN):
     return _agent(SOL, fallback, api_key="relay-bearer-synthetic", base_url=SIWC_BASE_URL, api_mode="codex_responses")
 
 
+def _kimi_home_agent(fallback=RULED_CHAIN):
+    """The ruled chain: Kimi primary, then Opus, then Sol."""
+    return _agent(KIMI, fallback, api_key="kimi-synthetic", base_url="https://api.kimi.com/coding/")
+
+
 def _route_client(provider, *args, **kwargs):
     """A fake of ``resolve_provider_client``: the configured fallback client, and no socket."""
     client = MagicMock()
     client.api_key = "synthetic"
-    client.base_url = "https://api.anthropic.com" if provider == OPUS[0] else "https://api.kimi.com/coding/"
+    client.base_url = kwargs.get("explicit_base_url") or (
+        "https://api.anthropic.com" if provider == OPUS[0] else "https://api.kimi.com/coding/")
     client._custom_headers = None
     client.default_headers = None
     return client, kwargs.get("model")
@@ -250,19 +274,21 @@ def _route_client(provider, *args, **kwargs):
 
 class Run(SimpleNamespace):
     """One driven turn: result, calls as (provider, model) per API call, waits as (route, seconds)
-    for each backoff Hermes asked for, and sleeps as any direct main-thread ``time.sleep`` argument."""
+    for each backoff Hermes asked for, sleeps as any direct main-thread ``time.sleep`` argument, and
+    requests as the ``api_kwargs`` of each call."""
 
 
 def drive(agent, script, max_api_calls=MAX_API_CALLS):
     """Run one turn. script(route, attempt) returns an exception to raise, the reply text for that
     call, or a whole response object."""
-    calls, waits, sleeps = [], [], []
+    calls, waits, sleeps, requests = [], [], [], []
 
     def fake_api_call(api_kwargs, *args, **kwargs):
         if len(calls) >= max_api_calls:
             raise HarnessBound(f"more than {max_api_calls} API calls: {calls[-4:]}")
         route = (agent.provider, agent.model)
         calls.append(route)
+        requests.append(api_kwargs)
         outcome = script(route, sum(1 for c in calls if c == route))
         if isinstance(outcome, BaseException):
             raise outcome
@@ -302,7 +328,7 @@ def drive(agent, script, max_api_calls=MAX_API_CALLS):
             "hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m))
         stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
         result = agent.run_conversation("synthetic public-home turn")
-    return Run(result=result, calls=calls, waits=waits, sleeps=sleeps)
+    return Run(result=result, calls=calls, waits=waits, sleeps=sleeps, requests=requests)
 
 
 def _reply(result):
@@ -323,9 +349,36 @@ def _cooldown(agent):
     return max(0.0, (getattr(agent, "_rate_limited_until", 0) or 0) - time.monotonic())
 
 
-def _expire_cooldown(agent):
-    """Move the monotonic deadline into the past instead of waiting for it."""
+def _ledger_file(route):
+    from agent.route_cooldown import _path
+
+    return Path(_path(route[0], route[1], ""))
+
+
+def _ledger(route):
+    """The route's shared cooldown record, or None."""
+    from agent.route_cooldown import read_route_cooldown
+
+    return read_route_cooldown(route[0], route[1], "")
+
+
+def _shared_seconds(route):
+    """Seconds left on the route's shared cooldown. 0 when none is armed."""
+    held = _ledger(route)
+    return held.remaining() if held is not None else 0.0
+
+
+def _expire_cooldown(agent, route=None):
+    """Move both deadlines into the past instead of waiting for them. The shared record stays, so
+    its count still doubles the next cooldown. ``route`` defaults to the agent's primary."""
+    primary = agent._primary_runtime
+    route = route or (primary["provider"], primary["model"])
     agent._rate_limited_until = time.monotonic() - 1
+    path = _ledger_file(route)
+    if path.exists():
+        record = json.loads(path.read_text())
+        record["until"] = time.time() - 1
+        path.write_text(json.dumps(record))
 
 
 class TestHarnessBounds:
@@ -367,10 +420,8 @@ class TestOpusWallMovesToKimi:
         assert (agent.provider, agent.model) == KIMI
 
     def test_unified_headers_alone_still_fall_back(self):
-        # Only the anthropic-ratelimit-unified-* names, no Retry-After. This revision does not read
-        # the unified reset (agent/retry_utils.py provider_retry_after_seconds reads Retry-After and
-        # problem-detail fields), so the reset is unknown to Hermes. The turn still moves. Cade's quota
-        # watch, not Hermes, has to carry the reset time into the status reply (F7 and F8).
+        # Only the anthropic-ratelimit-unified-* names, no Retry-After. F8 reads the unified reset,
+        # so the cooldown runs to the window's end. Those header names are shape U: not measured live.
         agent = _public_home_agent()
         wall = opus_rate_limit(unified_headers(time.time() + FOUR_HOURS))
 
@@ -379,6 +430,7 @@ class TestOpusWallMovesToKimi:
         assert run.result["completed"] is True
         assert _reply(run.result) == "answered on kimi"
         assert _opus_waits(run) == []
+        assert FOUR_HOURS - 60 < _cooldown(agent) <= FOUR_HOURS
 
     def test_usage_limit_wording_without_reset_falls_back(self):
         # A wall phrased as a usage limit with no reset signal. Whichever reason it classifies as,
@@ -452,9 +504,8 @@ class TestNextTurn:
     failure leaves the primary. It takes the provider's reset, and with none it uses 60 s doubling to
     4 h. ``restore_primary_runtime`` then keeps that agent on the fallback until the deadline passes.
 
-    The deadline lives on the agent and nowhere else, so this holds only for a reused agent: the CLI,
-    the TUI or a gateway turn that failed. The gateway drops the agent after a successful fallback
-    turn, and ``api_server`` builds one per run. TestGatewayEviction pins the gateway case.
+    The same deadline is in the shared store (agent/route_cooldown.py), so an agent built after the
+    wall holds it too. TestGatewayEviction pins that case.
     """
 
     @staticmethod
@@ -481,18 +532,23 @@ class TestNextTurn:
         assert run.calls == [OPUS, KIMI]
         assert run.result["completed"] is True
 
-    def test_a_wall_with_no_reset_signal_stays_at_sixty_seconds(self):
-        # Hermes does not read the unified reset, so a wall that names four hours arms 60 s. The
-        # doubling never starts: the restore that lets Opus try again zeroes the backoff count. On a
-        # reused agent a closed four-hour window costs one Opus 429 per minute of turns. On the
-        # gateway it costs one per successful turn (TestGatewayEviction).
+    def test_a_wall_that_names_its_reset_is_not_tried_again_inside_the_window(self):
         agent = _public_home_agent()
         script = self._script(opus_rate_limit(unified_headers(time.time() + FOUR_HOURS)))
+        drive(agent, script)
+        assert FOUR_HOURS - 60 < _cooldown(agent) <= FOUR_HOURS
+        assert drive(agent, script).calls == [KIMI]
+
+    def test_a_wall_with_no_reset_signal_doubles_across_restores(self):
+        # A restore zeroes the agent's count, and the route has served nothing since, so the shared
+        # count keeps the doubling. A closed window with no reset signal costs fewer calls each time.
+        agent = _public_home_agent()
+        script = self._script(opus_rate_limit({}))
         drive(agent, script)
         assert 0 < _cooldown(agent) <= 60
         _expire_cooldown(agent)
         assert drive(agent, script).calls == [OPUS, KIMI]
-        assert 0 < _cooldown(agent) <= 60
+        assert 60 < _cooldown(agent) <= 120
 
 
 class _GatewaySessions:
@@ -508,15 +564,15 @@ class _GatewaySessions:
         self._build = build
         self._cached = {}
 
-    def agent(self):
-        if self.SESSION not in self._cached:
-            self._cached[self.SESSION] = self._build()
-        return self._cached[self.SESSION]
+    def agent(self, session=SESSION):
+        if session not in self._cached:
+            self._cached[session] = self._build()
+        return self._cached[session]
 
-    def finish_turn(self, agent, result):
+    def finish_turn(self, agent, result, session=SESSION):
         from gateway.run_turn import GatewayTurnMixin
 
-        turn = SimpleNamespace(session_key=self.SESSION, agent_holder=[agent], result_holder=[result])
+        turn = SimpleNamespace(session_key=session, agent_holder=[agent], result_holder=[result])
         GatewayTurnMixin._run_agent_evict_on_fallback(self, turn)
 
     def _evict_cached_agent(self, session_key):
@@ -527,21 +583,20 @@ class TestGatewayEviction:
     """The next turn on the gateway, Cade's live surface.
 
     ``_run_agent_evict_on_fallback`` drops the cached agent after a successful fallback turn so the
-    next message retries the primary. Nothing outside the agent stores ``_rate_limited_until``, so
-    the cooldown goes with it and a fresh agent starts on the walled route. The forwarded 429 and the
-    notice's retry time do not hold here. A shared cooldown (F9) or a kept agent is what would change
-    these pins.
+    next message retries the primary. The route's cooldown is in the shared store, so a fresh agent
+    reads it and starts on the fallback. This is the F9 choice in step 6(d): the store, not a kept
+    agent, because ``api_server`` and cron build an agent per run and a new session has no cached
+    agent to keep.
     """
 
-    @pytest.mark.parametrize(
-        "build, wall, walled, served",
-        [
-            (_public_home_agent, lambda: opus_rate_limit({"retry-after": str(FOUR_HOURS)}), OPUS, KIMI),
-            (_sol_home_agent, lambda: forwarded_sol_wall(FOUR_HOURS), SOL, OPUS),
-        ],
-        ids=["public-home", "sol-forwarded-429"],
-    )
-    def test_a_successful_fallback_drops_the_cooldown_so_the_wall_repeats(self, build, wall, walled, served):
+    CASES = [
+        (_public_home_agent, lambda: opus_rate_limit({"retry-after": str(FOUR_HOURS)}), OPUS, KIMI),
+        (_sol_home_agent, lambda: forwarded_sol_wall(FOUR_HOURS), SOL, OPUS),
+        (_kimi_home_agent, lambda: kimi_rate_limit(retry_after=FOUR_HOURS), KIMI, OPUS),
+    ]
+
+    @pytest.mark.parametrize("build, wall, walled, served", CASES, ids=["public-home", "sol-forwarded-429", "ruled-kimi"])
+    def test_an_eviction_keeps_the_cooldown_so_the_wall_is_not_paid_twice(self, build, wall, walled, served):
         sessions = _GatewaySessions(build)
         script = lambda route, attempt: wall() if route == walled else "answered on " + route[0]
 
@@ -557,8 +612,37 @@ class TestGatewayEviction:
 
         second = sessions.agent()
         assert second is not first
-        assert _cooldown(second) == 0
-        assert drive(second, script).calls == [walled, served]
+        assert _cooldown(second) == 0  # nothing yet: this agent has run no turn
+        notices.clear()
+        second.status_callback = first.status_callback
+        run = drive(second, script)
+        assert run.calls == [served]
+        assert run.result["completed"] is True
+        assert FOUR_HOURS - 60 < _cooldown(second) <= FOUR_HOURS
+        assert any("Primary retry eligible in ~" in text for text in notices), notices
+
+    def test_a_second_session_never_pays_the_first_sessions_wall(self):
+        sessions = _GatewaySessions(_public_home_agent)
+        wall = opus_rate_limit({"retry-after": str(FOUR_HOURS)})
+        script = lambda route, attempt: wall if route == OPUS else "answered on kimi"
+        assert drive(sessions.agent("a"), script).calls == [OPUS, KIMI]
+        assert drive(sessions.agent("b"), script).calls == [KIMI]
+
+    def test_a_per_run_agent_holds_the_cooldown(self):
+        # ``api_server`` builds an agent per /v1/runs run, so each run here is a new agent.
+        wall = opus_rate_limit({"retry-after": str(FOUR_HOURS)})
+        script = lambda route, attempt: wall if route == OPUS else "answered on kimi"
+        calls = [drive(_public_home_agent(), script).calls for _ in range(3)]
+        assert calls == [[OPUS, KIMI], [KIMI], [KIMI]]
+
+    def test_after_the_window_a_fresh_agent_tries_the_primary_and_it_clears(self):
+        wall = opus_rate_limit({"retry-after": str(FOUR_HOURS)})
+        drive(_public_home_agent(), lambda route, attempt: wall if route == OPUS else "answered on kimi")
+        agent = _public_home_agent()
+        _expire_cooldown(agent)
+        run = drive(agent, lambda route, attempt: "answered on " + route[0])
+        assert run.calls == [OPUS]
+        assert _ledger(OPUS) is None
 
     def test_a_failed_turn_keeps_the_agent_and_its_cooldown(self):
         sessions = _GatewaySessions(_sol_home_agent)
@@ -576,6 +660,92 @@ class TestGatewayEviction:
         assert sessions.agent() is first
         assert FOUR_HOURS - 60 < _cooldown(first) <= FOUR_HOURS
         assert set(drive(first, script).calls) == {KIMI}
+
+
+class TestTurnStartHold:
+    """``hold_walled_primary``: what a turn does when its primary starts in a shared cooldown."""
+
+    @staticmethod
+    def _arm(route, seconds=FOUR_HOURS):
+        from agent.route_cooldown import record_route_cooldown
+
+        record_route_cooldown(route[0], route[1], "", seconds=seconds, count=1, reason="rate_limit")
+
+    def test_the_hold_walks_the_chain_in_order_past_a_second_closed_route(self):
+        self._arm(KIMI)
+        self._arm(OPUS)
+        run = drive(_kimi_home_agent(), lambda route, attempt: "answered on " + route[0])
+        assert run.calls == [SOL]
+        assert _reply(run.result) == "answered on cade-siwc"
+
+    def test_the_prompt_names_the_route_that_carries_the_turn(self):
+        self._arm(KIMI)
+        agent = _kimi_home_agent()
+        agent._cached_system_prompt = "stored prompt\nModel: k3.1-pro\nProvider: kimi-coding"
+        run = drive(agent, lambda route, attempt: "answered")
+        assert agent._cached_system_prompt.endswith(f"Model: {OPUS[1]}\nProvider: {OPUS[0]}")
+        # The request, not only the cache: the turn took its prompt before the hold moved the route.
+        sent = str(run.requests[0].get("system"))
+        assert f"Model: {OPUS[1]}" in sent
+        assert "k3.1-pro" not in sent
+
+    def test_with_no_other_route_open_the_primary_keeps_the_turn(self):
+        # The deadlines can be wrong, so a closed chain does not refuse the turn.
+        for route in (KIMI, OPUS, SOL):
+            self._arm(route)
+        run = drive(_kimi_home_agent(), lambda route, attempt: "answered on " + route[0])
+        assert run.calls == [KIMI]
+        assert run.result["completed"] is True
+
+    def test_custody_refuses_a_candidate_at_the_hold(self):
+        # The walk is the mid-turn walk, so the custody skip runs. Nothing is added to the session's
+        # unavailable set: a refusal holds for this turn.
+        self._arm(KIMI)
+        agent = _kimi_home_agent()
+        with patch("agent.route_hooks.fallback_custody_refuses", side_effect=lambda a, fb, p, m: p == OPUS[0]):
+            run = drive(agent, lambda route, attempt: "answered on " + route[0])
+        assert run.calls == [SOL]
+        assert not agent._unavailable_fallback_keys
+
+    def test_custody_refusing_every_candidate_leaves_the_primary_with_a_whole_chain(self):
+        self._arm(KIMI)
+        agent = _kimi_home_agent()
+        with patch("agent.route_hooks.fallback_custody_refuses", return_value=True):
+            run = drive(agent, lambda route, attempt: "answered on " + route[0])
+        assert run.calls == [KIMI]
+        assert agent._fallback_index == 0
+        assert agent._fallback_activated is False
+
+    def test_labels_are_known_before_the_hold(self):
+        # A hold ahead of ``turn_route`` would judge the turn without its labels.
+        self._arm(KIMI)
+        seen = []
+        real = __import__("agent.route_hooks", fromlist=["begin_turn"]).begin_turn
+
+        def begin(agent, **kwargs):
+            seen.append(("begin", agent.provider))
+            return real(agent, **kwargs)
+
+        with patch("agent.turn_context.begin_route_turn", side_effect=begin):
+            run = drive(_kimi_home_agent(), lambda route, attempt: "answered on " + route[0])
+        assert seen == [("begin", KIMI[0])]
+        assert run.calls == [OPUS]
+
+    def test_a_fallback_kept_from_an_earlier_turn_is_left_alone(self):
+        self._arm(KIMI)
+        agent = _kimi_home_agent()
+        script = lambda route, attempt: "answered on " + route[0]
+        drive(agent, script)
+        assert drive(agent, script).calls == [OPUS]
+        assert agent._fallback_index == 1
+
+    def test_a_route_with_no_chain_never_reads_the_store(self):
+        self._arm(KIMI)
+        agent = _kimi_home_agent(fallback=[])
+        with patch("agent.fallback_cooldown.read_route_cooldown") as read:
+            run = drive(agent, lambda route, attempt: "answered")
+        assert run.calls == [KIMI]
+        read.assert_not_called()
 
 
 class TestSolWallThroughTheRelay:
@@ -604,27 +774,45 @@ class TestSolWallThroughTheRelay:
         run = drive(agent, script)
         assert run.calls == [SOL] * agent._api_max_retries + [OPUS]
 
-    def test_a_response_failed_usage_code_arms_no_cooldown(self):
+    @pytest.mark.parametrize("code", ["subscription_sharing_usage_limit_exceeded", "usage_limit_reached"])
+    def test_a_response_failed_usage_code_arms_the_cooldown(self, code):
         # The relay forwards this frame with its code. ``turn_response_check`` moves on the first
-        # invalid response, so Sol gets one call, and Hermes reads no quota in the code.
+        # invalid response, so Sol gets one call. F7 reads the code as a rate limit. This frame
+        # carries no reset, so the cooldown is the 60 s first step. The first code comes from a
+        # fixture in cade ``relay.test.mjs``, not from a live wall.
         agent = _sol_home_agent()
-        failed = responses_failed("subscription_sharing_usage_limit_exceeded")
-        run = drive(agent, self._script(failed))
+        run = drive(agent, self._script(responses_failed(code)))
         assert run.calls == [SOL, OPUS]
         assert run.result["completed"] is True
-        assert _cooldown(agent) == 0
+        assert 0 < _cooldown(agent) <= 60
+        assert drive(agent, self._script(responses_failed(code))).calls == [OPUS]
 
-    def test_classifying_the_code_alone_would_still_arm_no_cooldown(self):
-        # F7 is not enough. ``turn_response_check`` calls ``_try_activate_fallback()`` with no reason
-        # and no reset, so a rate-limit verdict with a reset leaves the cooldown unarmed.
+    def test_the_soft_failure_call_site_carries_the_frames_reset(self):
+        agent = _sol_home_agent()
+        failed = responses_failed("usage_limit_reached", resets_in_seconds=FOUR_HOURS)
+        run = drive(agent, self._script(failed))
+        assert run.calls == [SOL, OPUS]
+        assert FOUR_HOURS - 60 < _cooldown(agent) <= FOUR_HOURS
+        assert FOUR_HOURS - 60 < _shared_seconds(SOL) <= FOUR_HOURS
+
+    def test_the_soft_failure_call_site_passes_a_classified_reset(self):
+        # Step 6(b) alone, with the classifier stubbed. The mutation that drops the reason or the
+        # reset at the first call site fails here.
         agent = _sol_home_agent()
         verdict = ClassifiedError(reason=FailoverReason.rate_limit)
         context = {"reset_at": time.time() + FOUR_HOURS}
-        failed = responses_failed("usage_limit_reached")
+        failed = responses_failed("anything")
         with patch("agent.turn_recovery.classify_codex_soft_failure", return_value=(verdict, context)):
             run = drive(agent, self._script(failed))
         assert run.calls == [SOL, OPUS]
+        assert FOUR_HOURS - 60 < _cooldown(agent) <= FOUR_HOURS
+
+    def test_a_soft_failure_that_is_not_a_quota_wall_arms_nothing(self):
+        agent = _sol_home_agent()
+        run = drive(agent, self._script(responses_failed("server_error")))
+        assert run.calls == [SOL, OPUS]
         assert _cooldown(agent) == 0
+        assert _ledger(SOL) is None
 
     def test_reauthentication_moves_at_once_with_no_cooldown(self):
         agent = _sol_home_agent()
@@ -686,7 +874,7 @@ class TestRelayOutage:
 
 
 class TestForwardedSolWall:
-    """The same wall once the relay forwards it as a 429. The relay does not do this today."""
+    """The same wall once the relay forwards it as a 429 (step 5)."""
 
     def test_a_forwarded_wall_moves_at_once_and_arms_the_cooldown(self):
         agent = _sol_home_agent()
@@ -700,7 +888,8 @@ class TestForwardedSolWall:
 
 
 class TestThreeRoutes:
-    """Sol, then Opus, then Kimi, with Sol's wall in the forwarded shape."""
+    """Sol, then Opus, then Kimi, with Sol's wall in the forwarded shape. Sol is live today, so
+    these show the walls on the way to the ruled order. TestRuledOrder pins that order."""
 
     @staticmethod
     def _script(sol_wall, opus_wall, kimi=None):
@@ -727,21 +916,23 @@ class TestThreeRoutes:
         assert run.calls == [SOL] * agent._api_max_retries + [OPUS, KIMI]
         assert run.result["completed"] is True
 
-    def test_only_the_primary_gets_a_cooldown(self):
-        # The hop from Opus to Kimi arms nothing, so Opus' four-hour window is not recorded. Once
-        # Sol's short window passes, the next turn spends a call on each closed route again.
+    def test_every_hop_records_its_window(self):
+        # The hop from Opus to Kimi records Opus' four hours in the shared store. Once Sol's short
+        # window passes, the next turn pays Sol's wall and skips Opus. ``_rate_limited_until`` stays
+        # the primary's: the Opus hop leaves it alone.
         agent = _sol_home_agent()
         script = self._script(forwarded_sol_wall(90), opus_rate_limit({"retry-after": str(FOUR_HOURS)}))
         drive(agent, script)
         assert 0 < _cooldown(agent) <= 90
+        assert FOUR_HOURS - 60 < _shared_seconds(OPUS) <= FOUR_HOURS
         assert drive(agent, script).calls == [KIMI]
         _expire_cooldown(agent)
-        assert drive(agent, script).calls == [SOL, OPUS, KIMI]
+        assert drive(agent, script).calls == [SOL, KIMI]
 
     def test_after_sol_reopens_the_next_turn_returns_to_sol(self):
         agent = _sol_home_agent()
         drive(agent, self._script(forwarded_sol_wall(90), opus_rate_limit({"retry-after": str(FOUR_HOURS)})))
-        _expire_cooldown(agent)
+        _expire_cooldown(agent, SOL)
         run = drive(agent, self._script("answered on sol", "unused"))
         assert run.calls == [SOL]
         assert _reply(run.result) == "answered on sol"
@@ -769,3 +960,138 @@ class TestThreeRoutes:
         # As in TestBothWalls: Hermes' own text, after the capped waits on the last route.
         assert _reply(run.result).strip(), run.result
         assert _waits_on(run, SOL) == [] and _waits_on(run, OPUS) == []
+
+
+class TestRuledOrder:
+    """J160(a): Kimi, then Opus, then Sol, with the on-prem tail J160(b) keeps for C1 and C2 turns."""
+
+    @staticmethod
+    def _script(*closed):
+        walls = {
+            KIMI: kimi_rate_limit(retry_after=FOUR_HOURS), OPUS: opus_rate_limit({"retry-after": str(FOUR_HOURS)}),
+            SOL: forwarded_sol_wall(FOUR_HOURS),
+        }
+
+        def script(route, attempt):
+            return walls[route] if route in closed else "answered on " + route[0]
+        return script
+
+    def test_the_turn_starts_on_kimi(self):
+        run = drive(_kimi_home_agent(), self._script())
+        assert run.calls == [KIMI]
+
+    def test_a_kimi_wall_moves_to_opus(self):
+        agent = _kimi_home_agent()
+        run = drive(agent, self._script(KIMI))
+        assert run.calls == [KIMI, OPUS]
+        assert run.waits == []
+        assert _reply(run.result) == "answered on anthropic"
+        assert agent.api_mode == "anthropic_messages"
+
+    def test_two_walls_reach_sol_on_the_relays_api_mode(self):
+        agent = _kimi_home_agent()
+        run = drive(agent, self._script(KIMI, OPUS))
+        assert run.calls == [KIMI, OPUS, SOL]
+        assert run.waits == []
+        assert _reply(run.result) == "answered on cade-siwc"
+        assert (agent.provider, agent.base_url, agent.api_mode) == (SOL[0], SIWC_BASE_URL, "codex_responses")
+
+    def test_a_masked_sol_wall_as_the_last_route_ends_with_text(self):
+        # Sol is the last route here, so the relay's 502 takes the auto-recovery ladder.
+        agent = _kimi_home_agent()
+        kimi_wall, opus_wall = kimi_rate_limit(retry_after=FOUR_HOURS), opus_rate_limit({"retry-after": str(FOUR_HOURS)})
+        walls = {KIMI: kimi_wall, OPUS: opus_wall, SOL: relay_rejected()}
+        retries, cycles = agent._api_max_retries, agent._auto_recovery_cycles
+        run = drive(agent, lambda route, attempt: walls[route], max_api_calls=2 + retries * (1 + cycles) + 1)
+        assert run.calls == [KIMI, OPUS] + [SOL] * (retries * (1 + cycles))
+        assert run.result["completed"] is False
+        assert _reply(run.result).strip(), run.result
+
+    def test_three_walls_end_the_turn_with_text(self):
+        agent = _kimi_home_agent()
+        run = drive(agent, self._script(KIMI, OPUS, SOL))
+        assert run.calls == [KIMI, OPUS] + [SOL] * agent._api_max_retries
+        assert run.result["completed"] is False
+        assert _reply(run.result).strip(), run.result
+
+    def test_each_later_turn_goes_straight_to_the_open_route(self):
+        script = self._script(KIMI, OPUS)
+        assert drive(_kimi_home_agent(), script).calls == [KIMI, OPUS, SOL]
+        assert drive(_kimi_home_agent(), script).calls == [SOL]
+        assert drive(_kimi_home_agent(), script).calls == [SOL]
+
+    def test_a_cold_on_prem_tail_falls_through_to_the_status_reply(self):
+        # J160(b): until a local model is warm the turn reaches the SPR-151 reply. The reply text is
+        # Cade's, through F6. The refused connection stands in for a cold local route.
+        from hermes_cli.plugins import PluginManager
+
+        def cold(route, attempt):
+            if route == ONPREM:
+                return openai.APIConnectionError(request=httpx.Request("POST", f"{ONPREM_BASE_URL}/chat"))
+            return script(route, attempt)
+
+        script = self._script(KIMI, OPUS, SOL)
+        manager = PluginManager()
+        manager._discovered = True
+        exhausted = []
+        manager._hooks["on_routes_exhausted"] = [
+            lambda **kw: exhausted.append(kw) or {"reply": "Every model route is resting."}]
+        agent = _kimi_home_agent(fallback=RULED_CHAIN_WITH_TAIL)
+        retries, cycles = agent._api_max_retries, agent._auto_recovery_cycles
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+            run = drive(agent, cold, max_api_calls=3 + retries * (2 + cycles) + 1)
+        assert run.calls[:4] == [KIMI, OPUS, SOL, ONPREM]
+        assert set(run.calls[3:]) == {ONPREM}
+        assert run.result["completed"] is False
+        assert _reply(run.result) == "Every model route is resting."
+        assert len(exhausted) == 1
+
+
+class TestRouteReceipts:
+    """F8 through the real loop: what a quota watch hears about each attempt."""
+
+    @staticmethod
+    def _receipts():
+        from hermes_cli.plugins import PluginManager
+
+        manager = PluginManager()
+        manager._discovered = True
+        seen = []
+        manager._hooks["post_api_response"] = [lambda receipt, **kw: seen.append(receipt)]
+        return patch("hermes_cli.plugins.get_plugin_manager", return_value=manager), seen
+
+    def test_a_wall_then_a_served_fallback_gives_two_receipts(self):
+        loaded, seen = self._receipts()
+        wall = opus_rate_limit(unified_headers(time.time() + FOUR_HOURS))
+        with loaded:
+            drive(_public_home_agent(), lambda route, attempt: wall if route == OPUS else "answered on kimi")
+        assert [(r["provider"], r["status"]) for r in seen] == [(OPUS[0], 429), (KIMI[0], 200)]
+        assert seen[0]["headers"]["anthropic-ratelimit-unified-status"] == "rejected"
+        assert seen[1]["headers"] == {}
+
+    def test_a_soft_quota_wall_reports_429_and_not_200(self):
+        # ingestReceipt treats a 2xx as a live success, which would close the breaker on a wall.
+        loaded, seen = self._receipts()
+        failed = responses_failed("usage_limit_reached")
+        with loaded:
+            drive(_sol_home_agent(), lambda route, attempt: failed if route == SOL else "answered on " + route[0])
+        assert [(r["provider"], r["status"]) for r in seen] == [(SOL[0], 429), (OPUS[0], 200)]
+
+    def test_a_refused_connection_has_no_receipt(self):
+        loaded, seen = self._receipts()
+        with loaded:
+            drive(_sol_home_agent(), lambda route, attempt: relay_down() if route == SOL else "answered on " + route[0])
+        assert [(r["provider"], r["status"]) for r in seen] == [(OPUS[0], 200)]
+
+    def test_a_raising_observer_leaves_the_turn_alone(self):
+        from hermes_cli.plugins import PluginManager
+
+        def boom(**kw):
+            raise RuntimeError("synthetic")
+
+        manager = PluginManager()
+        manager._discovered = True
+        manager._hooks["post_api_response"] = [boom]
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+            run = drive(_public_home_agent(), lambda route, attempt: "answered")
+        assert run.result["completed"] is True
