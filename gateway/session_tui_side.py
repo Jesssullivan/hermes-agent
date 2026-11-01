@@ -77,19 +77,40 @@ def _side_scope(authority, policy, task_id):
             clear_session_vars(tokens)
 
 
-def _resolve_runtime(authority, policy):
-    """``(model, runtime)`` the session's next turn would use: its frozen policy route."""
+def _parent_route(authority, live):
+    """``(session id, resident agent)`` of the session a side agent serves, for route custody: its
+    physical id, which keys the labels earlier turns gave it. ``('', None)`` when the runner cannot
+    tell (agent/route_hooks.py)."""
+    from gateway.run_turn_prepare import _resolution_session_id
+    runner, route = authority.runner, getattr(live, 'route', None)
+    lookup = getattr(runner, '_resident_agent_for', None) or getattr(runner, '_cached_agent_for', None)
+    resident = None
+    with contextlib.suppress(Exception):
+        resident = lookup(route) if callable(lookup) and not live.superseded else None
+    session_id = getattr(resident, 'session_id', None)
+    return session_id or _resolution_session_id(runner, getattr(live, 'source', None), route), resident
+
+
+def _resolve_runtime(authority, policy, live=None):
+    """``(model, runtime)`` the session's next turn would use: its frozen policy route. A fallback
+    entry's custody record stays stashed in this context for the caller (``take_resolution_entry``),
+    and a resolve-phase check reads the labels of the *live* session."""
+    from agent.route_hooks import custody_applies, resolving_session, stash_resolution_entry
     from gateway.run_turn_prepare import _resolve_policy_agent_runtime
-    return _resolve_policy_agent_runtime(authority.runner, policy)
+    stash_resolution_entry(None)
+    with resolving_session(_parent_route(authority, live)[0] if custody_applies(None) else ''):
+        return _resolve_policy_agent_runtime(authority.runner, policy)
 
 
 def _side_agent(authority, policy, live, task_id, **overrides):
     """A fresh ``AIAgent`` on the session's frozen route (call inside ``_side_scope``)."""
     from agent.skill_utils import parse_config_string_list
+    from agent.route_hooks import custody_applies, inherit_route_custody, take_resolution_entry
     from gateway.run import _checkpoint_agent_kwargs
     from run_agent import AIAgent
     runner = authority.runner
-    model, runtime = _resolve_runtime(authority, policy)
+    model, runtime = _resolve_runtime(authority, policy, live)
+    record = take_resolution_entry()
     config = policy.config(authority)
     from gateway.session_worker_construct import session_routing
     pr = session_routing(authority, policy)
@@ -112,7 +133,11 @@ def _side_agent(authority, policy, live, task_id, **overrides):
         load_soul_identity=not policy.ignore_rules, skip_memory=policy.ignore_rules,
         side_agent=True)
     kwargs.update(overrides)
-    return AIAgent(**kwargs)
+    agent = AIAgent(**kwargs)
+    if custody_applies(record):  # its turn start checks the entry, with the session's labels and data use
+        session_id, resident = _parent_route(authority, live)
+        inherit_route_custody(agent, record, parent=resident, session_id=session_id)
+    return agent
 
 
 def _abandoned(holder):
@@ -207,14 +232,17 @@ async def btw(connection, ref, params):
     handle = _SideQuestionStop()
 
     def body():
+        from agent.route_hooks import take_resolution_entry
         from agent.side_question import answer_side_question
         history = snapshot or authority.db.get_messages_as_conversation(target)
         with _side_scope(authority, policy, task_id):
-            model, runtime = _resolve_runtime(authority, policy)
+            model, runtime = _resolve_runtime(authority, policy, _live)
             main_runtime = {'model': model, 'session_id': ref.session_id,
                             **{key: runtime.get(key) for key in ('provider', 'base_url', 'api_key', 'api_mode')}}
+            route = {'record': take_resolution_entry(), 'platform': getattr(policy, 'platform', ''),
+                     'session_id': getattr(agent, 'session_id', None) or target}
             return answer_side_question(text, history, parent_agent=agent, main_runtime=main_runtime,
-                                        on_fork=handle.set_fork, should_stop=handle.stopped.is_set) or ''
+                                        on_fork=handle.set_fork, should_stop=handle.stopped.is_set, route=route) or ''
 
     return _spawn(authority, ref, task_id, 'btw.complete', body, extra={'question': text}, holder=[handle])
 

@@ -103,6 +103,10 @@ def _recover_or_remember_model(runner, skey, model):
 
 
 class GatewayTurnPrepareMixin:
+    def _route_session_id(self, source) -> str:
+        """The session a detached agent for *source* serves, whose labels and data use it inherits."""
+        return _resolution_session_id(self, source, None)
+
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None, fallback: bool = True,

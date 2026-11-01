@@ -377,17 +377,25 @@ class CLIAgentSetupMixin:
         order and switch the CLI's requested_provider/model to the first that resolves.
         None when the error is not auth-related or no fallback resolves."""
         from cli import _cprint, logger
+        from agent.route_hooks import resolution_record, resolution_refuses
         from hermes_cli.auth import AuthError, primary_failure_wording
         from hermes_cli.runtime_provider import resolve_runtime_provider
         if not isinstance(primary_exc, AuthError):
             return None
         _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
+        _primary_route = {"provider": str(getattr(self, "requested_provider", "") or "").strip().lower(),
+                          "model": str(getattr(self, "model", "") or "").strip()}
+        _route_labels = {}
         for _fb in _fb_chain:
             _fb_provider = (_fb.get("provider") or "").strip().lower()
             _fb_model = (_fb.get("model") or "").strip()
             if not _fb_provider or not _fb_model:
                 continue
             try:
+                # turn_route and route_custody (agent/route_hooks.py): a gate may refuse this entry before any turn exists.
+                if resolution_refuses(_fb, primary=_primary_route, chain=_fb_chain, labels_cache=_route_labels,
+                                      session_id=getattr(self, "session_id", "") or ""):
+                    continue
                 from hermes_cli.fallback_config import resolve_entry_api_key
                 # target_model: the fallback entry names the model that will be sent; without it the
                 # ladder keys off config `default` (see _ensure_runtime_credentials, #112600).
@@ -408,11 +416,22 @@ class CLIAgentSetupMixin:
                     platform="cli")
                 self.requested_provider = _fb_provider
                 self.model = _fb_model
+                # This shell's route from now on: later resolves succeed on it as if it were the primary.
+                self._route_entry_record = resolution_record(_fb, runtime, model=_fb_model)
                 # reasoning_config follows the swap in _ensure_runtime_credentials (the only caller).
                 return runtime
             except Exception:
                 continue
         return None
+
+    def _side_route(self) -> dict:
+        """Route custody context of this shell's route for a side call (agent/route_hooks.py)."""
+        return {"record": getattr(self, "_route_entry_record", None), "session_id": self.session_id, "platform": "cli"}
+
+    def _bind_side_route(self, agent) -> None:
+        """A local side agent on this shell's route: its turn start checks the fallback entry the walker chose."""
+        from agent.route_hooks import inherit_route_custody
+        inherit_route_custody(agent, getattr(self, "_route_entry_record", None), session_id=self.session_id)
 
     def _runtime_credentials_ready(self) -> bool:
         """Silently probe whether any inference provider can be resolved.
@@ -746,6 +765,8 @@ class CLIAgentSetupMixin:
             # ``cli._active_agent_ref`` None forever — so memory shutdown never ran on /exit (#49287).
             import cli as _cli
             _cli._active_agent_ref = self.agent
+            from agent.route_hooks import bind_resolution_entry
+            bind_resolution_entry(self.agent, getattr(self, "_route_entry_record", None))
             self.agent.control_update_callback = self._mark_automation_stale
             # Seed the agent's once-per-lifecycle auto_load cache with the bytes the preload
             # thread rendered, so the shared prompt path never re-reads config or skill files.

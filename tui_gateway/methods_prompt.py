@@ -1178,10 +1178,14 @@ def _(rid, params: dict) -> dict:
         return err
 
     def body():
+        from agent.route_hooks import inherit_route_custody, side_route_record
         from run_agent import AIAgent
-        kwargs = _background_agent_kwargs(session["agent"], task_id)
+        parent_agent = session["agent"]
+        kwargs = _background_agent_kwargs(parent_agent, task_id)
         with _side_agent_session_db(kwargs.get("session_db")) as session_db:
             agent = AIAgent(**{**kwargs, "session_db": session_db})
+            # It copied the parent's route: the turn check follows the route (agent/route_hooks.py).
+            inherit_route_custody(agent, side_route_record(parent_agent), parent=parent_agent)
             try:
                 result = agent.run_conversation(user_message=text, task_id=task_id)
             finally:
@@ -1234,6 +1238,7 @@ def _(rid, params: dict) -> dict:
     preview_cwd = _validated_preview_cwd(cwd)
 
     def body():
+        from agent.route_hooks import inherit_route_custody, side_route_record
         from run_agent import AIAgent
         from tools.terminal_tool import register_task_env_overrides
         if preview_cwd:
@@ -1246,10 +1251,13 @@ def _(rid, params: dict) -> dict:
             {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"})
         # Deliberately NOT closed via AIAgent.close(): it would kill the background
         # server this task exists to leave running.
-        result = AIAgent(
-            **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
+        parent_agent = session["agent"]
+        restart_agent = AIAgent(
+            **_ephemeral_preview_agent_kwargs(parent_agent, task_id),
             **_preview_restart_callbacks(parent, task_id),
-        ).run_conversation(
+        )
+        inherit_route_custody(restart_agent, side_route_record(parent_agent), parent=parent_agent)
+        result = restart_agent.run_conversation(
             user_message=prompt, task_id=task_id, conversation_history=parent_history or None)
         return _final_response_text(result)
 

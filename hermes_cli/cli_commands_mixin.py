@@ -1400,6 +1400,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     **{kw: getattr(self, attr) for kw, attr in _BG_PROVIDER_KWARGS.items()})
+                self._bind_side_route(bg_agent)
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None
 
@@ -1421,10 +1422,9 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                         response = _gt("model.error_prefix", error=result["error"])
                     return response
                 finally:
-                    # One agent per /bg task in a long-lived CLI process: close()
-                    # is the owner boundary (memory shutdown, tool subprocesses,
-                    # httpx clients); an unclosed side agent leaks all of them
-                    # until the CLI exits (#50197).
+                    # One agent per /bg task in a long-lived CLI process: close() is the owner boundary
+                    # (memory shutdown, tool subprocesses, httpx clients); an unclosed side agent leaks
+                    # all of them until the CLI exits (#50197).
                     with suppress(Exception):
                         bg_agent.close()
             finally:
@@ -1565,7 +1565,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         def produce():
             from agent.side_question import answer_side_question
             return answer_side_question(
-                question, history_snapshot, parent_agent=parent_agent, main_runtime=main_runtime)
+                question, history_snapshot, parent_agent=parent_agent, main_runtime=main_runtime, route=self._side_route())
 
         self._side_worker(produce, name="btw-side-question", fail_label="/btw",
                           header_lines=[f"  {_t('btw.header', preview=preview)}"],
