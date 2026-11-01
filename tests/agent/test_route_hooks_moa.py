@@ -1,4 +1,4 @@
-"""Route custody over MoA reference slots (agent/route_hooks.py F12, phase "moa"). A slot's provider
+"""Route custody over MoA reference slots (agent/route_hooks.py F13, phase "moa"). A slot's provider
 is explicit, so no fallback walk would ever ask the gate. Each test counts the calls that reach
 ``call_llm``: a refused slot must send nothing. The plugin side is a fake."""
 

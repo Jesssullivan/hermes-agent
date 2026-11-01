@@ -80,9 +80,9 @@ class TestCapabilities:
     def test_each_route_hook_is_advertised_and_registered(self):
         caps = route_hooks.HERMES_ROUTE_CAPABILITIES
         # F1 is not advertised: a provider: auto slot still walks the main model and its chain.
-        assert set(caps) == {"F2", "F3", "F6", "F12"}
+        assert set(caps) == {"F2", "F3", "F6", "F13"}, "F12, primary-route custody, is not in this build"
         assert (caps["F2"], caps["F3"], caps["F6"]) == ("turn_route", "route_custody", "on_routes_exhausted")
-        assert caps["F12"] == "route_custody"
+        assert caps["F13"] == "route_custody"
         for hook in route_hooks.ROUTE_HOOKS:
             assert hook in VALID_HOOKS
             assert hook in SHELL_UNSUPPORTED_HOOKS  # no shell channel for labels, allow or reply

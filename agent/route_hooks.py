@@ -71,7 +71,9 @@ HERMES_ROUTE_CAPABILITIES: Mapping[str, str] = MappingProxyType({
     "F2": TURN_ROUTE_HOOK,
     "F3": ROUTE_CUSTODY_HOOK,
     "F6": ROUTES_EXHAUSTED_HOOK,
-    "F12": ROUTE_CUSTODY_HOOK,  # the same hook, asked for each MoA reference slot (phase "moa")
+    # The same hook, asked for each MoA reference slot (phase "moa"). F12 names custody on the primary
+    # route, which this build does not have. Listing one of the two never implies the other.
+    "F13": ROUTE_CUSTODY_HOOK,
 })
 # Every ``phase`` a ``route_custody`` callback may receive from this build. A gate that pins a
 # revision checks that each phase it handles is listed here, and refuses a phase it does not know.
@@ -875,7 +877,7 @@ def auxiliary_refuses(entry: Mapping[str, Any], *, task: Optional[str], failed_p
 
 
 def moa_reference_refuses(agent: Any, slot: Mapping[str, Any]) -> bool:
-    """F12: ``True`` keeps a MoA reference *slot* off this turn, before its call. References read the
+    """F13: ``True`` keeps a MoA reference *slot* off this turn, before its call. References read the
     conversation's text view, and a slot's provider is explicit, so no fallback walk would ever ask
     the gate. Same contract as a fallback candidate: a loaded gate is asked for every slot, a
     ``route_custody: required`` slot needs an explicit allow, and a check that cannot run refuses."""
