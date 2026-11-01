@@ -61,7 +61,8 @@ block sets ``route_custody: required``.
   capacity ending (rate limit, overload, outage, timeout) or a custody refusal.
 
 ``HERMES_ROUTE_CAPABILITIES`` names what this build provides, keyed by the route-gate ids. F12 means
-the serving route is judged as above. F1 is not listed. The ``auxiliary.main_model_fallback`` and
+the serving route is judged as above. F13 means each MoA reference slot is judged before its call
+(:func:`moa_reference_refuses`). F1 is not listed. The ``auxiliary.main_model_fallback`` and
 ``compression.main_model_fallback`` keys cover explicit auxiliary slots only: a slot left on ``provider: auto`` still walks the main
 model and the main fallback chain. F7 is not listed: bare usage codes classify and carry their
 reset, but ``fallback.switch_on_plan_limit`` does not exist. F8 is the ``post_api_response``
@@ -96,6 +97,9 @@ HERMES_ROUTE_CAPABILITIES: Mapping[str, str] = MappingProxyType({
     "F12": ROUTE_CUSTODY_HOOK,
     "F8": "post_api_response",
     "F9": "route_cooldown_store",
+    # The same hook, asked for each MoA reference slot (phase "moa"). F12 judges the serving route.
+    # Listing one of the two never implies the other.
+    "F13": ROUTE_CUSTODY_HOOK,
 })
 # Every ``phase`` a ``route_custody`` callback may receive from this build. A gate that pins a
 # revision checks that each phase it handles is listed here, and refuses a phase it does not know.
@@ -1581,7 +1585,7 @@ def _availability_probe() -> bool:
 
 
 def moa_reference_refuses(agent: Any, slot: Mapping[str, Any]) -> bool:
-    """F12: ``True`` keeps a MoA reference *slot* off this turn, before its call. References read the
+    """F13: ``True`` keeps a MoA reference *slot* off this turn, before its call. References read the
     conversation's text view, and a slot's provider is explicit, so no fallback walk would ever ask
     the gate. Same contract as a fallback candidate: a loaded gate is asked for every slot, a
     ``route_custody: required`` slot needs an explicit allow, and a check that cannot run refuses."""

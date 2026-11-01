@@ -1211,7 +1211,7 @@ def register(ctx):
 - **A text slot with no model.** A text slot that names no model is judged with an empty model, and its client may then send the provider's default. A gate that decides by model sees no model there.
 - **Transport retries.** One API request can reach the wire more than once: an SDK retry or a stream reconnect inside `_interruptible_api_call` sends the same payload on the same route, and the check before that request covers them.
 - **The Codex app server.** A `codex_app_server` turn runs in its own process, so it is judged at turn start and not before each of that process's requests.
-- **A MoA reference slot.** `F12` judges the serving route. A reference call of a MoA turn is a separate route with its own check, outside this build.
+- **A MoA aggregator call.** `F13` judges each reference slot before its call (phase `moa`). The aggregator call gets no `moa` check.
 - **MoA advisors under a `moa` mark.** A mark on `moa` covers the `moa` route and its `moa://` endpoint only. An `auto` slot or a `vision` call that runs on the preset's aggregator provider, and the advisor calls, are not judged as the marked route.
 - **A launch policy's frozen config.** A session bound to a launch policy runs from that policy's frozen config, and the `model` mark is read from `config.yaml`. Its entries carry their own keys as usual.
 - **A session's entry across a restart.** A gateway `/model` on a resolution-time entry stays under it within the process. After a restart, a turn on that override has no record, so a loaded gate judges it as the main route.

@@ -656,7 +656,7 @@ def _run_references_parallel(
             if slot.get("provider") == "moa":
                 results[idx] = _placeholder_output(slot, "[skipped: MoA presets cannot recursively reference MoA]")
                 continue
-            if moa_reference_refuses(agent, slot):  # route_custody (F12): no request leaves for this slot
+            if moa_reference_refuses(agent, slot):  # route_custody (F13): no request leaves for this slot
                 results[idx] = _placeholder_output(slot, _ROUTE_CUSTODY_REFERENCE_NOTE)
                 continue
             futures[
