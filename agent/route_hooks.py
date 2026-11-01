@@ -24,7 +24,10 @@ required``.
   check reads the record and never infers it from the agent's own chain. A side agent, a
   cache-parity fork or a side question on such a route carries the record too
   (:func:`inherit_route_custody`, :func:`detached_auxiliary`), with the session's labels and data
-  use. Within a turn on such a route, a request or a post-tool compaction is checked again
+  use. A delegated child on such a route carries it too (:func:`inherit_child_route_custody`), and
+  whatever data use the child gathered reaches the parent (:func:`carry_child_data_use`). A model
+  change on the entry's provider stays under the entry, and the gate sees the model in use.
+  Within a turn on such a route, a request or a post-tool compaction is checked again
   (``phase="request"``, :func:`check_request_route`) when the data use or the labels grew past what
   the gate admitted: a refusal restores the primary or stops the turn. A compaction outside a
   turn on such a route is checked first (``phase="compaction"``) and binds its session for the
@@ -32,6 +35,9 @@ required``.
   before a turn (gateway, ``/background``, the CLI's text image mode) checks such a route with
   ``phase="auxiliary"`` and ``task="vision"`` before an image leaves, after ``turn_route`` has
   labelled the inbound message (:func:`detached_auxiliary`, :func:`agent_vision_scope`).
+  The last-resort hop to the main model asks the gate as well (:func:`main_route_refuses`), and a
+  refusal in an auxiliary call ends that call's walk before built-in discovery
+  (:func:`discovery_refused`), whose candidates the gate never sees.
   :data:`HERMES_ROUTE_CUSTODY_PHASES` lists every phase.
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
@@ -108,6 +114,8 @@ _warned_values: set[str] = set()
 _ROUTE_SCOPE: ContextVar[Optional[Callable[[], Any]]] = ContextVar("hermes_route_scope", default=None)
 # The messages of the auxiliary request in flight, for the data use its custody check reports.
 _AUX_REQUEST: ContextVar[Optional[list]] = ContextVar("hermes_route_aux_request", default=None)
+# The refusals of the auxiliary fallback walk in flight. Built-in discovery reads it and stands down.
+_AUX_WALK: ContextVar[Optional[list]] = ContextVar("hermes_route_aux_walk", default=None)
 # The messages a compaction summarizes. Out of a turn they are the only record of the session's data.
 _COMPACTION_SOURCE: ContextVar[Optional[list]] = ContextVar("hermes_route_compaction_source", default=None)
 # The entry record of the latest runtime resolution in this context. The gateway resolves in each
@@ -386,11 +394,37 @@ def _scope_agent() -> Any:
 def auxiliary_request(messages: Any) -> Iterator[None]:
     """Bind an auxiliary request's messages while its call runs, so a custody check in its
     fallback walk reports the data use stamped on them."""
-    token = _AUX_REQUEST.set(messages if isinstance(messages, list) else None)
+    token, walk_token = _AUX_REQUEST.set(messages if isinstance(messages, list) else None), _AUX_WALK.set([])
     try:
         yield
     finally:
+        _AUX_WALK.reset(walk_token)
         _AUX_REQUEST.reset(token)
+
+
+@contextmanager
+def auxiliary_walk() -> Iterator[None]:
+    """Open a fallback walk for a route resolved outside :func:`auxiliary_request`, such as a
+    ``get_text_auxiliary_client`` call. An open walk stays the one in use."""
+    if _AUX_WALK.get() is not None:
+        yield
+        return
+    token = _AUX_WALK.set([])
+    try:
+        yield
+    finally:
+        _AUX_WALK.reset(token)
+
+
+def discovery_refused(task: Optional[str]) -> bool:
+    """Whether a gate refused a candidate in this auxiliary walk. Discovery then stops: its candidates
+    have no fallback entry and no gate call, so it would send what the gate just kept off a route."""
+    refused = _AUX_WALK.get()
+    if not refused:
+        return False
+    logger.warning("Auxiliary %s: route custody refused %s; not trying built-in discovery", task or "call",
+                   ", ".join(refused))
+    return True
 
 
 def in_turn(agent: Any) -> bool:
@@ -682,7 +716,7 @@ def _snapshot_bound_route(agent: Any, record: dict[str, Any]) -> None:
 
 def settle_init_resolution_route(agent: Any) -> None:
     """Agent construction finished: the init-time record takes the route the agent will send on,
-    once. A later deliberate model switch leaves it alone and so reads as a move off the entry."""
+    once. A later switch to another provider leaves it alone and so reads as a move off the entry."""
     record = getattr(agent, "_route_resolution_entry", None)
     if isinstance(record, dict) and record.get("source") == "init" and not record.get("settled"):
         _snapshot_bound_route(agent, record)
@@ -717,6 +751,39 @@ def inherit_route_custody(child: Any, record: Any, *, parent: Any = None, sessio
         labels |= _held(parent, "_route_labels", source_id)
         data_use |= _held(parent, "_route_data_use", source_id)
     _grow_session(child, labels=labels, data_use=data_use)
+
+
+def inherit_child_route_custody(child: Any, record: Any, parent: Any) -> None:
+    """Custody for a delegated *child*. *record* is :func:`side_route_record` of *parent*, read when
+    the child's runtime was copied. The child binds it unless a delegation override put it on another
+    provider, and it always takes the parent's labels and data use. A child's turn start then checks
+    the route as any other agent's does, and a refusal fails that child alone."""
+    if isinstance(record, Mapping):
+        provider = _provider_forms(getattr(child, "provider", ""))
+        if provider and not provider & _record_provider_forms(record):
+            record = None
+    inherit_route_custody(child, record, parent=parent)
+
+
+def carry_child_data_use(parent: Any, child: Any, result: Any = None) -> None:
+    """A delegated *child* ended, on any path: its summary reaches *parent*, so what the child read
+    does too. The union goes to the parent's session, for every later gate call, and to the
+    ``delegate_task`` tool row through the dispatch sink, for the requests that carry that row. A
+    background child has no open sink, so only the session takes it."""
+    from agent.message_metadata import data_use_requirement
+    from tools.connectors.data_use import record_data_use
+    rows = (getattr(child, "_session_messages", None), result.get("messages") if isinstance(result, Mapping) else None)
+    data_use = _session_data_use(child).union(*(data_use_requirement(r) for r in rows if isinstance(r, list)))
+    if data_use:
+        _grow_session(parent, data_use=data_use)
+        record_data_use(data_use)
+
+
+def _record_provider_forms(record: Mapping[str, Any]) -> frozenset[str]:
+    """Every provider name a resolution-time *record* answers to."""
+    bound = record.get("bound_route") if isinstance(record.get("bound_route"), Mapping) else {}
+    return (_provider_forms(record.get("provider")) | _provider_forms(record.get("resolved_provider"))
+            | _provider_forms(bound.get("provider")))
 
 
 def _provider_forms(name: Any) -> frozenset[str]:
@@ -755,18 +822,20 @@ def _resolution_fallback_entry(agent: Any) -> Optional[Mapping[str, Any]]:
     """The recorded resolution-time entry when a custody decision applies to it and the agent
     still runs on it. The agent's route matches the entry as configured, as resolved, or as the
     agent was built on it (``bound_route``), with provider names in canonical form on every side.
-    ``None`` with no record, no gate, or after the agent moved off the entry (``/model``, a request
-    route), which is logged once at warning."""
+    A model change on that provider (``/model``, a request route) is still the entry's route, with
+    the model in use, so the gate judges what will carry the data. So is a blank provider, which
+    proves no move. ``None`` with no record, no gate, or after the agent moved to another provider,
+    which is logged once at warning."""
     record = getattr(agent, "_route_resolution_entry", None)
     if not isinstance(record, Mapping) or not _gated(record):
         return None
     current = _current_route(agent)
     bound = record.get("bound_route") if isinstance(record.get("bound_route"), Mapping) else {}
-    wanted = (_provider_forms(record.get("provider")) | _provider_forms(record.get("resolved_provider"))
-              | _provider_forms(bound.get("provider")))
-    models = (str(record.get("model") or ""), str(record.get("resolved_model") or ""), str(bound.get("model") or ""))
-    if wanted & _provider_forms(current["provider"]) and _same_model(models, current["model"], current["provider"]):
-        return record
+    if not current["provider"] or _record_provider_forms(record) & _provider_forms(current["provider"]):
+        models = (str(record.get("model") or ""), str(record.get("resolved_model") or ""), str(bound.get("model") or ""))
+        if not current["model"] or _same_model(models, current["model"], current["provider"]):
+            return record
+        return {**record, "model": current["model"], "resolved_model": current["model"]}
     if isinstance(record, dict) and not record.get("left_warned"):
         record["left_warned"] = True
         logger.warning("Route custody: the agent left the resolution-time entry %s/%s (now %s/%s); "
@@ -976,8 +1045,22 @@ def auxiliary_refuses(entry: Mapping[str, Any], *, task: Optional[str], failed_p
     if agent is not None:
         data_use |= _turn_data_use(agent, _turn_messages(agent))
         labels, known, context = _session_labels(agent), _labels_known(agent), _agent_context(agent)
-    return custody_refuses(entry, phase="auxiliary", current=_route(failed_provider, failed_model),
-                           data_use=data_use, labels=labels, labels_known=known, task=str(task or ""), **context)
+    refused = custody_refuses(entry, phase="auxiliary", current=_route(failed_provider, failed_model),
+                              data_use=data_use, labels=labels, labels_known=known, task=str(task or ""), **context)
+    walk = _AUX_WALK.get()
+    if refused and walk is not None:
+        walk.append(f"{entry.get('provider')}/{entry.get('model')}")
+    return refused
+
+
+def main_route_refuses(provider: Any, model: Any, *, task: Optional[str], failed_provider: str,
+                       failed_model: Optional[str] = None) -> bool:
+    """F3 for an auxiliary call's last-resort hop to the main model. The main route has no chain entry
+    of its own, so the candidate takes the custody key of the gated entry the scope agent runs on."""
+    agent = _scope_agent()
+    active = _active_entry(agent) if agent is not None else None
+    return auxiliary_refuses({**(active or {}), "provider": provider, "model": model}, task=task,
+                             failed_provider=failed_provider, failed_model=failed_model)
 
 
 def routes_exhausted(agent: Any, result: dict[str, Any], *, classified: Any, provider: Any,
