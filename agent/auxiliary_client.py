@@ -122,7 +122,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
-from agent.route_hooks import auxiliary_refuses, auxiliary_request
+from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, discovery_refused, main_route_refuses
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4243,7 +4243,7 @@ def _try_payment_fallback(
     # The SESSION's provider decides whether discovery is allowed: a live `/model xai-oauth` session
     # over a persisted ``provider: auto`` is a selection, so the disk value alone is not the answer.
     main_provider = _normalize_main_runtime(main_runtime).get("provider") or _read_main_provider()
-    if not _discovery_chain_allowed(main_provider, task):
+    if discovery_refused(task) or not _discovery_chain_allowed(main_provider, task):  # route_custody (F3) first
         return None, None, ""
     skip_labels = {skip}
     if main_provider and main_provider.lower() in skip:
@@ -4324,7 +4324,8 @@ def _try_main_agent_model_fallback(
     if _is_provider_unhealthy(main_provider, main_base_url):
         _log_skip_unhealthy(main_provider, task, base_url=main_base_url)
         return None, None, ""
-    if main_model_fallback_refused(task, reason, failed_provider):  # after the no-op checks
+    if main_model_fallback_refused(task, reason, failed_provider) or main_route_refuses(  # after the no-op checks
+            main_provider, main_model, task=task, failed_provider=failed_provider, failed_model=failed_model):
         return None, None, ""
     try:
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
@@ -4679,17 +4680,18 @@ def _resolve_auto_route(
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
-    if task:
-        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+    with auxiliary_walk():
+        if task:
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, main_provider or "auto", reason="main provider unavailable")
+            if fb_client is not None:
+                return fb_client, fb_model, _fallback_provider_from_label(fb_label)
+        fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
-            return fb_client, fb_model, _fallback_provider_from_label(fb_label)
-    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-        task, main_provider or "auto", reason="main provider unavailable")
-    if fb_client is not None:
-        return fb_client, fb_model, fb_label
-    if not _discovery_chain_allowed(main_provider, task):
-        return None, None, ""
+            return fb_client, fb_model, fb_label
+        if discovery_refused(task) or not _discovery_chain_allowed(main_provider, task):
+            return None, None, ""
     return _try_discovery_chain()
 
 
