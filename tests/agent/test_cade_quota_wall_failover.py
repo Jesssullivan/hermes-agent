@@ -10,11 +10,14 @@ main turns with one Kimi Code fallback (xoxd-ai/cade ``scripts/hermes-profiles.p
 Two more chains run the three routes SPR-301 names. The ruled one is Kimi, then Opus 5.5, then Sol
 through the SIWC relay (J160(a), TIN-7765 ``bdb14417``). The other starts on Sol, the cade home's
 live route today, then Opus, then Kimi, because that is where a wall lands until the render moves.
-Cade renders neither yet: ``interim_model_blocks`` sets ``fallback_providers: []``. These chains
-show what Hermes does with them and say nothing about custody. J160(b) keeps the on-prem tail, for
-C1 and C2 turns first, and TestRuledOrder pins the turn falling through it while no local model
-answers. A cade-home Kimi entry also needs the F1, F2, F3 and F6 gate in
-``docs/ROUTE_FAILOVER.md``. These tests load no route hook unless they say so.
+Main cade renders neither yet: ``interim_model_blocks`` sets ``fallback_providers: []``. The ruled
+chain here is what draft xoxd-ai/cade#256 ``chain_model_blocks`` renders, so Sol carries
+``route_custody: required`` and no base_url, and the warm on-prem tail is a ``custom:<name>`` entry
+with no base_url. J160(b) keeps that tail, for C1 and C2 turns first, and TestRuledOrder pins the
+turn falling through it while no local model answers. A required entry needs a plugin that answers
+for it, so the ruled tests use the ``custody_gate`` fixture, a real plugin manager with a synthetic
+gate, and TestRuledOrderWithNoGate pins the turn with none. Cade's own gate plugin does not exist
+yet. These tests load no route hook unless they say so.
 
 The error bodies and headers are synthetic. The live shapes of a Claude Max plan-window 429, a Kimi
 Code 429 and a ChatGPT plan wall are not measured (xoxd-ai/cade ``docs/ROUTE_FAILOVER.md`` section
@@ -65,15 +68,22 @@ PUBLIC_FALLBACK = [{"provider": KIMI[0], "model": KIMI[1]}]
 THREE_ROUTE_CHAIN = [{"provider": OPUS[0], "model": OPUS[1]}, {"provider": KIMI[0], "model": KIMI[1]}]
 # The relay is a loopback listener. No test connects, so a reserved name stands in for its address.
 SIWC_BASE_URL = "http://siwc-relay.invalid/v1"
-# J160(a): Kimi, then Opus, then Sol. The primary is Kimi, so these are the entries behind it.
+# J160(a): Kimi, then Opus, then Sol. The primary is Kimi, so these are the entries behind it. This
+# is the shape of xoxd-ai/cade#256 ``chain_model_blocks``: the endpoint and wire of Sol and of the
+# tail come from the ``providers:`` block in RENDERED_PROVIDERS, not from the entry.
 RULED_CHAIN = [
     {"provider": OPUS[0], "model": OPUS[1]},
-    {"provider": SOL[0], "model": SOL[1], "base_url": SIWC_BASE_URL, "api_mode": "codex_responses"},
+    {"provider": SOL[0], "model": SOL[1], "route_custody": "required"},
 ]
-ONPREM = ("cade-onprem", "local-model")
+ONPREM_NAME = "cade-onprem"
+ONPREM = ("custom:" + ONPREM_NAME, "local-model")
 ONPREM_BASE_URL = "http://onprem.invalid/v1"
-# J160(b): the on-prem tail stays. Its chain entry is a stand-in, because cade names no route yet.
-RULED_CHAIN_WITH_TAIL = [*RULED_CHAIN, {"provider": ONPREM[0], "model": ONPREM[1], "base_url": ONPREM_BASE_URL}]
+# J160(b): the on-prem tail stays. #256 renders it only while a local model is warm.
+RULED_CHAIN_WITH_TAIL = [*RULED_CHAIN, {"provider": ONPREM[0], "model": ONPREM[1]}]
+RENDERED_PROVIDERS = {
+    SOL[0]: {"base_url": SIWC_BASE_URL, "api_mode": "codex_responses", "key_env": "SYNTHETIC_RELAY_KEY"},
+    ONPREM_NAME: {"api": ONPREM_BASE_URL, "transport": "chat_completions", "key_env": "SYNTHETIC_ONPREM_KEY"},
+}
 # A plan window that reopens in four hours, as on 2026-10-29 when a Kimi plan hit its 5 h window.
 FOUR_HOURS = 4 * 3600
 
@@ -101,6 +111,14 @@ def _synthetic_model_ids():
     shared store and a read of it. ``drive`` patches the same name for its turn."""
     with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _rendered_providers():
+    """The ``providers:`` block #256 renders beside the chain, in the per-test Hermes home."""
+    from hermes_constants import get_hermes_home
+
+    (Path(get_hermes_home()) / "config.yaml").write_text(json.dumps({"providers": RENDERED_PROVIDERS}))
 
 
 class HarnessBound(BaseException):
@@ -261,15 +279,48 @@ def _kimi_home_agent(fallback=RULED_CHAIN):
     return _agent(KIMI, fallback, api_key="kimi-synthetic", base_url="https://api.kimi.com/coding/")
 
 
+ROUTE_BASE_URLS = {OPUS[0]: "https://api.anthropic.com", SOL[0]: SIWC_BASE_URL, ONPREM[0]: ONPREM_BASE_URL}
+
+
 def _route_client(provider, *args, **kwargs):
     """A fake of ``resolve_provider_client``: the configured fallback client, and no socket."""
     client = MagicMock()
     client.api_key = "synthetic"
-    client.base_url = kwargs.get("explicit_base_url") or (
-        "https://api.anthropic.com" if provider == OPUS[0] else "https://api.kimi.com/coding/")
+    client.base_url = kwargs.get("explicit_base_url") or ROUTE_BASE_URLS.get(provider, "https://api.kimi.com/coding/")
     client._custom_headers = None
     client.default_headers = None
     return client, kwargs.get("model")
+
+
+class Gate:
+    """A real plugin manager holding a synthetic gate: ``turn_route`` labels the turn, and
+    ``route_custody`` answers through ``decide(candidate)`` and records each call in ``seen``."""
+
+    LABELS = ["synthetic-label"]
+
+    def __init__(self):
+        from hermes_cli.plugins import PluginManager
+
+        self.seen = []
+        self.decide = lambda candidate: {"action": "allow"}
+        self.manager = PluginManager()
+        self.manager._discovered = True
+        self.manager._hooks["turn_route"] = [lambda **kw: {"labels": self.LABELS}]
+        self.manager._hooks["route_custody"] = [self._custody]
+
+    def _custody(self, **kw):
+        self.seen.append(kw)
+        return self.decide(kw["candidate"])
+
+    def judged(self, route):
+        return [kw for kw in self.seen if (kw["candidate"]["provider"], kw["candidate"]["model"]) == route]
+
+
+@pytest.fixture
+def custody_gate():
+    gate = Gate()
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=gate.manager):
+        yield gate
 
 
 class Run(SimpleNamespace):
@@ -662,6 +713,7 @@ class TestGatewayEviction:
         assert set(drive(first, script).calls) == {KIMI}
 
 
+@pytest.mark.usefixtures("custody_gate")
 class TestTurnStartHold:
     """``hold_walled_primary``: what a turn does when its primary starts in a shared cooldown."""
 
@@ -697,24 +749,44 @@ class TestTurnStartHold:
         assert run.calls == [KIMI]
         assert run.result["completed"] is True
 
-    def test_custody_refuses_a_candidate_at_the_hold(self):
+    def test_custody_refuses_a_candidate_at_the_hold(self, custody_gate):
         # The walk is the mid-turn walk, so the custody skip runs. Nothing is added to the session's
         # unavailable set: a refusal holds for this turn.
         self._arm(KIMI)
         agent = _kimi_home_agent()
-        with patch("agent.route_hooks.fallback_custody_refuses", side_effect=lambda a, fb, p, m: p == OPUS[0]):
-            run = drive(agent, lambda route, attempt: "answered on " + route[0])
+        custody_gate.decide = lambda candidate: {"action": "block" if candidate["provider"] == OPUS[0] else "allow"}
+        run = drive(agent, lambda route, attempt: "answered on " + route[0])
         assert run.calls == [SOL]
         assert not agent._unavailable_fallback_keys
 
-    def test_custody_refusing_every_candidate_leaves_the_primary_with_a_whole_chain(self):
+    def test_a_real_gate_sees_this_turns_labels_and_the_required_flag_at_the_hold(self, custody_gate):
+        self._arm(KIMI)
+        self._arm(OPUS)
+        run = drive(_kimi_home_agent(), lambda route, attempt: "answered on " + route[0])
+        assert run.calls == [SOL]
+        [sol] = custody_gate.judged(SOL)
+        assert (sol["phase"], sol["required"], sol["labels"]) == ("failover", True, Gate.LABELS)
+
+    def test_custody_refusing_every_candidate_leaves_the_primary_with_a_whole_chain(self, custody_gate):
         self._arm(KIMI)
         agent = _kimi_home_agent()
-        with patch("agent.route_hooks.fallback_custody_refuses", return_value=True):
-            run = drive(agent, lambda route, attempt: "answered on " + route[0])
+        custody_gate.decide = lambda candidate: {"action": "block"}
+        run = drive(agent, lambda route, attempt: "answered on " + route[0])
         assert run.calls == [KIMI]
         assert agent._fallback_index == 0
         assert agent._fallback_activated is False
+
+    def test_a_raising_gate_refuses_every_candidate_and_the_primary_still_runs_unjudged(self, custody_gate):
+        # F12 in cade#256: nothing judges the primary, so a client raw turn can reach Kimi against
+        # SPR-102. This pins that gap as it stands. It is not the fix.
+        def boom(candidate):
+            raise RuntimeError("synthetic")
+
+        self._arm(KIMI)
+        custody_gate.decide = boom
+        run = drive(_kimi_home_agent(), lambda route, attempt: "answered on " + route[0])
+        assert run.calls == [KIMI]
+        assert custody_gate.judged(KIMI) == []
 
     def test_labels_are_known_before_the_hold(self):
         # A hold ahead of ``turn_route`` would judge the turn without its labels.
@@ -962,19 +1034,34 @@ class TestThreeRoutes:
         assert _waits_on(run, SOL) == [] and _waits_on(run, OPUS) == []
 
 
+def _ruled_script(*closed):
+    walls = {
+        KIMI: kimi_rate_limit(retry_after=FOUR_HOURS), OPUS: opus_rate_limit({"retry-after": str(FOUR_HOURS)}),
+        SOL: forwarded_sol_wall(FOUR_HOURS), ONPREM: kimi_rate_limit(retry_after=FOUR_HOURS),
+    }
+
+    def script(route, attempt):
+        return walls[route] if route in closed else "answered on " + route[0]
+    return script
+
+
+class TestRuledOrderWithNoGate:
+    """The rendered Sol entry needs ``route_custody: required`` answered. With no plugin it carries
+    nothing, which is what a home on #256 does until cade ships its gate plugin."""
+
+    def test_a_required_sol_entry_is_never_called(self):
+        agent = _kimi_home_agent()
+        run = drive(agent, _ruled_script(KIMI, OPUS))
+        assert run.calls == [KIMI] + [OPUS] * agent._api_max_retries
+        assert run.result["completed"] is False
+        assert _reply(run.result).strip(), run.result
+
+
+@pytest.mark.usefixtures("custody_gate")
 class TestRuledOrder:
     """J160(a): Kimi, then Opus, then Sol, with the on-prem tail J160(b) keeps for C1 and C2 turns."""
 
-    @staticmethod
-    def _script(*closed):
-        walls = {
-            KIMI: kimi_rate_limit(retry_after=FOUR_HOURS), OPUS: opus_rate_limit({"retry-after": str(FOUR_HOURS)}),
-            SOL: forwarded_sol_wall(FOUR_HOURS),
-        }
-
-        def script(route, attempt):
-            return walls[route] if route in closed else "answered on " + route[0]
-        return script
+    _script = staticmethod(_ruled_script)
 
     def test_the_turn_starts_on_kimi(self):
         run = drive(_kimi_home_agent(), self._script())
@@ -988,13 +1075,33 @@ class TestRuledOrder:
         assert _reply(run.result) == "answered on anthropic"
         assert agent.api_mode == "anthropic_messages"
 
-    def test_two_walls_reach_sol_on_the_relays_api_mode(self):
+    def test_two_walls_reach_sol_on_the_relays_api_mode(self, custody_gate):
         agent = _kimi_home_agent()
         run = drive(agent, self._script(KIMI, OPUS))
         assert run.calls == [KIMI, OPUS, SOL]
         assert run.waits == []
         assert _reply(run.result) == "answered on cade-siwc"
+        # The entry names neither: both come from the rendered ``providers:`` block.
         assert (agent.provider, agent.base_url, agent.api_mode) == (SOL[0], SIWC_BASE_URL, "codex_responses")
+        assert [kw["required"] for kw in custody_gate.judged(SOL)] == [True]
+        assert [kw["required"] for kw in custody_gate.judged(OPUS)] == [False]
+
+    def test_a_gate_refusal_keeps_sol_out_of_the_turn(self, custody_gate):
+        custody_gate.decide = lambda candidate: {"action": "block" if candidate["provider"] == SOL[0] else "allow"}
+        agent = _kimi_home_agent()
+        run = drive(agent, self._script(KIMI, OPUS))
+        assert run.calls == [KIMI] + [OPUS] * agent._api_max_retries
+        assert run.result["completed"] is False
+
+    def test_one_soft_wall_on_the_last_route_arms_one_window(self):
+        # Both ``retry_invalid_response`` sites re-arm, so per arm this left count 4 and 480 seconds.
+        agent = _kimi_home_agent()
+        failed = responses_failed("usage_limit_reached")
+        script = self._script(KIMI, OPUS)
+        run = drive(agent, lambda route, attempt: failed if route == SOL else script(route, attempt))
+        assert run.calls == [KIMI, OPUS] + [SOL] * agent._api_max_retries
+        assert _ledger(SOL).count == 1
+        assert 0 < _shared_seconds(SOL) <= 60
 
     def test_a_masked_sol_wall_as_the_last_route_ends_with_text(self):
         # Sol is the last route here, so the relay's 502 takes the auto-recovery ladder.
@@ -1020,26 +1127,41 @@ class TestRuledOrder:
         assert drive(_kimi_home_agent(), script).calls == [SOL]
         assert drive(_kimi_home_agent(), script).calls == [SOL]
 
-    def test_a_cold_on_prem_tail_falls_through_to_the_status_reply(self):
-        # J160(b): until a local model is warm the turn reaches the SPR-151 reply. The reply text is
-        # Cade's, through F6. The refused connection stands in for a cold local route.
-        from hermes_cli.plugins import PluginManager
+    def test_a_walled_tail_is_skipped_on_the_next_turn(self):
+        # The agent records the tail with its resolved URL and the rendered entry has none, so both
+        # must land on one file. A closed window then costs the tail no call on the next turn.
+        script = self._script(KIMI, OPUS, SOL, ONPREM)
+        first = _kimi_home_agent(fallback=RULED_CHAIN_WITH_TAIL)
+        assert ONPREM in drive(first, script).calls
+        assert FOUR_HOURS - 60 < _shared_seconds(ONPREM) <= FOUR_HOURS
+        assert first.base_url == ONPREM_BASE_URL
+        run = drive(_kimi_home_agent(fallback=RULED_CHAIN_WITH_TAIL), script)
+        assert ONPREM not in run.calls
 
+    def test_a_tail_that_is_not_rendered_ends_on_sol_and_the_status_reply(self, custody_gate):
+        # #256 does not render a cold tail, so the chain ends on Sol and F6 answers.
+        custody_gate.manager._hooks["on_routes_exhausted"] = [lambda **kw: {"reply": "Every model route is resting."}]
+        agent = _kimi_home_agent()
+        run = drive(agent, self._script(KIMI, OPUS, SOL))
+        assert run.calls == [KIMI, OPUS] + [SOL] * agent._api_max_retries
+        assert run.result["completed"] is False
+        assert _reply(run.result) == "Every model route is resting."
+
+    def test_a_rendered_tail_that_refuses_falls_through_to_the_status_reply(self, custody_gate):
+        # J160(b): until a local model answers the turn reaches the SPR-151 reply. The reply text is
+        # Cade's, through F6. A refused connection is a tail rendered warm that has gone cold.
         def cold(route, attempt):
             if route == ONPREM:
                 return openai.APIConnectionError(request=httpx.Request("POST", f"{ONPREM_BASE_URL}/chat"))
             return script(route, attempt)
 
         script = self._script(KIMI, OPUS, SOL)
-        manager = PluginManager()
-        manager._discovered = True
         exhausted = []
-        manager._hooks["on_routes_exhausted"] = [
+        custody_gate.manager._hooks["on_routes_exhausted"] = [
             lambda **kw: exhausted.append(kw) or {"reply": "Every model route is resting."}]
         agent = _kimi_home_agent(fallback=RULED_CHAIN_WITH_TAIL)
         retries, cycles = agent._api_max_retries, agent._auto_recovery_cycles
-        with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
-            run = drive(agent, cold, max_api_calls=3 + retries * (2 + cycles) + 1)
+        run = drive(agent, cold, max_api_calls=3 + retries * (2 + cycles) + 1)
         assert run.calls[:4] == [KIMI, OPUS, SOL, ONPREM]
         assert set(run.calls[3:]) == {ONPREM}
         assert run.result["completed"] is False

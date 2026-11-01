@@ -15,7 +15,7 @@ from agent.agent_runtime_helpers import extract_api_error_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.fallback_cooldown import _arm_rate_limit_cooldown
 from agent.route_cooldown import (
-    MAX_COOLDOWN_SECONDS, _path, clear_route_cooldown, read_route_cooldown, record_route_cooldown,
+    MAX_COOLDOWN_COUNT, MAX_COOLDOWN_SECONDS, _path, clear_route_cooldown, read_route_cooldown, record_route_cooldown,
     route_cooldown_remaining,
 )
 from agent.turn_recovery import _CodexSoftFailure, _codex_soft_failure_error
@@ -26,6 +26,12 @@ ROUTE = ("kimi-coding", "k3.1-pro")
 def _arm(*route, seconds=3600.0, count=1):
     route = route or ROUTE
     record_route_cooldown(*route[:2], route[2] if len(route) > 2 else "", seconds=seconds, count=count, reason="rate_limit")
+
+
+def _expire(*route):
+    """Move the route's deadline into the past, keeping its count, instead of waiting for it."""
+    path = Path(_path(*route, ""))
+    path.write_text(json.dumps({**json.loads(path.read_text()), "until": time.time() - 1}))
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +66,11 @@ class TestStore:
         _arm("openrouter", "a/one")
         assert route_cooldown_remaining("openrouter", "a/two") == 0.0
 
+    def test_a_custom_name_is_one_route_with_or_without_its_url(self):
+        # The agent records its resolved URL. A rendered ``custom:<name>`` chain entry has none.
+        _arm("custom:cade-onprem", "local-model", "http://onprem.invalid/v1")
+        assert route_cooldown_remaining("custom:cade-onprem", "local-model", None) > 0
+
     def test_two_custom_endpoints_are_separate_and_a_named_provider_ignores_the_url(self):
         _arm("custom", "m", "https://one.example/v1/")
         assert route_cooldown_remaining("custom", "m", "https://one.example/v1") > 0
@@ -82,8 +93,11 @@ class TestStore:
 
     @pytest.mark.parametrize(
         "content",
-        ["", "not json", "[]", '{"until": "soon"}', '{"until": 1e400, "count": 1, "reason": "r", "armed_at": 1}'],
-        ids=["empty", "text", "list", "bad-value", "infinite"],
+        [
+            "", "not json", "[]", '{"until": "soon"}', '{"until": 1e400, "count": 1, "reason": "r", "armed_at": 1}',
+            '{"until": 1, "count": 1e400, "reason": "r", "armed_at": 1}',
+        ],
+        ids=["empty", "text", "list", "bad-value", "infinite", "infinite-count"],
     )
     def test_a_corrupt_file_is_no_cooldown(self, content):
         path = Path(_path(*ROUTE, ""))
@@ -91,6 +105,32 @@ class TestStore:
         path.write_text(content)
         assert read_route_cooldown(*ROUTE) is None
         assert route_cooldown_remaining(*ROUTE) == 0.0
+
+    def test_an_overflowing_count_can_be_written_over_and_cleared(self):
+        path = Path(_path(*ROUTE, ""))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        bad = '{"until": 1, "count": 1e400, "reason": "r", "armed_at": 1}'
+        path.write_text(bad)
+        _arm(count=2)
+        assert read_route_cooldown(*ROUTE).count == 2
+        path.write_text(bad)
+        clear_route_cooldown(*ROUTE)
+        assert not path.exists()
+
+    def test_a_huge_count_is_clamped(self):
+        _arm(count=10 ** 9)
+        assert read_route_cooldown(*ROUTE).count == MAX_COOLDOWN_COUNT
+
+    def test_removing_the_file_that_names_the_route_lifts_the_hold(self):
+        # The operator's remedy for a wrong hold: the file name is a hash, so the content finds it.
+        _arm()
+        _arm("anthropic", "claude-opus-5-5")
+        store = Path(_path(*ROUTE, "")).parent
+        named = [p for p in store.glob("route-*.json") if json.loads(p.read_text())["provider"] == ROUTE[0]]
+        assert len(named) == 1
+        named[0].unlink()
+        assert route_cooldown_remaining(*ROUTE) == 0.0
+        assert route_cooldown_remaining("anthropic", "claude-opus-5-5") > 0
 
     def test_a_deadline_past_the_cap_is_a_bad_file_and_not_a_hold(self):
         path = Path(_path(*ROUTE, ""))
@@ -132,10 +172,56 @@ def _agent(**fields):
 
 
 class TestArming:
-    def test_a_fresh_agent_continues_the_doubling(self):
-        assert _arm_rate_limit_cooldown(_agent(), FailoverReason.rate_limit) == 60
+    OPUS = ("anthropic", "claude-opus-5-5")
+
+    def test_a_fresh_agent_continues_the_doubling_once_the_window_has_passed(self):
+        for seconds in (60, 120, 240):
+            assert _arm_rate_limit_cooldown(_agent(), FailoverReason.rate_limit) == seconds
+            _expire(*self.OPUS)
+
+    def test_a_burst_inside_one_window_counts_once(self):
+        # Nine in-flight walls of one throttle. Per arm this reached count 9 and 14400 seconds.
+        armed = [_arm_rate_limit_cooldown(_agent(), FailoverReason.rate_limit) for _ in range(9)]
+        assert armed[0] == 60 and max(armed) == 60
+        held = read_route_cooldown(*self.OPUS)
+        assert held.count == 1
+        assert 0 < held.remaining() <= 60
+
+    def test_the_next_window_after_a_burst_is_the_next_level(self):
+        for _ in range(9):
+            _arm_rate_limit_cooldown(_agent(), FailoverReason.rate_limit)
+        _expire(*self.OPUS)
         assert _arm_rate_limit_cooldown(_agent(), FailoverReason.rate_limit) == 120
-        assert _arm_rate_limit_cooldown(_agent(), FailoverReason.rate_limit) == 240
+        assert read_route_cooldown(*self.OPUS).count == 2
+
+    def test_a_reused_agent_keeps_its_count_inside_the_window(self):
+        agent = _agent()
+        _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit)
+        _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit)
+        assert agent._rate_limit_backoff_count == 1
+
+    def test_a_wall_inside_a_window_keeps_the_later_deadline(self):
+        record_route_cooldown(*self.OPUS, "", seconds=3600, count=2, reason="rate_limit")
+        agent = _agent()
+        assert 3590 < _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) <= 3600
+        held = read_route_cooldown(*self.OPUS)
+        assert held.count == 2
+        assert 3590 < held.remaining() <= 3600
+        assert 3590 < agent._rate_limited_until - time.monotonic() <= 3600
+
+    def test_a_named_reset_inside_a_window_extends_it_and_keeps_the_count(self):
+        record_route_cooldown(*self.OPUS, "", seconds=60, count=1, reason="rate_limit")
+        armed = _arm_rate_limit_cooldown(_agent(), FailoverReason.rate_limit, reset_at=time.time() + 900)
+        assert 890 < armed <= 900
+        held = read_route_cooldown(*self.OPUS)
+        assert held.count == 1
+        assert 890 < held.remaining() <= 900
+
+    def test_a_hop_wall_inside_a_window_keeps_the_count(self):
+        agent = _agent(provider="kimi-coding", model="k3.1-pro", _fallback_activated=True)
+        for _ in range(4):
+            assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) is None
+        assert read_route_cooldown("kimi-coding", "k3.1-pro").count == 1
 
     def test_a_fallback_hop_records_the_route_and_leaves_the_primary_deadline(self):
         agent = _agent(provider="kimi-coding", model="k3.1-pro", _fallback_activated=True, _rate_limited_until=7.0,
@@ -222,8 +308,18 @@ class TestUnifiedReset:
         headers = {UNIFIED + "status": "rejected", UNIFIED + "reset": str(int(time.time()) - 60)}
         assert "reset_at" not in extract_api_error_context(_Wall(headers))
 
-    def test_retry_after_still_comes_first(self):
-        headers = {"retry-after": "90", UNIFIED + "status": "rejected", UNIFIED + "reset": str(int(time.time()) + 3600)}
+    def test_a_refused_windows_reset_beats_a_short_retry_after(self):
+        # Shape U. A closed plan window with a short Retry-After would otherwise wall per minute.
+        reset = int(time.time()) + 3600
+        headers = {"retry-after": "90", UNIFIED + "status": "rejected", UNIFIED + "reset": str(reset)}
+        assert extract_api_error_context(_Wall(headers))["reset_at"] == reset
+
+    def test_retry_after_stands_when_no_window_refused(self):
+        headers = {"retry-after": "90", UNIFIED + "status": "allowed", UNIFIED + "reset": str(int(time.time()) + 3600)}
+        assert 80 < extract_api_error_context(_Wall(headers))["reset_at"] - time.time() <= 90
+
+    def test_retry_after_stands_when_the_refused_reset_has_passed(self):
+        headers = {"retry-after": "90", UNIFIED + "status": "rejected", UNIFIED + "reset": str(int(time.time()) - 60)}
         assert 80 < extract_api_error_context(_Wall(headers))["reset_at"] - time.time() <= 90
 
     def test_a_usage_limit_refusal_with_a_unified_reset_is_a_rate_limit_and_not_billing(self):

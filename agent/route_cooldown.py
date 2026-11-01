@@ -30,12 +30,14 @@ logger = logging.getLogger(__name__)
 
 # Longer than the weekly plan window. A deadline past this is a bad clock or a bad file, not a reset.
 MAX_COOLDOWN_SECONDS = 8 * 86400
+# The doubling reaches its 4 h cap at 9. Past this a count is a bad file, and it feeds a ``2 ** count``.
+MAX_COOLDOWN_COUNT = 16
 
 
 @dataclass(frozen=True)
 class RouteCooldown:
     until: float  # wall-clock epoch
-    count: int  # walls since this route last served a response
+    count: int  # cooldown windows since this route last served a response
     reason: str
     armed_at: float
 
@@ -47,12 +49,13 @@ def _route_key(provider: Any, model: Any, base_url: Any) -> str:
     provider = str(provider or "").strip().lower()
     model = str(model or "").strip()
     # A chain entry names its model as configured and the binder normalizes it, so both forms must
-    # land on one file. A custom provider's name does not identify its endpoint, so its URL does.
+    # land on one file. A bare ``custom`` does not identify its endpoint, so its URL does. A
+    # ``custom:<name>`` entry does, and it renders with no base_url, so a URL here would split the
+    # agent's record from the chain entry's read of it.
     with contextlib.suppress(Exception):
         from hermes_cli.model_normalize import normalize_model_for_provider
         model = normalize_model_for_provider(model, provider) or model
-    custom = provider == "custom" or provider.startswith("custom:")
-    endpoint = str(base_url or "").strip().rstrip("/").lower() if custom else ""
+    endpoint = str(base_url or "").strip().rstrip("/").lower() if provider == "custom" else ""
     return hashlib.sha256("\0".join((provider, model, endpoint)).encode("utf-8")).hexdigest()[:24]
 
 
@@ -66,10 +69,10 @@ def _load(path: str) -> Optional[RouteCooldown]:
         with open(path, encoding="utf-8-sig") as handle:
             raw = json.load(handle)
         cooldown = RouteCooldown(
-            until=float(raw["until"]), count=max(0, int(raw["count"])), reason=str(raw["reason"]),
-            armed_at=float(raw["armed_at"]),
+            until=float(raw["until"]), count=min(max(0, int(raw["count"])), MAX_COOLDOWN_COUNT),
+            reason=str(raw["reason"]), armed_at=float(raw["armed_at"]),
         )
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
         return None
     if not (math.isfinite(cooldown.until) and math.isfinite(cooldown.armed_at)):
         return None

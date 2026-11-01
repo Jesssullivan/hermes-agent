@@ -52,6 +52,8 @@ fallback:
 
 The cooldown is stored per route under `~/.hermes/rate_limits/`, so it holds across sessions, gateway restarts, `/v1/runs` and cron jobs of the same profile. A turn that starts on a route in cooldown moves down the chain before its first call, and a chain entry in cooldown is skipped. When no other route will take the turn, the primary keeps it. A response served by the route clears its cooldown. Two profiles keep separate cooldowns, even on one subscription.
 
+Walls inside an armed window count once, so a burst of in-flight calls does not double the cooldown. The key is the provider and model, with the URL added only for a bare `custom` provider. It ignores the credential, so a rotated key stays held until the deadline, because a held route gets no call that could clear it. To lift a hold by hand, delete the route's `route-*.json` file. Each file names its `provider` and `model`.
+
 Gemini fallback entries accept `gemini`, `google`, `google-gemini`, and
 `google-ai-studio`. On Google's native API endpoint, all use the native Gemini
 client, including its `generationConfig.thinkingConfig` translation. A custom
