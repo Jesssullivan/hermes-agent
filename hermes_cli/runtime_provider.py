@@ -35,7 +35,7 @@ from hermes_cli import config as _config_mod
 from hermes_cli import models as _models  # attribute access keeps ``hermes_cli.models.<name>`` patches effective
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.providers import determine_api_mode, get_provider, is_actual_route, is_official_openai_host, nous_api_mode
-from utils import base_url_host_matches, base_url_hostname, base_url_path, env_int
+from utils import KIMI_CODE_HOSTS, base_url_host_matches, base_url_hostname, base_url_path, env_int
 
 
 # A frozen session route's config (``frozen_runtime_config``); None = the live profile config.
@@ -157,7 +157,7 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     if mandated:
         return mandated
     path = base_url_path(normalized)
-    if path.endswith(("/anthropic", "/anthropic/v1")) or (hostname == "api.kimi.com" and "/coding" in normalized):
+    if path.endswith(("/anthropic", "/anthropic/v1")) or (hostname in KIMI_CODE_HOSTS and "/coding" in normalized):
         # Direct native Anthropic host: realign with providers.determine_api_mode, which already maps this
         # host to anthropic_messages. The exact-hostname match rejects lookalike subdomains
         # (api.anthropic.com.attacker.test) and path-segment spoofing (proxy.test/api.anthropic.com/v1).

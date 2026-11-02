@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from utils import base_url_host_matches, base_url_hostname
+from utils import KIMI_CODE_HOSTS, base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +325,7 @@ def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
     # Exact-hostname matching only — never bare substring — so lookalike hosts
     # (api.openai.com.attacker.test) and path-segment spoofs (proxy.test/api.openai.com/v1) are NOT treated
     # as the real endpoint. (#32243)
-    if hostname == "api.kimi.com" and "/coding" in url_lower:
+    if hostname in KIMI_CODE_HOSTS and "/coding" in url_lower:
         return "anthropic_messages"
     if hostname == "api.anthropic.com" or url_lower.endswith("/anthropic"):
         return "anthropic_messages"

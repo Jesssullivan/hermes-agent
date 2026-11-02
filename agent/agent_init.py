@@ -46,7 +46,7 @@ from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
-from utils import base_url_host_matches, is_truthy_value
+from utils import KIMI_CODE_HOSTS, KIMI_CODE_USER_AGENT, base_url_host_matches, is_truthy_value
 
 # Same logger name as run_agent so caplog/patches on "run_agent" see our records.
 logger = logging.getLogger("run_agent")
@@ -1063,7 +1063,7 @@ _HOST_DEFAULT_HEADERS: list[tuple[str, Callable[[Any, str], dict[str, str]]]] = 
      _lazy_headers("agent.auxiliary_client", "build_nvidia_nim_headers", pass_base=True)),
     ("api.routermint.com", _lazy_headers("agent.client_lifecycle", "_routermint_headers")),
     ("githubcopilot.com", _lazy_headers("hermes_cli.models", "copilot_default_headers")),
-    ("api.kimi.com", lambda _k, _b: {"User-Agent": "claude-code/0.1.0"}),
+    *((host, lambda _k, _b: {"User-Agent": KIMI_CODE_USER_AGENT}) for host in KIMI_CODE_HOSTS),
     ("portal.qwen.ai", _lazy_headers("agent.client_lifecycle", "_qwen_portal_headers")),
     ("chatgpt.com", _lazy_headers("agent.codex_headers", "codex_cloudflare_headers", pass_key=True)),
     ("x.ai", _lazy_headers("tools.xai_http", "hermes_xai_default_headers")),

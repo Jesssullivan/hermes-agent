@@ -8,6 +8,7 @@ from agent.reasoning_effort import KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, thinking_
 from hermes_cli.version_info import get_version_info
 from providers import register_provider
 from providers.base import OMIT_TEMPERATURE, ProviderProfile
+from utils import KIMI_CODE_HOSTS
 
 _HEADERS = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
@@ -28,7 +29,7 @@ def _is_confirmed_kimi_coding_url(base_url: str) -> bool:
     except ValueError:
         return False
     return (
-        p.scheme.lower() == "https" and (p.hostname or "").lower() == "api.kimi.com" and port in (None, 443)
+        p.scheme.lower() == "https" and (p.hostname or "").lower() in KIMI_CODE_HOSTS and port in (None, 443)
         and p.username is None and p.password is None
         and p.path.rstrip("/") in {"/coding", "/coding/v1"} and not p.query and not p.fragment
     )

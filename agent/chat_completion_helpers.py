@@ -54,7 +54,7 @@ from agent.local_prompt_progress import prompt_progress, with_prompt_progress
 from agent.repetition_guard import RunawayStreamWatch, is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
-from utils import base_url_host_matches, base_url_hostname, env_float, env_int
+from utils import KIMI_CODE_HOSTS, base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
@@ -1489,7 +1489,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         is_qwen_portal=_is_qwen,
         is_github_models=_is_gh,
         is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
-        is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
+        is_kimi=any(base_url_host_matches(agent.base_url, h) for h in (*KIMI_CODE_HOSTS, "moonshot.ai", "moonshot.cn")),
         is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
         is_custom_provider=agent.provider == "custom",
         qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,

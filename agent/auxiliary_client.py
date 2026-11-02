@@ -133,7 +133,7 @@ from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
     nous_credential_failure_detail, record_nous_credential_failure)
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
-from utils import base_url_host_matches, base_url_hostname, base_url_origin, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from utils import KIMI_CODE_HOSTS, KIMI_CODE_USER_AGENT, base_url_host_matches, base_url_hostname, base_url_origin, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -1016,7 +1016,7 @@ def _to_openai_base_url(base_url: str) -> str:
         logger.debug(
             "Auxiliary client: keeping Anthropic-only base URL %s (no dual-surface host match)", url)
         return url
-    if base_url_host_matches(url, "api.kimi.com") and url.endswith("/coding"):
+    if any(base_url_host_matches(url, host) for host in KIMI_CODE_HOSTS) and url.endswith("/coding"):
         rewritten = url + "/v1"
         logger.debug("Auxiliary client: rewrote Kimi base URL %s → %s", url, rewritten)
         return rewritten
@@ -1906,7 +1906,7 @@ def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     if urlparse(normalized).path.rstrip("/").endswith(("/anthropic", "/anthropic/v1")):
         return True
     hostname = base_url_hostname(normalized)
-    return hostname == "api.anthropic.com" or bool(hostname == "api.kimi.com" and "/coding" in normalized)
+    return hostname == "api.anthropic.com" or bool(hostname in KIMI_CODE_HOSTS and "/coding" in normalized)
 
 
 def _maybe_wrap_anthropic(
@@ -2209,8 +2209,8 @@ def _resolve_api_key_provider() -> tuple[Optional[OpenAI], Optional[str]]:
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
             if is_native_gemini_base_url(base_url):
                 return GeminiNativeClient(api_key=api_key, base_url=base_url), model
-        if base_url_host_matches(base_url, "api.kimi.com"):
-            headers = {"User-Agent": "claude-code/0.1.0"}
+        if any(base_url_host_matches(base_url, host) for host in KIMI_CODE_HOSTS):
+            headers = {"User-Agent": KIMI_CODE_USER_AGENT}
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
             headers = copilot_default_headers()
@@ -2236,8 +2236,8 @@ def _endpoint_default_headers(
     (``is_vision`` adds Copilot-Vision-Request); NVIDIA NIM and (optionally) xAI have
     their own fingerprints; anything else falls back to the provider profile.
     """
-    if base_url_host_matches(base_url, "api.kimi.com"):
-        headers: dict = {"User-Agent": "claude-code/0.1.0"}
+    if any(base_url_host_matches(base_url, host) for host in KIMI_CODE_HOSTS):
+        headers: dict = {"User-Agent": KIMI_CODE_USER_AGENT}
     elif base_url_host_matches(base_url, "githubcopilot.com"):
         from hermes_cli.copilot_auth import copilot_request_headers
         headers = dict(copilot_request_headers(is_agent_turn=True, is_vision=is_vision))
@@ -3643,7 +3643,7 @@ def _pool_cache_hint(provider: str, *, main_runtime: Optional[dict[str, Any]] = 
 _POOL_PROVIDER_BY_HOST = (
     ("chatgpt.com", "openai-codex"), ("openrouter.ai", "openrouter"),
     ("inference-api.nousresearch.com", "nous"), ("api.anthropic.com", "anthropic"),
-    ("githubcopilot.com", "copilot"), ("api.kimi.com", "kimi-coding"), ("api.x.ai", "xai-oauth"),
+    ("githubcopilot.com", "copilot"), *((host, "kimi-coding") for host in KIMI_CODE_HOSTS), ("api.x.ai", "xai-oauth"),
 )
 _AUTH_REFRESH_PROVIDER_BY_HOST = (
     ("api.githubcopilot.com", "copilot"), ("chatgpt.com", "openai-codex"),
