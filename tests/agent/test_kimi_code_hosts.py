@@ -108,10 +108,16 @@ def test_model_discovery_confirms_each_host(base):
 
 @pytest.mark.parametrize("base", ["https://api.kimi.ai.example/coding", "https://example.test/api.kimi.ai/coding",
                                   "https://kimi.ai/coding", "https://api.kimi.ai/other"])
-def test_lookalikes_do_not_take_the_kimi_gates(base):
+def test_lookalikes_do_not_take_the_kimi_coding_gates(base):
     assert _detect_api_mode_for_url(base) is None
     assert not _endpoint_speaks_anthropic_messages(base)
     assert _auth_style("token", base, base) != "kimi"
+
+
+# These two gates read the host and not the path, so another path on a Kimi host still matches.
+@pytest.mark.parametrize("base", ["https://api.kimi.ai.example/coding", "https://example.test/api.kimi.ai/coding",
+                                  "https://kimi.ai/coding"])
+def test_lookalike_hosts_do_not_take_the_kimi_host_gates(base):
     assert reasoning_echo_family("custom", "other-model", base) is None
     compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
     compressor.config = SimpleNamespace(base_url=base)
