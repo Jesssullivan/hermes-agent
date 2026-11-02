@@ -122,7 +122,8 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
-from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, discovery_refused, main_route_refuses
+from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, discovery_refused
+from agent.route_hooks import main_route_marked, main_route_refuses, marked_main_refuses
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4339,17 +4340,9 @@ def _try_main_agent_model_fallback(
     return client, resolved_model or main_model, label
 
 
-# ── Context-window screening for runtime fallback chains (issue #52392) ── When the runtime auxiliary
-# fallback chain selects a candidate that is reachable but has a context window smaller than the compression
-# task requires, the call errors out instead of continuing to the next, viable candidate. The startup
-# feasibility check in ``agent.conversation_compression.check_compression_model_feasibility`` already
-# filters too-small auxiliary models at startup, but the runtime fallback chain
-# (``_try_configured_fallback_chain`` and ``_try_main_fallback_chain``) does not apply the same filter, so
-# compression can stop at the first alive door even if the room behind it is too small. The helpers below
-# screen each candidate by its effective context window before it is returned. ``None`` results from
-# ``get_model_context_length`` are passed through (we cannot prove a model is too small, so we do not block
-# it). This preserves the existing fallback surface for unrecognised/custom models while closing the gap on
-# the well-known ones.
+# ── Context-window screening for runtime fallback chains (issue #52392) ── A reachable candidate too small
+# for the compression task errors out instead of continuing. The helpers below screen each candidate by its
+# effective context window. ``None`` from ``get_model_context_length`` passes: such a model is not proven small.
 def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
     """Minimum context length for an auxiliary task; None = no floor (only ``compression`` has one)."""
     return MINIMUM_CONTEXT_LENGTH if task == "compression" else None
@@ -4677,10 +4670,11 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
-    routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
-    if routed is not None:
-        return routed
     with auxiliary_walk():
+        if not marked_main_refuses(main_provider, main_model, task=task):  # route_custody (F12)
+            routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
+            if routed is not None:
+                return routed
         if task:
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                 task, main_provider or "auto", reason="main provider unavailable")
@@ -5660,6 +5654,8 @@ def _vision_auto_route(
             main_provider, main_model = _agg_provider, _agg_model
             runtime = dict(runtime, base_url="", api_key="", api_mode="")
     if main_provider and main_provider not in {"auto", "", "moa"}:
+        if not _aux_probe_active() and marked_main_refuses(main_provider, main_model, task="vision"):
+            return None, None, None  # route_custody (F12): no image leaves, and no discovery follows a refusal
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
             return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
@@ -5706,6 +5702,8 @@ def resolve_vision_provider_client(
     if requested == "auto":
         return _vision_auto_route(runtime, resolved_model, resolved_api_mode, async_mode)
     if requested in _VISION_AUTO_PROVIDER_ORDER:
+        if not _aux_probe_active() and marked_main_refuses(requested, resolved_model, task="vision"):
+            return requested, None, None  # route_custody (F12)
         sync_client, default_model = _resolve_strict_vision_backend(requested, resolved_model)
         return _finalize_vision_client(requested, sync_client, default_model, resolved_model, async_mode)
     if requested == "zai":
@@ -6016,9 +6014,7 @@ def _get_cached_client(
     Async clients bind to the loop they were created on, so every async hit validates the cached
     loop is the current, open loop; stale entries are replaced in place (bounded, no cross-loop reuse).
 
-    This keeps cache size bounded to one entry per unique provider config, preventing the fd-exhaustion that
-    previously occurred in long-running gateways where recycled worker threads created unbounded entries
-    (#10200).
+    One entry per provider config keeps the cache bounded: recycled gateway workers once exhausted fds (#10200).
     """
     # A bare llama.cpp alias keys on the live local endpoint: a restarted server (new port/key)
     # must not be served the old client, and a stopped one resolves to nothing, not a cloud client.
@@ -6028,6 +6024,8 @@ def _get_cached_client(
         if not local[0]:
             return None, None
         base_url, api_key = local
+    if marked_main_refuses(provider, model, task=task):  # route_custody (F12): a slot naming the marked route
+        return None, None
     current_loop = _current_event_loop() if async_mode else None
     runtime = _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(
@@ -6035,6 +6033,8 @@ def _get_cached_client(
         main_runtime=main_runtime, is_vision=is_vision, task=task, model=model,
     )
     with _client_cache_lock:
+        if provider == "auto" and main_route_marked(runtime.get("provider")):
+            _client_cache.pop(cache_key, None)  # an ``auto`` client on a marked route is judged each call
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
             loop_ok = not async_mode or (

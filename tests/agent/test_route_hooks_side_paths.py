@@ -492,15 +492,17 @@ class TestSideQuestionFork:
             route_hooks.begin_turn(fork, messages=[], turn_id="t")
         assert [phase for phase, *_rest in asked] == ["turn"]
 
-    def test_a_fork_on_a_primary_is_not_gated(self, hooks):
+    def test_a_fork_on_a_primary_is_judged_as_its_own_serving_route(self, hooks):
         from tests.agent.test_route_hooks import _make_agent
         parent = _make_agent(None)
         parent.provider, parent.model = "openrouter", "gpt-4o"
         asked = []
         hooks["route_custody"] = [_skip_all(asked)]
         fork = self._fork(parent)
-        route_hooks.begin_turn(fork, messages=[], turn_id="t")
-        assert asked == []
+        assert getattr(fork, "_route_resolution_entry", None) is None
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            route_hooks.begin_turn(fork, messages=[], turn_id="t")
+        assert [(phase, provider) for phase, provider, *_rest in asked] == [("turn", "openrouter")]
 
     def test_a_refused_fork_result_raises(self, hooks):
         from agent import side_question

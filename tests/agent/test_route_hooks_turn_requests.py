@@ -1,9 +1,9 @@
 """Route custody between the requests of a turn (agent/route_hooks.py ``check_request_route``).
 
 CADE-1 review 5728175100 (B3): after a failover, a tool row stamped with ``data_use`` reached the
-fallback on the next request, and the gate had been asked once with ``data_use`` empty. Each probe
-drives the real ``run_conversation`` loop with a stub provider call and a stub tool. No provider is
-called."""
+fallback on the next request, and the gate had been asked once with ``data_use`` empty. F12 widens
+the check to every request on any route (``test_route_hooks_serving_route.py``). Each probe drives
+the real ``run_conversation`` loop with a stub provider call and a stub tool. No provider is called."""
 
 import json
 from types import SimpleNamespace
@@ -109,8 +109,11 @@ def _rate_limit():
     return error
 
 
-def _refuse_tool_data(asked, *, refuse=True):
+def _refuse_tool_data(asked, *, refuse=True, on="zai"):
+    """Refuses the tool data on *on*, the hosted route. Only that route's calls are recorded."""
     def custody(phase, candidate, data_use, **_kw):
+        if candidate["provider"] != on:
+            return {"action": "allow"}
         asked.append((phase, candidate["provider"], list(data_use)))
         if refuse and TOOL_DATA in data_use:
             return {"action": "skip", "reason": "client data"}
@@ -126,7 +129,8 @@ class TestFailoverThenToolRow:
         result = turn.run()
         assert ("zai", False) in turn.sent and ("zai", True) not in turn.sent
         assert turn.sent[-1] == (turn.primary, True), "the restored primary carries the row"
-        assert asked == [("failover", "zai", []), ("request", "zai", [TOOL_DATA])]
+        assert asked[0] == ("failover", "zai", []) and asked[-1] == ("request", "zai", [TOOL_DATA])
+        assert {phase for phase, *_rest in asked} == {"failover", "request"}
         assert result["final_response"] == "done"
         assert not turn.agent._provider_fallback_active
 
@@ -151,13 +155,13 @@ class TestFailoverThenToolRow:
         assert result["final_response"] == "held for review"
         assert [event["reason"] for event in events] == ["route_custody"]
 
-    def test_an_admitted_row_is_asked_once_and_the_turn_goes_on(self, hooks):
+    def test_an_admitted_row_is_asked_each_request_and_the_turn_goes_on(self, hooks):
         asked = []
         hooks["route_custody"] = [_refuse_tool_data(asked, refuse=False)]
         turn = _Turn()
         result = turn.run()
         assert turn.sent[-1] == ("zai", True) and result["final_response"] == "done"
-        assert asked == [("failover", "zai", []), ("request", "zai", [TOOL_DATA])]
+        assert asked[0] == ("failover", "zai", []) and asked[-1] == ("request", "zai", [TOOL_DATA])
 
     def test_no_gate_and_no_key_never_asks(self, hooks):
         turn = _Turn()
@@ -169,14 +173,15 @@ class TestFailoverThenToolRow:
 class TestResolutionEntry:
     def test_a_refused_row_stops_a_turn_built_on_the_entry(self, hooks):
         asked = []
-        hooks["route_custody"] = [_refuse_tool_data(asked)]
+        hooks["route_custody"] = [_refuse_tool_data(asked, on="openrouter")]
         turn = _Turn(chain=(), fail_primary=False)
         route_hooks.bind_resolution_entry(turn.agent, route_hooks.resolution_record(
             {"provider": turn.primary, "model": turn.agent.model}, {"provider": turn.primary}, model=turn.agent.model))
         result = turn.run()
         assert turn.sent == [(turn.primary, False)], "the row never left"
         assert result["failure_reason"] == "route_custody"
-        assert [(phase, data_use) for phase, _p, data_use in asked] == [("turn", []), ("request", [TOOL_DATA])]
+        assert [(phase, data_use) for phase, _p, data_use in asked] == [("turn", []), ("request", []),
+                                                                        ("request", [TOOL_DATA])]
 
 
 class TestPostToolCompaction:
@@ -213,15 +218,12 @@ class TestCheckRequestRoute:
             _rate_limited_until=0, _restore_primary_runtime=lambda: False)
         return agent
 
-    def test_growth_in_labels_asks_again(self, hooks):
+    def test_every_check_asks_though_nothing_grew(self, hooks):
         asked = []
         hooks["route_custody"] = [_refuse_tool_data(asked, refuse=False)]
         agent = self._agent()
         assert route_hooks.check_request_route(agent, []) is False
         assert route_hooks.check_request_route(agent, []) is False
-        assert [phase for phase, *_rest in asked] == ["request"]
-        route_hooks._remember_session("s1", labels=frozenset({"acme:client"}))
-        route_hooks.check_request_route(agent, [])
         assert [phase for phase, *_rest in asked] == ["request", "request"]
 
     def test_a_gate_that_cannot_run_refuses(self, hooks):
@@ -239,13 +241,14 @@ class TestCheckRequestRoute:
         assert agent._route_turn["messages"] == [row]
         assert TOOL_DATA in route_hooks.session_data_use("s1")
 
-    def test_the_primary_route_is_never_asked(self, hooks):
+    def test_the_primary_route_is_judged_too(self, hooks):
         asked = []
         hooks["route_custody"] = [_refuse_tool_data(asked)]
         row = {"role": "tool", "content": RAW}
         stamp_data_use(row, [TOOL_DATA])
-        assert route_hooks.check_request_route(self._agent(active=False), [row]) is False
-        assert asked == []
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            route_hooks.check_request_route(self._agent(active=False), [row])
+        assert asked == [("request", "zai", [TOOL_DATA])]
 
     def test_the_phase_is_advertised(self):
         assert "request" in route_hooks.HERMES_ROUTE_CUSTODY_PHASES

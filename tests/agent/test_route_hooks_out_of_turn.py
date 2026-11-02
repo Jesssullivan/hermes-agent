@@ -144,7 +144,7 @@ class TestOutOfTurnCompactionScope:
         with _compression_seam(recorder):
             agent._compress_context(_transcript(), "")
         assert recorder.refused == [True]
-        assert [s[0] for s in seen] == ["auxiliary"]  # no out-of-turn route check inside a turn
+        assert [s[0] for s in seen] == ["turn", "auxiliary"]  # no out-of-turn route check inside a turn
         assert route_hooks._scope_agent() is agent
 
 
@@ -407,24 +407,24 @@ class TestBoundRoute:
 
     def test_a_deliberate_switch_leaves_the_entry_with_one_warning(self, hooks, caplog):
         asked = []
-        hooks["route_custody"] = [_resolve_allows_compaction_refuses(asked)]
+        hooks["route_custody"] = [lambda candidate, **_kw: asked.append(candidate["provider"]) or {"action": "allow"}]
         agent = _make_agent()
         route_hooks.bind_resolution_entry(agent, RECORD)
         agent.provider, agent.model = "anthropic", "claude-opus-4"  # /model
         with caplog.at_level(logging.WARNING, logger="agent.route_hooks"):
             for turn in ("t1", "t2"):
                 route_hooks.begin_turn(agent, messages=[{"role": "user", "content": "q"}], turn_id=turn)
-        assert asked == []
+        assert asked == ["anthropic", "anthropic"], "the route in use is judged, not the entry it left"
         assert sum("left the resolution-time entry" in r.getMessage() for r in caplog.records) == 1
 
     def test_an_agent_built_on_another_provider_is_not_the_entry(self, hooks):
         asked = []
-        hooks["route_custody"] = [_resolve_allows_compaction_refuses(asked)]
+        hooks["route_custody"] = [lambda candidate, **_kw: asked.append(candidate["provider"]) or {"action": "allow"}]
         agent = _make_agent(provider="anthropic", model="claude-opus-4")  # a channel's own provider won
         route_hooks.bind_resolution_entry(agent, RECORD)
         assert "bound_route" not in agent._route_resolution_entry
         route_hooks.begin_turn(agent, messages=[{"role": "user", "content": "q"}], turn_id="t1")
-        assert asked == []
+        assert asked == ["anthropic"]
 
     def test_the_init_record_settles_once_on_the_built_route(self):
         agent = _make_agent(model="gpt-4o")

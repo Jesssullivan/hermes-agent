@@ -80,8 +80,9 @@ class TestCapabilities:
     def test_each_route_hook_is_advertised_and_registered(self):
         caps = route_hooks.HERMES_ROUTE_CAPABILITIES
         # F1 is not advertised: a provider: auto slot still walks the main model and its chain.
-        assert set(caps) == {"F2", "F3", "F6"}
+        assert set(caps) == {"F2", "F3", "F6", "F12"}
         assert (caps["F2"], caps["F3"], caps["F6"]) == ("turn_route", "route_custody", "on_routes_exhausted")
+        assert caps["F12"] == "route_custody"
         for hook in route_hooks.ROUTE_HOOKS:
             assert hook in VALID_HOOKS
             assert hook in SHELL_UNSUPPORTED_HOOKS  # no shell channel for labels, allow or reply
@@ -196,7 +197,8 @@ class TestRouteCustody:
         calls = []
 
         def custody(candidate, labels, data_use, **kw):
-            calls.append((dict(candidate), kw))
+            if kw["phase"] == "failover":
+                calls.append((dict(candidate), kw))
             return {"action": "skip", "reason": "client data"} if candidate["provider"] == "openai" else None
 
         hooks["route_custody"] = [custody]
@@ -252,14 +254,20 @@ class TestRouteCustody:
         verdict = {"action": "allow"}
         hooks["route_custody"] = [lambda **_kw: verdict]
         agent = _make_agent([HOSTED])
+        primary = agent.provider, agent.model
         assert _activate(agent) is True and agent._provider_fallback_active
         agent._rate_limited_until = time.monotonic() + 600  # primary cooling down: the fallback is kept
-        restore = MagicMock(return_value=True)
+
+        def back_on_primary():
+            agent.provider, agent.model = primary
+            agent._provider_fallback_active = False
+            return True
+
+        restore = MagicMock(side_effect=back_on_primary)
         agent._restore_primary_runtime = restore
         route_hooks.begin_turn(agent, messages=[], turn_id="t2")
         restore.assert_not_called()  # allowed: the kept fallback carries the turn
-        verdict = {"action": "skip"}
-        hooks["route_custody"] = [lambda **_kw: verdict]
+        hooks["route_custody"] = [lambda candidate, **_kw: {"action": "skip"} if candidate["provider"] == "openai" else verdict]
         route_hooks.begin_turn(agent, messages=[], turn_id="t3")
         restore.assert_called_once()
         assert agent._rate_limited_until > time.monotonic()  # cooldown kept for the next failure
@@ -430,7 +438,8 @@ class TestAuxiliaryCustody:
         seen = []
 
         def custody(phase, candidate, task, labels, session_id, **_kw):
-            seen.append((phase, candidate["provider"], task, labels, session_id))
+            if phase == "auxiliary":
+                seen.append((phase, candidate["provider"], task, labels, session_id))
             return {"action": "skip"} if candidate["provider"] == "openai" else None
 
         hooks["route_custody"] = [custody]
@@ -533,9 +542,15 @@ class TestResolutionTimeAgent:
         assert not getattr(agent, "_provider_fallback_active", False)
         return agent
 
-    def test_required_entry_stops_the_turn_without_a_gate(self, hooks):
+    def test_required_entry_with_no_gate_moves_to_the_next_route(self, hooks):
         required = {**HOSTED, "route_custody": "required"}
         agent = self._built_on(required, [required, LOCAL])
+        assert route_hooks.begin_turn(agent, messages=[{"role": "user", "content": "hi"}], turn_id="t1") is True
+        assert agent.provider == "zai"
+
+    def test_required_entry_stops_the_turn_with_no_gate_and_no_other_route(self, hooks):
+        required = {**HOSTED, "route_custody": "required"}
+        agent = self._built_on(required, [required])
         with pytest.raises(route_hooks.RouteCustodyRefused):
             route_hooks.begin_turn(agent, messages=[{"role": "user", "content": "hi"}], turn_id="t1")
 
@@ -558,7 +573,7 @@ class TestResolutionTimeAgent:
         first.session_id = "gw-session"
         route_hooks.begin_turn(first, messages=[_tool_message(["acme:client-raw"])], turn_id="t1")
         # The primary then fails; the gateway builds a new agent for the same session on HOSTED.
-        rebuilt = self._built_on(HOSTED, [HOSTED, LOCAL], session_id="gw-session")
+        rebuilt = self._built_on(HOSTED, [HOSTED], session_id="gw-session")
         with pytest.raises(route_hooks.RouteCustodyRefused):
             route_hooks.begin_turn(rebuilt, messages=[{"role": "user", "content": "plain"}], turn_id="t2")
         # The earlier turn's data use is the session's too: it only grows.

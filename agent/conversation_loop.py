@@ -45,7 +45,7 @@ from agent.turn_route_check import enforce_request_route
 from agent.turn_scripted_prelude import Prelude, play_prelude
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call, stop_thinking_spinner
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, OPEN_TURN_TAIL_ROLES, failed_turn_notice, site_copy
@@ -1611,7 +1611,7 @@ def _start_iteration(agent, s: _LoopState) -> bool:
     if _run_phase(begin_iteration, agent, s).action == "break":
         return False
     _run_phase(prepare_iteration, agent, s)
-    return _run_phase(enforce_request_route, agent, s).action != "break"
+    return _run_phase(enforce_request_route, agent, s, refund=True).action != "break"
 
 
 def _finish_turn(agent, s: _LoopState) -> dict[str, Any]:
@@ -1620,7 +1620,7 @@ def _finish_turn(agent, s: _LoopState) -> dict[str, Any]:
         name: getattr(s, name)
         for name in inspect.signature(finalize_turn).parameters if name != "agent"
     })
-    if s._turn_exit_reason == ROUTE_CUSTODY_REASON:
+    if ROUTE_CUSTODY_REASON in (s._turn_exit_reason, result.get("turn_exit_reason")):
         result = route_custody_stopped(agent, result)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
@@ -1634,12 +1634,18 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+    attempted = False
     while s.retry_count < s.max_retries:
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
         if _ng.action == "break":
             return None
+        # ``_start_iteration`` judged the first attempt. Each retry is a request too (route custody).
+        if attempted and _run_phase(enforce_request_route, agent, s, refund=False).action == "break":
+            s.thinking_spinner = stop_thinking_spinner(agent, s.thinking_spinner)
+            return _finish_turn(agent, s)
+        attempted = True
         try:
             _run_phase(build_api_request, agent, s)
             if _run_phase(perform_api_call, agent, s).action == "break":
