@@ -21,7 +21,7 @@ from agent import model_metadata_http
 from agent.model_metadata_cache import _write_context_cache, locked_context_cache
 from agent.model_metadata_llamacpp import llamacpp_context
 
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname
+from utils import KIMI_CODE_HOSTS, atomic_json_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL, openrouter_variant_base
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, UNPRICED_REPLAY_FIELDS, without_persistence_fields
@@ -444,7 +444,7 @@ def _is_custom_endpoint(base_url: str) -> bool:
 _URL_TO_PROVIDER: dict[str, str] = {
     "api.openai.com": "openai", "chatgpt.com": "openai", "api.anthropic.com": "anthropic",
     "api.z.ai": "zai", "open.bigmodel.cn": "zai",
-    "api.moonshot.ai": "kimi-coding", "api.moonshot.cn": "kimi-coding-cn", "api.kimi.com": "kimi-coding",
+    "api.moonshot.ai": "kimi-coding", "api.moonshot.cn": "kimi-coding-cn", **dict.fromkeys(KIMI_CODE_HOSTS, "kimi-coding"),
     "api.stepfun.ai": "stepfun", "api.stepfun.com": "stepfun", "api.arcee.ai": "arcee", "api.minimax": "minimax",
     "dashscope.aliyuncs.com": "alibaba", "dashscope-intl.aliyuncs.com": "alibaba", "portal.qwen.ai": "qwen-oauth",
     "openrouter.ai": "openrouter", "generativelanguage.googleapis.com": "gemini",
@@ -592,7 +592,7 @@ def _ollama_show_context(data: dict[str, Any], *, gguf_first: bool, minimum: Opt
 
 # (host, canonical paths, model ids, context) — see _endpoint_scoped_context_length.
 _ENDPOINT_SCOPED_CONTEXT = (
-    ("api.kimi.com", {"/coding", "/coding/v1"}, {"k3", "kimi-k3", "kimi-k3-cot"}, 1_048_576),
+    *((host, {"/coding", "/coding/v1"}, {"k3", "kimi-k3", "kimi-k3-cot"}, 1_048_576) for host in KIMI_CODE_HOSTS),
     ("integrate.api.nvidia.com", {"/v1"}, {"deepseek-ai/deepseek-v4-pro"}, 262_144),
 )
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Dict, List, NamedTuple, Optional
-from utils import base_url_hostname, is_truthy_value
+from utils import KIMI_CODE_HOSTS, base_url_hostname, is_truthy_value
 from hermes_cli.fallback_config import scoped_fallback_chain
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
@@ -349,7 +349,7 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         provider, api_mode = "openai-codex", "codex_responses"
     elif host == "api.anthropic.com":
         provider, api_mode = "anthropic", "anthropic_messages"
-    elif "api.kimi.com/coding" in base_lower:
+    elif host in KIMI_CODE_HOSTS and "/coding" in base_lower:
         api_mode = "anthropic_messages"
     # Explicit delegation.api_mode always wins over the URL heuristic; a provider plugin's
     # registered dialect counts as explicit.

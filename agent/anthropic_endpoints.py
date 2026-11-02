@@ -10,7 +10,7 @@ cycle.
 
 from urllib.parse import urlparse
 
-from utils import base_url_host_matches, base_url_hostname
+from utils import KIMI_CODE_HOSTS, base_url_host_matches, base_url_hostname
 
 _MINIMAX_ANTHROPIC_PREFIXES = ("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic")
 
@@ -34,7 +34,7 @@ def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
 
 def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     """Kimi's /coding endpoint, which requires a claude-code User-Agent."""
-    return _normalized_lower(base_url).startswith("https://api.kimi.com/coding")
+    return _normalized_lower(base_url).startswith(tuple(f"https://{host}/coding" for host in KIMI_CODE_HOSTS))
 
 
 def _is_opencode_endpoint(base_url: str | None) -> bool:
@@ -67,7 +67,7 @@ def _is_kimi_family_endpoint(base_url: str | None, model: str | None = None) -> 
     Decides whether unsigned reasoning_content-derived thinking blocks are preserved on replay."""
     return (
         _is_kimi_coding_endpoint(base_url)
-        or any(base_url_host_matches(base_url or "", d) for d in ("api.kimi.com", "moonshot.ai", "moonshot.cn"))
+        or any(base_url_host_matches(base_url or "", d) for d in (*KIMI_CODE_HOSTS, "moonshot.ai", "moonshot.cn"))
         or _model_name_is_kimi_family(model)
     )
 

@@ -14,7 +14,7 @@ import subprocess
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
-from utils import normalize_proxy_env_vars
+from utils import KIMI_CODE_USER_AGENT, normalize_proxy_env_vars
 
 from agent.anthropic_credentials import _is_oauth_token, anthropic_route_is_oauth, is_native_anthropic_host
 from agent.anthropic_endpoints import (
@@ -508,7 +508,7 @@ def build_anthropic_client(api_key, base_url: str | None = None, timeout: float 
     kwargs["auth_token" if style in ("bearer", "oauth") else "api_key"] = api_key
     headers = _beta_header(common_betas + _OAUTH_ONLY_BETAS if style == "oauth" else common_betas)
     if style == "kimi":
-        headers = {**_attribution_headers(), **headers}
+        headers = {**_attribution_headers(), "User-Agent": KIMI_CODE_USER_AGENT, **headers}
     elif style == "oauth":
         headers["user-agent"] = f"claude-code/{_get_claude_code_version()} (external, cli)"
         headers["x-app"] = "cli"
