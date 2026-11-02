@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-from utils import base_url_host_matches, base_url_hostname
+from utils import KIMI_CODE_HOSTS, base_url_host_matches, base_url_hostname
 import fire
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
@@ -247,7 +247,7 @@ class AggregateMetrics:
 # Ordered (hostname, provider) table for _detect_provider (codex is matched separately).
 _PROVIDER_HOSTS: tuple[tuple[str, str], ...] = (
     ("openrouter.ai", "openrouter"), ("nousresearch.com", "nous"), ("z.ai", "zai"), ("moonshot.ai", "kimi-coding"),
-    ("moonshot.cn", "kimi-coding"), ("api.kimi.com", "kimi-coding"), ("arcee.ai", "arcee"), ("minimaxi.com", "minimax-cn"),
+    ("moonshot.cn", "kimi-coding"), *((host, "kimi-coding") for host in KIMI_CODE_HOSTS), ("arcee.ai", "arcee"), ("minimaxi.com", "minimax-cn"),
     ("minimax.io", "minimax"),
 )
 

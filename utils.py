@@ -785,8 +785,8 @@ def base_url_origin(base_url: str) -> tuple[str, str, int]:
     return (scheme, hostname, {"https": 443, "http": 80}.get(scheme, 0) if port is None else port)
 
 
-# Kimi Code's API hosts: api.kimi.com for a mainland login, api.kimi.ai for a global one. Every Kimi
-# Code gate reads this tuple, so removing a host here rolls that host back at each gate.
+# Kimi Code's API hosts: api.kimi.com for a mainland login, api.kimi.ai for a global one. Every gate
+# a model turn reads uses this tuple, so removing a host here rolls that host back at each of them.
 KIMI_CODE_HOSTS = ("api.kimi.com", "api.kimi.ai")
 # The User-Agent Kimi Code model calls send, on the OpenAI wire and on Anthropic Messages alike.
 KIMI_CODE_USER_AGENT = "claude-code/0.1.0"

@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
 from hermes_cli.timeouts import get_provider_request_timeout
-from utils import KIMI_CODE_HOSTS, base_url_host_matches, env_float
+from utils import KIMI_CODE_HOSTS, KIMI_CODE_USER_AGENT, base_url_host_matches, env_float
 
 logger = logging.getLogger("run_agent")  # origin module's logger name: log records / caplog filters unchanged
 _QWEN_CODE_VERSION = "0.14.1"  # Qwen Portal mimics the QwenCode CLI
@@ -44,7 +44,8 @@ _ROUTE_DEFAULT_HEADERS = (
     ("integrate.api.nvidia.com", lambda self, url: _lazy_attr("agent.auxiliary_client", "build_nvidia_nim_headers")(url)),
     ("api.routermint.com", lambda self, url: _routermint_headers()),
     ("githubcopilot.com", lambda self, url: _lazy_attr("hermes_cli.models", "copilot_default_headers")()),
-    *((host, lambda self, url: dict(_lazy_attr("agent.auxiliary_client", "_AI_GATEWAY_HEADERS"))) for host in KIMI_CODE_HOSTS),
+    *((host, lambda self, url: {**_lazy_attr("agent.auxiliary_client", "_AI_GATEWAY_HEADERS"), "User-Agent": KIMI_CODE_USER_AGENT})
+      for host in KIMI_CODE_HOSTS),
     ("portal.qwen.ai", lambda self, url: _qwen_portal_headers()),
     ("chatgpt.com", lambda self, url: _lazy_attr("agent.codex_headers", "codex_cloudflare_headers")(
         self._client_kwargs.get("api_key", ""), base_url=url)),
