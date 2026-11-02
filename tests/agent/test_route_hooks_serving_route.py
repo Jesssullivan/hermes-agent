@@ -64,6 +64,12 @@ def _gate(asked, refuse_on=(), *, data_only=True):
 
 
 class TestMarkedMainRoute:
+    def test_a_blank_provider_sends_nothing_with_no_gate(self, hooks, marked):
+        agent = MagicMock(provider="", model="m", _provider_fallback_active=False, _route_resolution_entry=None)
+        assert route_hooks._active_entry(agent) == {"provider": "", "model": "m"}
+        assert route_hooks.custody_refuses(route_hooks._active_entry(agent), phase="turn",
+                                           current={"provider": "", "model": "m"})
+
     def test_no_gate_sends_nothing(self, hooks, marked):
         turn = _Turn(chain=(), fail_primary=False)
         result = turn.run()
@@ -178,6 +184,89 @@ class TestMarkedMainRoute:
             assert aux._get_cached_client("openrouter", "gpt-4o", task="vision") == (None, None)
         build.assert_not_called()
 
+    @pytest.mark.parametrize("slot", ["main", "custom:main", "custom:openrouter", " Main "])
+    def test_a_slot_spelling_the_marked_route_gets_no_client(self, hooks, marked, slot):
+        with patch.object(aux, "_read_main_provider", return_value="openrouter"), \
+                patch.object(aux, "resolve_provider_client") as build:
+            assert aux._get_cached_client(slot, "gpt-4o", task="compression") == (None, None)
+        build.assert_not_called()
+
+    @pytest.mark.parametrize("slot", ["main", "custom:main"])
+    def test_a_vision_slot_spelling_the_marked_route_sends_nothing(self, hooks, marked, slot):
+        with patch.object(aux, "_read_main_provider", return_value="kimi-coding"), \
+                patch("agent.route_hooks._main_route_marker", return_value=("kimi-coding", True)), \
+                patch.object(aux, "_resolve_task_provider_model", return_value=(slot, "m", None, None, None)), \
+                patch.object(aux, "resolve_provider_client") as build:
+            assert aux.resolve_vision_provider_client()[1] is None
+        build.assert_not_called()
+
+    def test_a_codex_slot_reaches_the_gate_on_the_route_it_resolves_to(self, hooks):
+        asked = []
+        hooks["route_custody"] = [_gate(asked, refuse_on=("openai-codex",), data_only=False)]
+        with patch("agent.route_hooks._main_route_marker", return_value=("openai-codex", True)), \
+                patch.object(aux, "resolve_provider_client") as build:
+            assert aux._get_cached_client("codex", "m", task="vision") == (None, None)
+        build.assert_not_called()
+        assert [row[1] for row in asked] == ["openai-codex"]
+
+    def test_a_named_custom_slot_reaches_the_gate_on_the_marked_name(self, hooks):
+        with patch("agent.route_hooks._main_route_marker", return_value=("custom:relay", True)), \
+                patch.object(aux, "resolve_provider_client") as build:
+            assert aux._get_cached_client("custom:relay", "m", task="vision") == (None, None)
+        build.assert_not_called()
+
+    def test_an_admitted_main_slot_gets_its_client(self, hooks, marked):
+        asked = []
+        hooks["route_custody"] = [_gate(asked)]
+        client = MagicMock()
+        with patch.dict(aux._client_cache), patch.object(aux, "_read_main_provider", return_value="openrouter"), \
+                patch.object(aux, "resolve_provider_client", return_value=(client, "gpt-4o")):
+            assert aux._get_cached_client("main", "gpt-4o", task="compression")[0] is client
+        assert [row[1] for row in asked] == ["openrouter"]
+
+    def test_a_text_slot_spelling_the_marked_route_builds_no_client(self, hooks, marked):
+        with patch.object(aux, "_read_main_provider", return_value="openrouter"), \
+                patch.object(aux, "_resolve_task_provider_model", return_value=("main", "m", None, None, None)), \
+                patch.object(aux, "resolve_provider_client") as build:
+            assert aux.get_text_auxiliary_client("goal_judge") == (None, None)
+        build.assert_not_called()
+
+    def test_a_vision_base_url_slot_on_the_marked_route_builds_no_client(self, hooks, marked):
+        with patch.object(aux, "_resolve_task_provider_model",
+                          return_value=("openrouter", "m", "https://u/v1", "k", None)), \
+                patch.object(aux, "resolve_provider_client") as build:
+            assert aux.resolve_vision_provider_client()[1] is None
+        build.assert_not_called()
+
+    def test_vision_discovery_stops_at_a_candidate_the_mark_covers(self, hooks, marked):
+        with patch.object(aux, "_vision_main_provider_client", return_value=(None, None)), \
+                patch.object(aux, "_resolve_strict_vision_backend", return_value=(MagicMock(), "m")) as strict:
+            assert aux._vision_auto_route({"provider": "zai", "model": "m"}, None, None, False) == (None, None, None)
+        strict.assert_not_called()
+
+    def test_vision_discovery_runs_a_candidate_the_gate_admits(self, hooks, marked):
+        asked = []
+        hooks["route_custody"] = [_gate(asked)]
+        client = MagicMock()
+        with patch.object(aux, "_vision_main_provider_client", return_value=(None, None)), \
+                patch.object(aux, "_resolve_strict_vision_backend", return_value=(client, "m")):
+            assert aux._vision_auto_route({"provider": "zai", "model": "m"}, None, None, False)[1] is client
+        assert ("auxiliary", "openrouter") in [row[:2] for row in asked]
+
+    def test_an_auto_client_with_no_published_runtime_is_judged_each_call(self, hooks, marked):
+        answers = iter(({"action": "allow"}, {"action": "skip"}))
+        hooks["route_custody"] = [lambda **_kw: next(answers)]
+        client = MagicMock()
+        with patch.object(aux, "_try_main_provider_route", return_value=(client, "gpt-4o", "openrouter")) as ride, \
+                patch.object(aux, "_try_main_fallback_chain", return_value=(None, None, "")), \
+                patch.object(aux, "_warn_stale_openai_base_url"), \
+                patch.object(aux, "_normalize_main_runtime", return_value={}), \
+                patch.object(aux, "_read_main_provider", return_value="openrouter"), \
+                patch.object(aux, "_read_main_model", return_value="gpt-4o"):
+            assert aux._get_cached_client("auto")[0] is client
+            assert aux._get_cached_client("auto")[0] is None, "the cached client was served"
+        ride.assert_called_once()
+
     def test_an_auto_client_on_a_marked_route_is_judged_each_call(self, hooks, marked):
         answers = iter(({"action": "allow"}, {"action": "skip"}))
         hooks["route_custody"] = [lambda **_kw: next(answers)]
@@ -229,6 +318,24 @@ class TestMarkerRead:
                     "custom_providers:\n- name: relay\n  base_url: http://relay.invalid/v1\n")
         assert route_hooks.main_route_marked("custom")
         assert not route_hooks.main_route_marked("zai")
+
+    def test_a_failed_named_lookup_widens_the_mark_and_reads_no_credential(self):
+        self._write("model:\n  provider: relay\n  default: m\n  route_custody: required\n")
+        with patch("hermes_cli.runtime_provider._get_named_custom_provider", side_effect=OSError("io")) as lookup:
+            assert route_hooks.main_route_marked("custom")
+        assert lookup.call_args.kwargs == {"resolve_credentials": False}
+
+    def test_no_provider_name_counts_as_marked(self):
+        self._write("model:\n  provider: zai\n  default: m\n  route_custody: required\n")
+        assert route_hooks.main_route_marked("") and route_hooks.main_route_marked(None, "  ")
+        assert route_hooks.main_route_marked("zai", "") and not route_hooks.main_route_marked("openai", "")
+        assert route_hooks.agent_custody_applies(MagicMock(provider="", _route_resolution_entry=None))
+        self._write("model:\n  provider: zai\n  default: m\n")
+        assert not route_hooks.main_route_marked("")
+
+    def test_a_block_on_main_names_no_route_to_tell_apart(self):
+        self._write("model:\n  provider: main\n  route_custody: required\n")
+        assert route_hooks.main_route_marked("zai")
 
     @pytest.mark.parametrize("text,expected", [
         ("model:\n  provider: auto\n  route_custody: required\n", True),

@@ -2,8 +2,8 @@
 routes-exhausted reply.
 
 Three plugin hooks let a deployment decide which model route may carry a turn. None of them
-changes anything until a plugin registers for it, or a fallback entry sets ``route_custody:
-required``.
+changes anything until a plugin registers for it, or a fallback entry or the config's ``model``
+block sets ``route_custody: required``.
 
 - ``turn_route`` (F2) runs once per turn before turn-start compaction and the first API call
   (``phase="turn"``), before each later API request of the turn (``phase="request"``), before vision
@@ -42,7 +42,7 @@ required``.
   labelled the inbound message (:func:`detached_auxiliary`, :func:`agent_vision_scope`).
   The last-resort hop to the main model asks the gate as well (:func:`main_route_refuses`), and a
   refusal in an auxiliary call ends that call's walk before built-in discovery
-  (:func:`discovery_refused`), whose candidates the gate never sees.
+  (:func:`discovery_refused`), whose candidates the gate sees only when that mark covers them.
   :data:`HERMES_ROUTE_CUSTODY_PHASES` lists every phase.
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
@@ -203,22 +203,29 @@ def _main_route_marker() -> tuple[str, bool]:
 
 def main_route_marked(*providers: Any) -> bool:
     """Whether ``model.route_custody`` covers a route on any of *providers*. A block with no provider
-    or ``auto`` names no route to tell apart, so it covers every route."""
+    or ``auto`` names no route to tell apart, so it covers every route. So does a route with no
+    provider name, which proves it is not the marked one."""
     main_provider, marked = _main_route_marker()
     if not marked:
         return False
-    if main_provider.lower() in ("", "auto"):
+    named = [provider for provider in providers if str(provider or "").strip()]
+    if not named or main_provider.lower() in ("", *_MAIN_SLOT_PROVIDERS):
         return True
     forms = _marked_forms(main_provider)
-    return any(forms & _provider_forms(provider) for provider in providers)
+    return any(forms & _provider_forms(provider) for provider in named)
 
 
 def _marked_forms(main_provider: str) -> frozenset[str]:
-    """Every name a marked main route answers to. A named custom provider runs as ``custom``."""
+    """Every name a marked main route answers to. A named custom provider runs as ``custom``. A
+    lookup that fails counts as named, which widens the mark. The lookup reads no credential."""
     named = main_provider.lower().startswith("custom:")
-    with suppress(Exception):
-        from hermes_cli.runtime_provider import _get_named_custom_provider
-        named = named or bool(_get_named_custom_provider(main_provider))
+    if not named:
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+            named = bool(_get_named_custom_provider(main_provider, resolve_credentials=False))
+        except Exception:  # health: allow BLE001 -- an unreadable lookup keeps the wider mark
+            logger.debug("Route custody: named custom lookup failed", exc_info=True)
+            named = True
     forms = _provider_forms(main_provider)
     return forms | {"custom"} if named else forms
 
@@ -1184,9 +1191,16 @@ def main_route_refuses(provider: Any, model: Any, *, task: Optional[str], failed
 
 
 def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str]) -> bool:
-    """F3 for an auxiliary slot about to ride a route ``model.route_custody`` marks."""
-    return main_route_marked(provider) and main_route_refuses(provider, model, task=task, failed_provider=str(provider or ""),
-                                                              failed_model=str(model or ""))
+    """F3 for an auxiliary slot about to ride a route ``model.route_custody`` marks. A slot's spelling
+    (``main``, ``custom:main``, ``custom:<provider>``, ``codex``) can name another route than the one
+    it resolves to, so the mark is read on both, and the gate sees the first name the mark covers."""
+    if not _main_route_marker()[1]:
+        return False
+    from agent.auxiliary_client import _normalize_aux_provider
+    resolved = _normalize_aux_provider(provider) if str(provider or "").strip() else ""
+    route = next((name for name in (resolved, provider) if main_route_marked(name)), None)
+    return route is not None and main_route_refuses(route, model, task=task, failed_provider=str(route or ""),
+                                                    failed_model=str(model or ""))
 
 
 def routes_exhausted(agent: Any, result: dict[str, Any], *, classified: Any, provider: Any,

@@ -120,6 +120,7 @@ def aux_probe_mode():
 
 
 from agent.credential_pool import load_pool
+from agent.image_routing import _main_model_supports_vision
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
 from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, discovery_refused
@@ -5502,6 +5503,8 @@ def resolve_provider_client(
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str, Any]] = None) -> tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    if marked_main_refuses(provider, model, task=task or None):  # route_custody (F12)
+        return None, None
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
@@ -5509,20 +5512,6 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str
 
 
 _VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
-
-
-def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
-    """True when ``provider``/``model`` is known to accept image input; unknown capability → True (attempt the call)."""
-    try:
-        from agent.image_routing import _lookup_supports_vision
-        from hermes_cli.config import load_config_readonly
-    except ImportError:
-        return True
-    try:
-        supports = _lookup_supports_vision(provider, model, load_config_readonly())
-    except Exception:  # pragma: no cover - defensive
-        return True
-    return True if supports is None else bool(supports)
 
 
 def _normalize_vision_provider(provider: Optional[str]) -> str:
@@ -5663,6 +5652,8 @@ def _vision_auto_route(
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:
             continue  # already tried above
+        if not _aux_probe_active() and marked_main_refuses(candidate, resolved_model, task="vision"):
+            return None, None, None  # route_custody (F12): as above, a refusal ends the walk
         sync_client, default_model = _resolve_strict_vision_backend(candidate)
         if sync_client is not None:
             return _finalize_vision_client(candidate, sync_client, default_model, resolved_model, async_mode)
@@ -5693,6 +5684,8 @@ def resolve_vision_provider_client(
     raw_requested, requested = requested, _normalize_vision_provider(requested)
     if resolved_base_url:
         provider_for_base_override = requested if requested and requested not in {"", "auto"} else "custom"
+        if not _aux_probe_active() and marked_main_refuses(provider_for_base_override, resolved_model, task="vision"):
+            return provider_for_base_override, None, None  # route_custody (F12)
         client, final_model = resolve_provider_client(
             provider_for_base_override, model=resolved_model, async_mode=async_mode,
             explicit_base_url=resolved_base_url, explicit_api_key=resolved_api_key,
@@ -6032,8 +6025,9 @@ def _get_cached_client(
         provider, async_mode=async_mode, base_url=base_url, api_key=api_key, api_mode=api_mode,
         main_runtime=main_runtime, is_vision=is_vision, task=task, model=model,
     )
+    auto_marked = provider == "auto" and main_route_marked(runtime.get("provider") or _read_main_provider())
     with _client_cache_lock:
-        if provider == "auto" and main_route_marked(runtime.get("provider")):
+        if auto_marked:
             _client_cache.pop(cache_key, None)  # an ``auto`` client on a marked route is judged each call
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
