@@ -123,8 +123,8 @@ from agent.credential_pool import load_pool
 from agent.image_routing import _main_model_supports_vision
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
-from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, discovery_refused
-from agent.route_hooks import main_route_marked, main_route_refuses, marked_main_refuses
+from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, discovery_mark_refuses, discovery_refused
+from agent.route_hooks import judged_vision_client, main_route_marked, main_route_refuses, marked_main_refuses
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4687,7 +4687,10 @@ def _resolve_auto_route(
             return fb_client, fb_model, fb_label
         if discovery_refused(task) or not _discovery_chain_allowed(main_provider, task):
             return None, None, ""
-    return _try_discovery_chain()
+    client, model, label = _try_discovery_chain()
+    if client is not None and discovery_mark_refuses(_effective_provider_for_client(client, label), model, task=task):
+        return None, None, ""  # route_custody (F12): a candidate the mark covers carries nothing unadmitted
+    return client, model, label
 
 
 def _effective_provider_for_client(client: Any, fallback: str) -> str:
@@ -5568,12 +5571,13 @@ def get_available_vision_backends() -> list[str]:
 
 def _finalize_vision_client(
     resolved_provider: str, sync_client: Any, default_model: Optional[str],
-    resolved_model: Optional[str], async_mode: bool,
+    resolved_model: Optional[str], async_mode: bool, judged: Any = ...,
 ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Apply the explicit model override (and async wrapping) to a resolved vision client."""
-    if sync_client is None:
-        return resolved_provider, None, None
+    """Apply the explicit model override (and async wrapping) to a resolved vision client. Route
+    custody (F12) judges the model it sends, unless *judged* says the gate saw that one already."""
     final_model = resolved_model or default_model
+    if sync_client is None or (final_model != judged and marked_main_refuses(resolved_provider, final_model, task="vision")):
+        return resolved_provider, None, None
     if async_mode:
         async_client, async_model = _to_async_client(sync_client, final_model, is_vision=True)
         return resolved_provider, async_client, async_model
@@ -5582,12 +5586,11 @@ def _finalize_vision_client(
 
 def _vision_main_provider_client(
     main_provider: str, main_model: str, runtime: dict[str, Any], resolved_model: Optional[str],
-    resolved_api_mode: Optional[str],
+    resolved_api_mode: Optional[str], provider_vision_default: Optional[str],
 ) -> tuple[Optional[Any], Optional[str]]:
     """Auto-detect step 1: try the main provider; (None, None) falls through to the aggregator chain."""
     # A provider vision default (static override or catalog discovery) is a *known* multimodal
     # model; the pinned chat model usually isn't, so only fall back to it when no default exists.
-    provider_vision_default = _resolve_provider_vision_default(main_provider)
     vision_model = provider_vision_default or main_model
     if main_provider == "nous":
         # Nous picks its vision model from Portal tier-aware slots inside _try_nous(vision=True);
@@ -5643,19 +5646,19 @@ def _vision_auto_route(
             main_provider, main_model = _agg_provider, _agg_model
             runtime = dict(runtime, base_url="", api_key="", api_mode="")
     if main_provider and main_provider not in {"auto", "", "moa"}:
-        if not _aux_probe_active() and marked_main_refuses(main_provider, main_model, task="vision"):
+        vision_default = _resolve_provider_vision_default(main_provider)  # the model step 1 sends
+        judged = resolved_model or (vision_default if main_provider == "nous" else vision_default or main_model)
+        if marked_main_refuses(main_provider, judged, task="vision"):
             return None, None, None  # route_custody (F12): no image leaves, and no discovery follows a refusal
-        client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
+        client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode, vision_default)
         if client is not None:
-            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
+            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode, judged)
     # Aggregators use their dedicated vision model, not the user's main model.
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:
             continue  # already tried above
-        if not _aux_probe_active() and marked_main_refuses(candidate, resolved_model, task="vision"):
-            return None, None, None  # route_custody (F12): as above, a refusal ends the walk
         sync_client, default_model = _resolve_strict_vision_backend(candidate)
-        if sync_client is not None:
+        if sync_client is not None:  # route_custody (F12) judges the model it picked; a refusal ends the walk
             return _finalize_vision_client(candidate, sync_client, default_model, resolved_model, async_mode)
     logger.debug("Auxiliary vision client: none available")
     return None, None, None
@@ -5684,21 +5687,21 @@ def resolve_vision_provider_client(
     raw_requested, requested = requested, _normalize_vision_provider(requested)
     if resolved_base_url:
         provider_for_base_override = requested if requested and requested not in {"", "auto"} else "custom"
-        if not _aux_probe_active() and marked_main_refuses(provider_for_base_override, resolved_model, task="vision"):
+        if marked_main_refuses(provider_for_base_override, resolved_model, task="vision"):
             return provider_for_base_override, None, None  # route_custody (F12)
         client, final_model = resolve_provider_client(
             provider_for_base_override, model=resolved_model, async_mode=async_mode,
             explicit_base_url=resolved_base_url, explicit_api_key=resolved_api_key,
             api_mode=resolved_api_mode, main_runtime=runtime,
         )
-        return provider_for_base_override, client, (final_model if client is not None else None)
+        return provider_for_base_override, *judged_vision_client(provider_for_base_override, client, final_model, resolved_model)
     if requested == "auto":
         return _vision_auto_route(runtime, resolved_model, resolved_api_mode, async_mode)
     if requested in _VISION_AUTO_PROVIDER_ORDER:
-        if not _aux_probe_active() and marked_main_refuses(requested, resolved_model, task="vision"):
+        if marked_main_refuses(requested, resolved_model, task="vision"):
             return requested, None, None  # route_custody (F12)
         sync_client, default_model = _resolve_strict_vision_backend(requested, resolved_model)
-        return _finalize_vision_client(requested, sync_client, default_model, resolved_model, async_mode)
+        return _finalize_vision_client(requested, sync_client, default_model, resolved_model, async_mode, resolved_model)
     if requested == "zai":
         for _zai_url in _ZAI_OPENAI_VISION_URLS:
             client, final_model = _get_cached_client(
@@ -5707,12 +5710,12 @@ def resolve_vision_provider_client(
                 is_vision=True,
             )
             if client is not None:
-                return _finalize_vision_client(requested, client, final_model, resolved_model, async_mode)
+                return _finalize_vision_client(requested, client, final_model, resolved_model, async_mode, resolved_model)
         # Fallback: try without explicit base_url (old behavior)
     client, final_model = _get_cached_client(
         raw_requested, resolved_model, async_mode, api_mode=resolved_api_mode, main_runtime=runtime, is_vision=True,
     )
-    return requested, client, (final_model if client is not None else None)
+    return requested, *judged_vision_client(raw_requested, client, final_model, resolved_model)
 
 
 def get_auxiliary_extra_body() -> dict:

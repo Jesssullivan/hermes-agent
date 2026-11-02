@@ -42,8 +42,9 @@ block sets ``route_custody: required``.
   labelled the inbound message (:func:`detached_auxiliary`, :func:`agent_vision_scope`).
   The last-resort hop to the main model asks the gate as well (:func:`main_route_refuses`), and a
   refusal in an auxiliary call ends that call's walk before built-in discovery
-  (:func:`discovery_refused`), whose candidates the gate sees only when that mark covers them.
-  :data:`HERMES_ROUTE_CUSTODY_PHASES` lists every phase.
+  (:func:`discovery_refused`), whose candidates the gate sees only when that mark covers them
+  (:func:`discovery_mark_refuses`). An availability probe builds stubs that cannot send, so it
+  asks no gate. :data:`HERMES_ROUTE_CUSTODY_PHASES` lists every phase.
   ``{"action": "skip"}`` refuses the candidate for this turn only. The hook fails closed: a
   callback that raises or times out refuses the candidate. An entry with ``route_custody:
   required`` also needs an explicit ``{"action": "allow"}``; any other value that is not an
@@ -1161,8 +1162,9 @@ def auxiliary_refuses(entry: Mapping[str, Any], *, task: Optional[str], failed_p
     fallback chain. The gate sees the task name, the data use stamped on the request's own
     messages, and, when the call serves an agent's turn (bound by :func:`begin_turn`, carried
     into compression workers through ContextVars), that turn's data use, session and labels. A
-    required entry is skipped while no gate is loaded."""
-    if not _gated(entry):
+    required entry is skipped while no gate is loaded. An availability probe asks no gate: it builds
+    stubs that cannot send, so a refusal there would only hide a tool, and its real call is judged."""
+    if not _gated(entry) or _availability_probe():
         return False
     from agent.message_metadata import data_use_requirement
     data_use = data_use_requirement(_AUX_REQUEST.get() or ())
@@ -1201,6 +1203,38 @@ def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str]) -> bo
     route = next((name for name in (resolved, provider) if main_route_marked(name)), None)
     return route is not None and main_route_refuses(route, model, task=task, failed_provider=str(route or ""),
                                                     failed_model=str(model or ""))
+
+
+# Built-in text discovery labels a candidate by its chain slot. ``local/custom`` runs as ``custom``;
+# ``api-key`` is whichever API-key provider answered first, so it names no one route.
+_DISCOVERY_ROUTES = {"local/custom": "custom", "api-key": ""}
+
+
+def discovery_mark_refuses(label: Any, model: Any, *, task: Optional[str]) -> bool:
+    """F12 for the client built-in text discovery picked, judged on the model it picked. Under a
+    marked block, a candidate that names no one provider is refused with no gate call."""
+    if not _main_route_marker()[1] or _availability_probe():
+        return False
+    name = str(label or "").strip().lower()
+    route = _DISCOVERY_ROUTES.get(name, name)
+    if route:
+        return marked_main_refuses(route, model, task=task)
+    logger.warning("Auxiliary %s: model.route_custody is set and discovery picked %s, which names no one "
+                   "provider; not sending", task or "call", name or "an unnamed route")
+    return True
+
+
+def judged_vision_client(provider: Any, client: Any, model: Any, judged: Any) -> tuple[Any, Any]:
+    """``(client, model)`` for a vision slot, judged again (F12) when the model it sends is not the
+    *judged* one the gate already saw, and ``(None, None)`` when there is no client or a refusal."""
+    if client is None or (model != judged and marked_main_refuses(provider, model, task="vision")):
+        return None, None
+    return client, model
+
+
+def _availability_probe() -> bool:
+    from agent.auxiliary_client import _aux_probe_active
+    return _aux_probe_active()
 
 
 def routes_exhausted(agent: Any, result: dict[str, Any], *, classified: Any, provider: Any,

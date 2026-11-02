@@ -241,8 +241,8 @@ class TestMarkedMainRoute:
     def test_vision_discovery_stops_at_a_candidate_the_mark_covers(self, hooks, marked):
         with patch.object(aux, "_vision_main_provider_client", return_value=(None, None)), \
                 patch.object(aux, "_resolve_strict_vision_backend", return_value=(MagicMock(), "m")) as strict:
-            assert aux._vision_auto_route({"provider": "zai", "model": "m"}, None, None, False) == (None, None, None)
-        strict.assert_not_called()
+            assert aux._vision_auto_route({"provider": "zai", "model": "m"}, None, None, False)[1] is None
+        strict.assert_called_once()  # judged on the model it picked, and the refusal ends the walk
 
     def test_vision_discovery_runs_a_candidate_the_gate_admits(self, hooks, marked):
         asked = []
