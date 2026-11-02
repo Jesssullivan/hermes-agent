@@ -128,6 +128,19 @@ class TestDelegatedChildRoute:
             route_hooks.begin_turn(child, messages=[], turn_id="t1")
         assert asked[0][3] == [TOOL_DATA]
 
+    def test_delegation_model_on_the_parents_provider_is_judged_on_the_childs_model(self, hooks):
+        asked = []
+
+        def custody(phase, candidate, **_kw):
+            asked.append((phase, candidate["provider"], candidate["model"]))
+            return {"action": "skip"} if candidate["model"] == "gpt-5" else {"action": "allow"}
+
+        hooks["route_custody"] = [custody]
+        child = _child_built_by_delegation(_parent_on_entry(), model="gpt-5")
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            route_hooks.begin_turn(child, messages=[{"role": "user", "content": "g"}], turn_id="t1")
+        assert asked == [("turn", "openrouter", "gpt-5")]
+
     def test_an_override_to_another_provider_carries_no_entry_and_keeps_the_data(self, hooks):
         hooks["route_custody"] = [lambda **_kw: {"action": "skip"}]
         parent = _parent_on_entry()
@@ -135,7 +148,8 @@ class TestDelegatedChildRoute:
         child = _child_built_by_delegation(parent, provider="anthropic", model="claude-opus-4")
         assert getattr(child, "_route_resolution_entry", None) is None
         assert route_hooks._session_data_use(child) == {TOOL_DATA}
-        route_hooks.begin_turn(child, messages=[], turn_id="t1")  # no RouteCustodyRefused
+        with pytest.raises(route_hooks.RouteCustodyRefused, match="anthropic/claude-opus-4"):
+            route_hooks.begin_turn(child, messages=[], turn_id="t1")  # judged as its own serving route
 
     def test_an_ungated_build_changes_nothing(self, hooks):
         child = _child_built_by_delegation(_agent())
@@ -255,10 +269,11 @@ class TestMainModelFallback:
         asked = []
         hooks["route_custody"] = [_skip_all(asked)]
         agent = _agent()
-        route_hooks.begin_turn(agent, messages=_stamped_rows(), turn_id="t1")
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            route_hooks.begin_turn(agent, messages=_stamped_rows(), turn_id="t1")  # binds the scope all the same
         with _main_route(), patch.object(aux, "resolve_provider_client"):
             aux._try_main_agent_model_fallback("zai", "compression")
-        assert asked[-1][3] == [TOOL_DATA]
+        assert asked[-1][0] == "auxiliary" and asked[-1][3] == [TOOL_DATA]
 
     def test_with_no_gate_nothing_changes(self, hooks):
         client = MagicMock()

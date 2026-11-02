@@ -300,7 +300,7 @@ class TestEndOfTurn:
         hooks["route_custody"] = [_resolve_allows_compaction_refuses(asked)]
         agent = _make_agent(session_id="same-context")
         route_hooks.bind_resolution_entry(agent, dict(RECORD))
-        with patch("agent.route_hooks._recheck_resolution_fallback"):  # admit the turn itself
+        with patch("agent.route_hooks._judge_serving_route", return_value=False):  # admit the turn itself
             _run_turn(agent)
         with _compression_seam(recorder), pytest.raises(route_hooks.RouteCustodyRefused):
             agent._compress_context(_transcript(), "")

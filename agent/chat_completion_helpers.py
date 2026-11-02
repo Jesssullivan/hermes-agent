@@ -2287,8 +2287,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     else:
         agent._safe_print(warning, diagnostic=True)
 
-    summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
-    summary_call_outcome = "failed"
+    from agent.turn_route_check import RouteCustodyRefused, check_summary_route
+    summary_api_request_id, summary_call_outcome = f"iteration-summary:{uuid.uuid4()}", "failed"
 
     # Shared constant so compaction recognizers can identify this runtime nudge by its stable
     # content after SessionDB projection strips metadata flags.
@@ -2297,13 +2297,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     try:
         api_messages = _iteration_summary_api_messages(agent, messages)
-        build_attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
-        attempt = build_attempt(agent, api_messages, summary_api_request_id)
 
         # One retry on an empty summary; a summary empty once its <think> block is stripped is NOT retried.
         final_response = _EMPTY_SUMMARY_RESPONSE
         for retry_count in (0, 1):
-            text = attempt(retry_count)
+            check_summary_route(agent, messages)  # custody may move the route: each attempt builds for its own
+            attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
+            text = attempt(agent, api_messages, summary_api_request_id)(retry_count)
             if not text:
                 continue
             if "<think>" in text:
@@ -2314,9 +2314,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = text
             break
 
-    except InterruptedError:
-        # Cancellation is not a summary failure: drop the unanswered nudge and let the
-        # finalizer end the turn as interrupted so the pending message is requeued.
+    except (InterruptedError, RouteCustodyRefused):
+        # Cancellation or a custody stop is not a summary failure: drop the unanswered nudge and let
+        # the finalizer end the turn on its own reason, so a pending message is requeued.
         summary_call_outcome = "cancelled"
         if messages and messages[-1] is nudge:
             messages.pop()

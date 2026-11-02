@@ -20,7 +20,9 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.route_hooks import ROUTE_CUSTODY_REASON, RouteCustodyRefused
 from agent.served_model import result_model_fields
+from agent.turn_route_check import ROUTE_CUSTODY_STOP_COPY
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
@@ -169,6 +171,8 @@ def _resolve_budget_fallback(
                 interrupted = True
                 _turn_exit_reason = interrupted_during_api_call_reason(agent)
                 final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
+            except RouteCustodyRefused:
+                final_response, _turn_exit_reason = ROUTE_CUSTODY_STOP_COPY, ROUTE_CUSTODY_REASON
 
     # A kanban worker must record a terminal outcome whether or not a fallback path
     # was eligible, so the dispatcher learns the worker could not complete. Only the
