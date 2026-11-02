@@ -161,11 +161,11 @@ class TestVisionModelInUse:
         assert asked[-1] == ("openrouter", "or-default")
 
 
-class TestRecordedLimits:
-    def test_a_custom_slot_at_the_marked_endpoint_is_read_by_name_only(self, hooks):
-        """hooks.md, Not covered: the mark is read by provider name. A ``custom`` slot whose base_url
-        is the marked provider's endpoint is not judged. This test changes when the mark learns
-        endpoint identity."""
+class TestMarkedEndpoint:
+    def test_a_custom_slot_at_the_marked_endpoint_is_judged_as_the_marked_route(self, hooks):
+        """The mark compares endpoints too: a ``custom`` slot whose base_url has the marked
+        provider's scheme, host and port is judged as that provider
+        (tests/agent/test_route_hooks_endpoint_compare.py)."""
         asked, client = [], MagicMock()
         hooks["route_custody"] = [_gate(asked)]
         with _mark("openrouter"), patch("hermes_cli.runtime_provider._get_named_custom_provider", return_value=None), \
@@ -173,7 +173,7 @@ class TestRecordedLimits:
                              return_value=("custom", "m", "https://openrouter.ai/api/v1", "k", None)), \
                 patch.object(aux, "resolve_provider_client", return_value=(client, "m")):
             assert aux.resolve_vision_provider_client()[1] is client
-        assert asked == []
+        assert asked == [("openrouter", "m")]
 
 
 class TestAvailabilityProbe:

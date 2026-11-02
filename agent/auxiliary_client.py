@@ -123,8 +123,8 @@ from agent.credential_pool import load_pool
 from agent.image_routing import _main_model_supports_vision
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
-from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, discovery_mark_refuses, discovery_refused
-from agent.route_hooks import judged_vision_client, main_route_marked, main_route_refuses, marked_main_refuses
+from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, client_base_url, discovery_mark_refuses, discovery_refused
+from agent.route_hooks import judged_auto_model, judged_vision_client, main_route_marked, main_route_refuses, marked_main_refuses
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4672,7 +4672,7 @@ def _resolve_auto_route(
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
     with auxiliary_walk():
-        if not marked_main_refuses(main_provider, main_model, task=task):  # route_custody (F12)
+        if not marked_main_refuses(main_provider, main_model, task=task, base_url=base_url):  # route_custody (F12)
             routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
             if routed is not None:
                 return routed
@@ -4688,7 +4688,7 @@ def _resolve_auto_route(
         if discovery_refused(task) or not _discovery_chain_allowed(main_provider, task):
             return None, None, ""
     client, model, label = _try_discovery_chain()
-    if client is not None and discovery_mark_refuses(_effective_provider_for_client(client, label), model, task=task):
+    if client is not None and discovery_mark_refuses(_effective_provider_for_client(client, label), model, task=task, base_url=client_base_url(client)):
         return None, None, ""  # route_custody (F12): a candidate the mark covers carries nothing unadmitted
     return client, model, label
 
@@ -4994,6 +4994,8 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
         logger.debug("Dropping OpenRouter-format model %r for non-OpenRouter "
                      "auxiliary provider (using %r instead)", model, resolved)
         model = None
+    if judged_auto_model(_effective_provider_for_client(client, effective_provider), client, model or resolved, resolved, task=req.task):
+        return None, None  # route_custody (F12): the slot's own model is judged on the route the walk picked
     routed_client, routed_model = _route_client(req, client, model or resolved)
     if routed_client is not None and effective_provider:
         try:
@@ -5506,7 +5508,7 @@ def resolve_provider_client(
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str, Any]] = None) -> tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    if marked_main_refuses(provider, model, task=task or None):  # route_custody (F12)
+    if marked_main_refuses(provider, model, task=task or None, base_url=base_url):  # route_custody (F12)
         return None, None
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
@@ -5576,7 +5578,7 @@ def _finalize_vision_client(
     """Apply the explicit model override (and async wrapping) to a resolved vision client. Route
     custody (F12) judges the model it sends, unless *judged* says the gate saw that one already."""
     final_model = resolved_model or default_model
-    if sync_client is None or (final_model != judged and marked_main_refuses(resolved_provider, final_model, task="vision")):
+    if sync_client is None or (final_model != judged and marked_main_refuses(resolved_provider, final_model, task="vision", base_url=client_base_url(sync_client))):
         return resolved_provider, None, None
     if async_mode:
         async_client, async_model = _to_async_client(sync_client, final_model, is_vision=True)
@@ -5687,14 +5689,14 @@ def resolve_vision_provider_client(
     raw_requested, requested = requested, _normalize_vision_provider(requested)
     if resolved_base_url:
         provider_for_base_override = requested if requested and requested not in {"", "auto"} else "custom"
-        if marked_main_refuses(provider_for_base_override, resolved_model, task="vision"):
+        if marked_main_refuses(provider_for_base_override, resolved_model, task="vision", base_url=resolved_base_url):
             return provider_for_base_override, None, None  # route_custody (F12)
         client, final_model = resolve_provider_client(
             provider_for_base_override, model=resolved_model, async_mode=async_mode,
             explicit_base_url=resolved_base_url, explicit_api_key=resolved_api_key,
             api_mode=resolved_api_mode, main_runtime=runtime,
         )
-        return provider_for_base_override, *judged_vision_client(provider_for_base_override, client, final_model, resolved_model)
+        return provider_for_base_override, *judged_vision_client(provider_for_base_override, client, final_model, resolved_model, resolved_base_url)
     if requested == "auto":
         return _vision_auto_route(runtime, resolved_model, resolved_api_mode, async_mode)
     if requested in _VISION_AUTO_PROVIDER_ORDER:
@@ -6020,7 +6022,7 @@ def _get_cached_client(
         if not local[0]:
             return None, None
         base_url, api_key = local
-    if marked_main_refuses(provider, model, task=task):  # route_custody (F12): a slot naming the marked route
+    if marked_main_refuses(provider, model, task=task, base_url=base_url):  # route_custody (F12): names or reaches the mark
         return None, None
     current_loop = _current_event_loop() if async_mode else None
     runtime = _normalize_main_runtime(main_runtime)

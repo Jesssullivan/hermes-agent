@@ -63,6 +63,7 @@ model and the main fallback chain.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -1192,17 +1193,81 @@ def main_route_refuses(provider: Any, model: Any, *, task: Optional[str], failed
                              failed_provider=failed_provider, failed_model=failed_model)
 
 
-def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str]) -> bool:
+def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str], base_url: Any = None) -> bool:
     """F3 for an auxiliary slot about to ride a route ``model.route_custody`` marks. A slot's spelling
     (``main``, ``custom:main``, ``custom:<provider>``, ``codex``) can name another route than the one
-    it resolves to, so the mark is read on both, and the gate sees the first name the mark covers."""
+    it resolves to, so the mark is read on both, and the gate sees the first name the mark covers.
+    A slot whose *base_url* reaches the marked route's endpoint is judged too (:func:`_endpoint_route`)."""
     if not _main_route_marker()[1]:
         return False
     from agent.auxiliary_client import _normalize_aux_provider
     resolved = _normalize_aux_provider(provider) if str(provider or "").strip() else ""
     route = next((name for name in (resolved, provider) if main_route_marked(name)), None)
+    if route is None:
+        route = _endpoint_route(resolved or provider, base_url)
     return route is not None and main_route_refuses(route, model, task=task, failed_provider=str(route or ""),
                                                     failed_model=str(model or ""))
+
+
+def _endpoint_route(provider: Any, base_url: Any) -> Optional[str]:
+    """The name the gate sees for a slot at *base_url* that no marked name covers: the marked provider
+    when the slot's scheme, host and port are the marked route's, and the slot's own name (else
+    ``custom``) when the marked route's endpoint cannot be resolved (fail closed). ``None`` otherwise."""
+    url = str(base_url or "").strip()
+    if not url:
+        return None
+    from utils import base_url_origin
+    origins, origin = _marked_route_origins(), base_url_origin(url)
+    if not origins:
+        if "\0endpoint" not in _warned_values:
+            _warned_values.add("\0endpoint")
+            logger.warning("Route custody: the marked route's endpoint cannot be resolved; judging every base_url slot")
+        return str(provider or "").strip() or "custom"
+    if origin in origins or not origin[1]:
+        return _main_route_marker()[0]
+    return None
+
+
+def _marked_route_origins() -> frozenset[tuple[str, str, int]]:
+    """``(scheme, host, port)`` of every endpoint the marked route can reach: the block's ``base_url``,
+    the named custom provider's, its provider's registry and catalog endpoints and their env
+    overrides, and the bound main runtime's when the mark covers that runtime. Empty when none resolves or a
+    lookup fails, so the caller judges every slot with a ``base_url``. Reads no credential."""
+    from utils import base_url_origin
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        from hermes_cli.config import read_raw_config_readonly
+        from hermes_cli.config_read_errors import FailedConfigRead
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+        from agent.auxiliary_client import _normalize_main_runtime
+        config = read_raw_config_readonly()
+        if config is None or isinstance(config, FailedConfigRead):
+            return frozenset()
+        block = config.get("model") if isinstance(config.get("model"), Mapping) else {}
+        main_provider = _main_route_marker()[0]
+        urls = [block.get("base_url")]
+        named = _get_named_custom_provider(main_provider, resolve_credentials=False) if main_provider else None
+        urls.append((named or {}).get("base_url"))
+        forms = _provider_forms(main_provider)
+        for form in forms:
+            pconfig = PROVIDER_REGISTRY.get(form)
+            if pconfig is not None:
+                urls += [pconfig.inference_base_url, os.environ.get(pconfig.base_url_env_var or "")]
+            with suppress(Exception):  # the catalog adds endpoints; a failed lookup removes none
+                from hermes_cli.providers import get_provider
+                pdef = get_provider(form, allow_network=False)
+                urls += [pdef.base_url, os.environ.get(pdef.base_url_env_var or "")] if pdef else []
+        if "openrouter" in forms:
+            from hermes_constants import OPENROUTER_BASE_URL
+            urls.append(OPENROUTER_BASE_URL)
+        runtime = _normalize_main_runtime(None)
+        if str(runtime.get("provider") or "").strip() and main_route_marked(runtime.get("provider")):
+            urls.append(runtime.get("base_url"))
+    except Exception:  # health: allow BLE001 -- an unresolved endpoint judges every base_url slot
+        logger.debug("Route custody: marked endpoint lookup failed", exc_info=True)
+        return frozenset()
+    origins = {base_url_origin(str(url)) for url in urls if isinstance(url, str) and url.strip()}
+    return frozenset(origin for origin in origins if origin[1])
 
 
 # Built-in text discovery labels a candidate by its chain slot. ``local/custom`` runs as ``custom``;
@@ -1210,24 +1275,45 @@ def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str]) -> bo
 _DISCOVERY_ROUTES = {"local/custom": "custom", "api-key": ""}
 
 
-def discovery_mark_refuses(label: Any, model: Any, *, task: Optional[str]) -> bool:
-    """F12 for the client built-in text discovery picked, judged on the model it picked. Under a
-    marked block, a candidate that names no one provider is refused with no gate call."""
+def discovery_mark_refuses(label: Any, model: Any, *, task: Optional[str], base_url: Any = None) -> bool:
+    """F12 for the client built-in text discovery picked, judged on the model it picked and on the
+    client's *base_url*. Under a marked block, a candidate that names no one provider is refused
+    with no gate call."""
     if not _main_route_marker()[1] or _availability_probe():
         return False
     name = str(label or "").strip().lower()
     route = _DISCOVERY_ROUTES.get(name, name)
     if route:
-        return marked_main_refuses(route, model, task=task)
+        return marked_main_refuses(route, model, task=task, base_url=base_url)
     logger.warning("Auxiliary %s: model.route_custody is set and discovery picked %s, which names no one "
                    "provider; not sending", task or "call", name or "an unnamed route")
     return True
 
 
-def judged_vision_client(provider: Any, client: Any, model: Any, judged: Any) -> tuple[Any, Any]:
+def client_base_url(client: Any) -> str:
+    """The base URL a built client sends to, read from it or from the client it wraps; ``""`` if none."""
+    import httpx
+    for obj in (client, getattr(client, "_client", None), getattr(client, "client", None)):
+        url = getattr(obj, "base_url", None) if obj is not None else None
+        if isinstance(url, (str, httpx.URL)) and str(url).strip():
+            return str(url)
+    return ""
+
+
+def judged_auto_model(label: Any, client: Any, model: Any, judged: Any, *, task: Optional[str]) -> bool:
+    """F12 for an ``auto`` text slot that names its own model: the walk judged the route *label* names
+    on *judged*, and *client* sends *model*. Judged again on *model* when the two differ."""
+    if model == judged:
+        return False
+    name = str(label or "").strip().lower()
+    return marked_main_refuses(_DISCOVERY_ROUTES.get(name, name), model, task=task, base_url=client_base_url(client))
+
+
+def judged_vision_client(provider: Any, client: Any, model: Any, judged: Any,
+                         base_url: Any = None) -> tuple[Any, Any]:
     """``(client, model)`` for a vision slot, judged again (F12) when the model it sends is not the
     *judged* one the gate already saw, and ``(None, None)`` when there is no client or a refusal."""
-    if client is None or (model != judged and marked_main_refuses(provider, model, task="vision")):
+    if client is None or (model != judged and marked_main_refuses(provider, model, task="vision", base_url=base_url)):
         return None, None
     return client, model
 
