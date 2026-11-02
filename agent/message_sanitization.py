@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterable, NamedTuple
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER, hidden_interrupt_placeholder_row
 from agent.message_metadata import DB_ROW_SNAPSHOT
 from agent.vision_message_prep import _provider_model_key
+from utils import KIMI_CODE_HOSTS
 
 logger = logging.getLogger(__name__)
 
@@ -643,7 +644,7 @@ def _set_provider_tool_id(tc: Any, key: str, value: str) -> None:
 # carrier; only wire copies are shaped here.
 _REASONING_ECHO_RULES: tuple = (
     # (family, exact providers (raw), exact providers (lowered), model substrings (lowered), hosts)
-    ("kimi", frozenset({"kimi-coding", "kimi-coding-cn"}), frozenset(), (), ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
+    ("kimi", frozenset({"kimi-coding", "kimi-coding-cn"}), frozenset(), (), (*KIMI_CODE_HOSTS, "moonshot.ai", "moonshot.cn")),
     ("deepseek", frozenset(), frozenset({"deepseek"}), ("deepseek",), ("api.deepseek.com",)),
     ("mimo", frozenset(), frozenset({"xiaomi"}), ("mimo",), ("api.xiaomimimo.com", "xiaomimimo.com")),
     # Portal stealth model that 400s on a tool-call turn without reasoning_content (f86276d2ebc).

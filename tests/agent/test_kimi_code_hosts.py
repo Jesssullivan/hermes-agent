@@ -1,6 +1,8 @@
 """TIN-7696 D17: api.kimi.ai takes the same gates as api.kimi.com. No test leaves the process."""
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -9,9 +11,12 @@ from agent.anthropic_adapter import _auth_style, build_anthropic_client
 from agent.agent_init import _host_default_headers_factory
 from agent.auxiliary_client import _endpoint_default_headers, _endpoint_speaks_anthropic_messages, _to_openai_base_url
 from agent.client_lifecycle import _ROUTE_DEFAULT_HEADERS
+from agent.message_sanitization import needs_reasoning_echo, reasoning_echo_family
 from agent.model_metadata import _endpoint_scoped_context_length
 from hermes_cli.providers import host_mandated_api_mode
 from hermes_cli.runtime_provider import _detect_api_mode_for_url
+from run_agent import AIAgent
+from trajectory_compressor import TrajectoryCompressor
 from utils import KIMI_CODE_HOSTS, KIMI_CODE_USER_AGENT
 
 BASES = [f"https://{host}/coding{suffix}" for host in KIMI_CODE_HOSTS for suffix in ("", "/v1")]
@@ -42,6 +47,33 @@ def test_rebuilt_openai_clients_and_the_coding_rewrite_cover_each_host(host):
     assert host in [row[0] for row in _ROUTE_DEFAULT_HEADERS]
     assert _to_openai_base_url(f"https://{host}/coding") == f"https://{host}/coding/v1"
     assert _endpoint_scoped_context_length("k3", f"https://{host}/coding") == 1_048_576
+
+
+@pytest.mark.parametrize("base", BASES)
+@patch("agent.process_bootstrap.OpenAI")
+def test_a_rebuilt_openai_client_sends_the_model_user_agent(mock_openai, base):
+    """/model and credential rotation rebuild client kwargs through this path. Attribution stays."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", model="test/model",
+                    quiet_mode=True, skip_context_files=True, skip_memory=True)
+    agent._apply_client_headers_for_base_url(base)
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["User-Agent"] == KIMI_CODE_USER_AGENT
+    assert headers["X-Title"] == "Hermes Agent"
+
+
+@pytest.mark.parametrize("base", BASES)
+def test_the_reasoning_echo_rule_covers_each_host(base):
+    """A custom provider name reaches the rule through the host alone. Tool-call turns 400 without the pad."""
+    assert reasoning_echo_family("custom", "other-model", base) == "kimi"
+    assert needs_reasoning_echo("custom", "other-model", base)
+
+
+@pytest.mark.parametrize("base", BASES)
+def test_the_trajectory_compressor_detects_each_host(base):
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = SimpleNamespace(base_url=base)
+    assert compressor._detect_provider() == "kimi-coding"
 
 
 @pytest.mark.parametrize("base", BASES)
@@ -80,3 +112,7 @@ def test_lookalikes_do_not_take_the_kimi_gates(base):
     assert _detect_api_mode_for_url(base) is None
     assert not _endpoint_speaks_anthropic_messages(base)
     assert _auth_style("token", base, base) != "kimi"
+    assert reasoning_echo_family("custom", "other-model", base) is None
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = SimpleNamespace(base_url=base)
+    assert compressor._detect_provider() == ""
