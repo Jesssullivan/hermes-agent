@@ -98,6 +98,9 @@ ROUTE_CUSTODY_REQUIRED = "required"
 # Runtime and agent-kwargs key a resolution-time walker stamps with the entry it chose. Callers pop
 # it before an ``AIAgent(**kwargs)`` spread and hand it to :func:`bind_resolution_entry`.
 ROUTE_ENTRY_KEY = "_route_fallback_entry"
+# Candidate key: the name a slot used when it is judged as the marked route under another name. The
+# gate sees it as ``candidate["slot_provider"]``, for audit; ``candidate["provider"]`` stays the marked name.
+_SLOT_PROVIDER_KEY = "_route_slot_provider"
 # Values that leave an entry ungated. Any other value (``true``, ``yes``, a typo) counts as
 # required, with a warning, so a misspelt gate fails closed instead of open.
 _ROUTE_CUSTODY_OFF = frozenset({"", "optional", "off", "none", "no", "false"})
@@ -233,10 +236,31 @@ def _marked_forms(main_provider: str) -> frozenset[str]:
 
 
 def entry_requires_custody(entry: Mapping[str, Any]) -> bool:
-    """Whether an entry needs an explicit ``allow``: its own key does, or its provider is the main
-    route's and ``model.route_custody`` marks that route."""
+    """Whether an entry needs an explicit ``allow``: its own key does, or ``model.route_custody`` marks
+    the main route and the entry names that route or sends to its endpoint (:func:`_entry_endpoint_route`)."""
     return (_custody_value_required(entry.get(ROUTE_CUSTODY_KEY), entry.get("provider"), entry.get("model"))
-            or main_route_marked(entry.get("provider"), entry.get("resolved_provider")))
+            or _entry_marked_by_name(entry) or _entry_endpoint_route(entry) is not None)
+
+
+def _entry_marked_by_name(entry: Mapping[str, Any]) -> bool:
+    return main_route_marked(entry.get("provider"), entry.get("resolved_provider"))
+
+
+def _entry_endpoint_route(entry: Mapping[str, Any]) -> Optional[str]:
+    """The marked provider, for an entry that has a URL at the marked endpoint: its own ``base_url`` or the
+    ``base_url`` of its provider's ``providers`` entry (:func:`_endpoint_route`). A lookup that fails counts
+    as reaching it. ``None`` otherwise, and with no mark. The lookup reads no credential."""
+    if not _main_route_marker()[1]:
+        return None
+    urls, provider = [entry.get("base_url")], str(entry.get("provider") or "").strip()
+    if provider:
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+            urls.append((_get_named_custom_provider(provider, resolve_credentials=False) or {}).get("base_url"))
+        except Exception:  # health: allow BLE001 -- an unreadable providers entry fails closed
+            logger.debug("Route custody: providers entry lookup failed for %s", provider, exc_info=True)
+            return _main_route_marker()[0]
+    return next((route for url in urls if isinstance(url, str) and (route := _endpoint_route(url)) is not None), None)
 
 
 def _gated(entry: Mapping[str, Any]) -> bool:
@@ -329,7 +353,12 @@ def custody_refuses(entry: Mapping[str, Any], *, phase: str, current: dict[str, 
                     labels_known: bool = True) -> bool:
     """Ask ``route_custody`` (F3) whether *entry* may carry this turn. Fails closed, and refuses
     without asking when ``turn_route`` failed for this turn (*labels_known* false)."""
-    candidate = _route(entry.get("provider"), entry.get("model"))
+    candidate, slot = _route(entry.get("provider"), entry.get("model")), entry.get(_SLOT_PROVIDER_KEY)
+    marked_as = None if slot or _entry_marked_by_name(entry) else _entry_endpoint_route(entry)
+    if marked_as is not None:  # an entry at the marked endpoint is judged as the marked route
+        candidate, slot = _route(marked_as, entry.get("model")), entry.get("provider")
+    if str(slot or "").strip():
+        candidate["slot_provider"] = str(slot).strip().lower()
     required = entry_requires_custody(entry)
     if not _has_hook(ROUTE_CUSTODY_HOOK):
         if required:
@@ -1184,13 +1213,16 @@ def auxiliary_refuses(entry: Mapping[str, Any], *, task: Optional[str], failed_p
 
 
 def main_route_refuses(provider: Any, model: Any, *, task: Optional[str], failed_provider: str,
-                       failed_model: Optional[str] = None) -> bool:
+                       failed_model: Optional[str] = None, slot_provider: Any = None) -> bool:
     """F3 for an auxiliary call's last-resort hop to the main model. The main route has no chain entry
-    of its own, so the candidate takes the custody key of the gated entry the scope agent runs on."""
+    of its own, so the candidate takes the custody key of the gated entry the scope agent runs on.
+    *slot_provider* names the slot judged as this route, for the gate's audit."""
     agent = _scope_agent()
     active = _active_entry(agent) if agent is not None else None
-    return auxiliary_refuses({**(active or {}), "provider": provider, "model": model}, task=task,
-                             failed_provider=failed_provider, failed_model=failed_model)
+    candidate = {**(active or {}), "provider": provider, "model": model}
+    if str(slot_provider or "").strip():
+        candidate[_SLOT_PROVIDER_KEY] = slot_provider
+    return auxiliary_refuses(candidate, task=task, failed_provider=failed_provider, failed_model=failed_model)
 
 
 def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str], base_url: Any = None) -> bool:
@@ -1201,11 +1233,13 @@ def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str], base_
     if not _main_route_marker()[1]:
         return False
     route = _marked_route(provider, base_url)
-    return route is not None and _refused_as(route, model, task)
+    return route is not None and _refused_as(route, model, task, provider)
 
 
-def _refused_as(route: Any, model: Any, task: Optional[str]) -> bool:
-    return main_route_refuses(route, model, task=task, failed_provider=str(route or ""), failed_model=str(model or ""))
+def _refused_as(route: Any, model: Any, task: Optional[str], slot_provider: Any) -> bool:
+    """Ask the gate about the marked *route*, with *slot_provider* naming the slot for audit."""
+    return main_route_refuses(route, model, task=task, failed_provider=str(route or ""), failed_model=str(model or ""),
+                              slot_provider=slot_provider)
 
 
 def _marked_route(provider: Any, base_url: Any) -> Optional[str]:
@@ -1229,7 +1263,46 @@ def judged_built_client(provider: Any, client: Any, model: Any, *, task: Optiona
     if _normalize_aux_provider(provider) == "auto" or _marked_route(provider, base_url) is not None:
         return client, model
     route = _endpoint_route(client_base_url(client))
-    return (None, None) if route is not None and _refused_as(route, model, task) else (client, model)
+    return (None, None) if route is not None and _refused_as(route, model, task, provider) else (client, model)
+
+
+def judged_entry_client(entry: Mapping[str, Any], client: Any, model: Any, *, task: Optional[str]) -> tuple[Any, Any]:
+    """:func:`judged_built_client` for the client a fallback chain entry built. An entry that names the
+    marked route or has a URL at its endpoint was judged as that route before the build
+    (:func:`entry_requires_custody`), so only another entry is judged on the URL its client sends to."""
+    if _entry_marked_by_name(entry) or _entry_endpoint_route(entry) is not None:
+        return client, model
+    return judged_built_client(entry.get("provider"), client, model, task=task)
+
+
+def vision_send_refused(provider: Any, client: Any, model: Any, judged: Any, judged_url: Any = None) -> bool:
+    """F12 for the client a vision backend built, ``True`` with no client. When the gate saw another
+    model, *model* is judged at the URL the client sends to. Otherwise the client is judged on that URL
+    unless the route was judged before the build, by name or at *judged_url* (:func:`judged_built_client`)."""
+    if client is None:
+        return True
+    if model != judged:
+        return marked_main_refuses(provider, model, task="vision", base_url=client_base_url(client))
+    return judged_built_client(provider, client, model, task="vision", base_url=judged_url)[0] is None
+
+
+def auto_client_judged_each_call(main_provider: Any, task: Optional[str]) -> bool:
+    """Whether an ``auto`` slot's cached client is dropped, so its walk judges the route again on each
+    call: the mark covers the main route, or the main or the task fallback chain the walk reads holds an
+    entry that needs an ``allow``. A chain that cannot be read counts as holding one."""
+    if main_route_marked(main_provider):
+        return True
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+        chain = list(get_fallback_chain(load_config_readonly()) or ())
+        task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
+        chain += task_chain if isinstance(task_chain, list) else []
+    except Exception:  # health: allow BLE001 -- an unreadable chain judges every call
+        logger.debug("Route custody: fallback chain read failed for an auto slot", exc_info=True)
+        return True
+    return any(isinstance(entry, Mapping) and entry_requires_custody(entry) for entry in chain)
 
 
 def _endpoint_route(base_url: Any) -> Optional[str]:
@@ -1253,7 +1326,8 @@ def _endpoint_route(base_url: Any) -> Optional[str]:
 def _marked_route_origins() -> frozenset[tuple[str, str, int]]:
     """``(scheme, host, port)`` of every endpoint the marked route can reach: the block's ``base_url``,
     the named custom provider's, its provider's registry and catalog endpoints and their env
-    overrides, and the bound main runtime's when the mark covers that runtime. Empty when none resolves or a
+    overrides, the endpoints its key can select (:func:`_key_selected_endpoints`), and the bound main
+    runtime's when the mark covers that runtime. Empty when none resolves or a
     lookup fails, so the caller judges every slot with a ``base_url``. Reads no credential."""
     from utils import base_url_origin
     try:
@@ -1282,6 +1356,7 @@ def _marked_route_origins() -> frozenset[tuple[str, str, int]]:
         if "openrouter" in forms:
             from hermes_constants import OPENROUTER_BASE_URL
             urls.append(OPENROUTER_BASE_URL)
+        urls += _key_selected_endpoints(forms)
         runtime = _normalize_main_runtime(None)
         if str(runtime.get("provider") or "").strip() and main_route_marked(runtime.get("provider")):
             urls.append(runtime.get("base_url"))
@@ -1290,6 +1365,15 @@ def _marked_route_origins() -> frozenset[tuple[str, str, int]]:
         return frozenset()
     origins = {base_url_origin(str(url)) for url in urls if isinstance(url, str) and url.strip()}
     return frozenset(origin for origin in origins if origin[1])
+
+
+def _key_selected_endpoints(forms: frozenset[str]) -> list[str]:
+    """Endpoints a provider's base URL resolver can pick from its key instead of the registry default
+    (``hermes_cli.auth._API_KEY_BASE_URL_RESOLVERS``): Kimi Code for an ``sk-kimi-`` key, and each Z.AI
+    region the probe can select."""
+    from hermes_cli.auth_zai_kimi import KIMI_CODE_BASE_URL, ZAI_ENDPOINTS
+    urls = [KIMI_CODE_BASE_URL] if forms & {"kimi-coding", "kimi-coding-cn"} else []
+    return urls + ([endpoint[1] for endpoint in ZAI_ENDPOINTS] if "zai" in forms else [])
 
 
 # Built-in text discovery labels a candidate by its chain slot. ``local/custom`` runs as ``custom``;

@@ -124,7 +124,7 @@ from agent.image_routing import _main_model_supports_vision
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
 from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, client_base_url, discovery_mark_refuses, discovery_refused
-from agent.route_hooks import judged_auto_model, judged_built_client, judged_vision_client, main_route_marked, main_route_refuses, marked_main_refuses
+from agent.route_hooks import auto_client_judged_each_call, judged_auto_model, judged_built_client, judged_entry_client, judged_vision_client, main_route_refuses, marked_main_refuses, vision_send_refused
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4415,7 +4415,7 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
         label = f"fallback_chain[{i}]({fb_provider})"
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = judged_entry_client(entry, *_resolve_fallback_entry(entry), task=task)  # route_custody (F12)
         except Exception:
             fb_client, resolved_model = None, None
         if fb_client is not None:
@@ -4506,7 +4506,7 @@ def _try_main_fallback_chain(
             tried.append(f"{label} (unhealthy)")
             continue
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = judged_entry_client(entry, *_resolve_fallback_entry(entry), task=task)  # route_custody (F12)
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
@@ -5573,12 +5573,12 @@ def get_available_vision_backends() -> list[str]:
 
 def _finalize_vision_client(
     resolved_provider: str, sync_client: Any, default_model: Optional[str],
-    resolved_model: Optional[str], async_mode: bool, judged: Any = ...,
+    resolved_model: Optional[str], async_mode: bool, judged: Any = ..., judged_url: Any = None,
 ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
     """Apply the explicit model override (and async wrapping) to a resolved vision client. Route
-    custody (F12) judges the model it sends, unless *judged* says the gate saw that one already."""
+    custody (F12) judges the model it sends and the URL the client sends to (route_hooks.vision_send_refused)."""
     final_model = resolved_model or default_model
-    if sync_client is None or (final_model != judged and marked_main_refuses(resolved_provider, final_model, task="vision", base_url=client_base_url(sync_client))):
+    if vision_send_refused(resolved_provider, sync_client, final_model, judged, judged_url):
         return resolved_provider, None, None
     if async_mode:
         async_client, async_model = _to_async_client(sync_client, final_model, is_vision=True)
@@ -5650,11 +5650,11 @@ def _vision_auto_route(
     if main_provider and main_provider not in {"auto", "", "moa"}:
         vision_default = _resolve_provider_vision_default(main_provider)  # the model step 1 sends
         judged = resolved_model or (vision_default if main_provider == "nous" else vision_default or main_model)
-        if marked_main_refuses(main_provider, judged, task="vision"):
+        if marked_main_refuses(main_provider, judged, task="vision", base_url=runtime.get("base_url")):
             return None, None, None  # route_custody (F12): no image leaves, and no discovery follows a refusal
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode, vision_default)
         if client is not None:
-            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode, judged)
+            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode, judged, runtime.get("base_url"))
     # Aggregators use their dedicated vision model, not the user's main model.
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:
@@ -6030,10 +6030,10 @@ def _get_cached_client(
         provider, async_mode=async_mode, base_url=base_url, api_key=api_key, api_mode=api_mode,
         main_runtime=main_runtime, is_vision=is_vision, task=task, model=model,
     )
-    auto_marked, hit = provider == "auto" and main_route_marked(runtime.get("provider") or _read_main_provider()), None
+    auto_marked, hit = provider == "auto" and auto_client_judged_each_call(runtime.get("provider") or _read_main_provider(), task), None
     with _client_cache_lock:
         if auto_marked:
-            _client_cache.pop(cache_key, None)  # an ``auto`` client on a marked route is judged each call
+            _client_cache.pop(cache_key, None)  # an ``auto`` client on a marked route or a required chain entry is judged each call
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
             loop_ok = not async_mode or (
