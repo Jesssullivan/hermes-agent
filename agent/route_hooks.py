@@ -40,7 +40,8 @@ block sets ``route_custody: required``.
   before a turn (gateway, ``/background``, the CLI's text image mode) checks such a route with
   ``phase="auxiliary"`` and ``task="vision"`` before an image leaves, after ``turn_route`` has
   labelled the inbound message (:func:`detached_auxiliary`, :func:`agent_vision_scope`).
-  The last-resort hop to the main model asks the gate as well (:func:`main_route_refuses`), and a
+  The last-resort hop to the main model asks the gate as well (:func:`main_route_refuses`), and its
+  built client is judged at the URL it sends to (:func:`judged_built_client`). A
   refusal in an auxiliary call ends that call's walk before built-in discovery
   (:func:`discovery_refused`), whose candidates the gate sees only when that mark covers them
   (:func:`discovery_mark_refuses`). An availability probe builds stubs that cannot send, so it
@@ -605,17 +606,20 @@ def exit_compaction_scope(tokens: tuple[Any, Any]) -> None:
 
 class _DetachedRoute:
     """The route and session of a call that runs with no agent: a ``session.mutate compress``
-    summary, or gateway vision enrichment before the turn's agent exists."""
+    summary, or gateway vision enrichment before the turn's agent exists. *base_url* is the URL the
+    resolved runtime sends to, so its entry is judged there as an agent's is."""
 
-    def __init__(self, *, session_id: str, provider: str, model: str, platform: str = "") -> None:
+    def __init__(self, *, session_id: str, provider: str, model: str, platform: str = "", base_url: Any = "") -> None:
         self.session_id, self.provider, self.model, self.platform = session_id, provider, model, platform
+        self.base_url = base_url
 
 
 @contextmanager
 def _detached_scope(record: Any, *, session_id: Any, provider: Any, model: Any, messages: list, platform: str,
-                    phase: str, task: str = "", check: bool = True, parent: Any = None) -> Iterator[None]:
+                    phase: str, task: str = "", check: bool = True, parent: Any = None,
+                    base_url: Any = "") -> Iterator[None]:
     route = _DetachedRoute(session_id=str(session_id or ""), provider=str(provider or ""), model=str(model or ""),
-                           platform=platform)
+                           platform=platform, base_url=base_url)
     bind_resolution_entry(route, record or _session_entry(session_id), source="detached")
     tokens, known_token = enter_compaction_scope(route, messages), None
     try:
@@ -644,27 +648,30 @@ def _check_parent_route(parent: Any, *, phase: str, task: str, messages: list, l
 
 @contextmanager
 def detached_compaction(record: Any, *, session_id: str, provider: str, model: str, messages: list,
-                        platform: str = "") -> Iterator[None]:
+                        platform: str = "", base_url: Any = "") -> Iterator[None]:
     """Route scope and custody for a compaction that summarizes *messages* on a resolved runtime
     with no agent: the auxiliary gate sees the session's labels and the messages' data use, and a
-    gated resolution-time *record* is checked first. Raises :class:`RouteCustodyRefused`."""
+    gated resolution-time *record* is checked first, at the runtime's *base_url*. Raises
+    :class:`RouteCustodyRefused`."""
     with _detached_scope(record, session_id=session_id, provider=provider, model=model, messages=messages,
-                         platform=platform, phase="compaction"):
+                         platform=platform, phase="compaction", base_url=base_url):
         yield
 
 
 @contextmanager
 def detached_auxiliary(record: Any, *, task: str, session_id: Any, provider: Any, model: Any, messages: list,
-                       rides_main: bool = True, platform: str = "", parent: Any = None) -> Iterator[None]:
+                       rides_main: bool = True, platform: str = "", parent: Any = None,
+                       base_url: Any = "") -> Iterator[None]:
     """Route scope and custody for an auxiliary call made outside any turn, such as gateway vision
     enrichment or a side question. *messages* is the session transcript and the inbound message.
     When the call rides the session's resolved main route (*rides_main*) and that route is a gated
     resolution-time *record*, ``turn_route`` labels *messages* first, then the entry is checked
-    (``phase="auxiliary"``, *task*) with the session's labels and the transcript's data use. The
-    route of a live *parent* the call may fork from is checked the same way. Raises
-    :class:`RouteCustodyRefused`."""
+    (``phase="auxiliary"``, *task*) at the runtime's *base_url*, with the session's labels and the
+    transcript's data use. The route of a live *parent* the call may fork from is checked the same
+    way. Raises :class:`RouteCustodyRefused`."""
     with _detached_scope(record, session_id=session_id, provider=provider, model=model, messages=messages,
-                         platform=platform, phase="auxiliary", task=task, check=rides_main, parent=parent):
+                         platform=platform, phase="auxiliary", task=task, check=rides_main, parent=parent,
+                         base_url=base_url):
         yield
 
 
@@ -980,18 +987,25 @@ def _resolution_fallback_entry(agent: Any) -> Optional[Mapping[str, Any]]:
     agent was built on it (``bound_route``), in canonical form on every side. Any other model on
     that provider (``/model``, a request route, ``delegation.model``, a rewrite such as
     ``nous/welcome``) is still the entry's route, with the model in use, so the gate judges what
-    will carry the data. So is a blank provider, which proves no move. ``None`` with no record, no
-    gate, or after the agent moved to another provider, which is logged once at warning."""
+    will carry the data. So is a blank provider, which proves no move. The entry is judged at the URL
+    the agent sends to now, when it has one, as a kept fallback is (:func:`_active_entry`): a
+    delegation ``base_url`` or a later move on the same provider leaves the record's URLs behind.
+    ``None`` with no record, no gate, or after the agent moved to another provider, which is logged
+    once at warning."""
     record = getattr(agent, "_route_resolution_entry", None)
-    if not isinstance(record, Mapping) or not _gated(record):
+    if not isinstance(record, Mapping):
         return None
+    url = _public_url(_agent_route(agent).get("base_url"))
+    entry = {**record, "base_url": url, "resolved_base_url": url} if url else record
     current = _current_route(agent)
     if not current["provider"] or _record_provider_forms(record) & _provider_forms(current["provider"]):
+        if not _gated(entry):
+            return None
         models = (str(record.get("model") or ""), str(record.get("resolved_model") or ""))
         if not current["model"] or _same_model(models, current["model"], current["provider"]):
-            return record
-        return {**record, "model": current["model"], "resolved_model": current["model"]}
-    if isinstance(record, dict) and not record.get("left_warned"):
+            return entry
+        return {**entry, "model": current["model"], "resolved_model": current["model"]}
+    if _gated(record) and isinstance(record, dict) and not record.get("left_warned"):
         record["left_warned"] = True
         logger.warning("Route custody: the agent left the resolution-time entry %s/%s (now %s/%s); "
                        "turn starts no longer check it", record.get("provider"), record.get("model"),

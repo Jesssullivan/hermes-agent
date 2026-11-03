@@ -72,7 +72,7 @@ async def prepare_compress(authority, live, payload, prepared):
         # labels and the transcript's data use, and give the auxiliary gate the same scope.
         with policy_scope(policy, authority=authority), detached_compaction(
                 route_entry, session_id=snapshot['target'], provider=runtime.get('provider') or '', model=model,
-                messages=head):
+                messages=head, base_url=runtime.get('base_url') or ''):
             from agent.conversation_compression import _pre_compress_memory_context
             memory_context = _pre_compress_memory_context(resident, head, False) if resident is not None else ''
             compressor = ContextCompressor(model, base_url=runtime.get('base_url') or '',

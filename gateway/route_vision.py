@@ -41,7 +41,7 @@ async def vision_under_custody(
         with scoped_runtime_main(runtime or None), detached_auxiliary(
                 record, task="vision", session_id=session_id, provider=runtime.get("provider"),
                 model=runtime.get("model"), messages=messages, rides_main=vision_rides_main_route(runtime),
-                platform=platform):
+                platform=platform, base_url=runtime.get("base_url")):
             return await enrich()
     except RouteCustodyRefused as exc:
         logger.warning("Vision enrichment skipped, no image sent: %s", exc)

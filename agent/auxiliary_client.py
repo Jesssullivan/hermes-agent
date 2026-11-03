@@ -4329,16 +4329,16 @@ def _try_main_agent_model_fallback(
     if main_model_fallback_refused(task, reason, failed_provider) or main_route_refuses(  # after the no-op checks
             main_provider, main_model, task=task, failed_provider=failed_provider, failed_model=failed_model, base_url=main_base_url):
         return None, None, ""
-    try:
+    try:  # judged again at the URL the client sends to: a custom main can fall through to an API-key provider
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
+        client, resolved_model = judged_built_client(main_provider, client, resolved_model or main_model, task=task, base_url=main_base_url)
     except Exception:
         client, resolved_model = None, None
     if client is None:
         return None, None, ""
-    label = f"main-agent({main_provider})"
-    logger.info("Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
-                task or "call", reason, failed_provider, label, resolved_model or main_model)
-    return client, resolved_model or main_model, label
+    logger.info("Auxiliary %s: %s on %s — falling back to main agent model main-agent(%s) (%s)",
+                task or "call", reason, failed_provider, main_provider, resolved_model or main_model)
+    return client, resolved_model or main_model, f"main-agent({main_provider})"
 
 
 # ── Context-window screening for runtime fallback chains (issue #52392) ── A reachable candidate too small

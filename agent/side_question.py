@@ -180,10 +180,10 @@ def _side_question_custody(question: str, history: Optional[list[dict[str, Any]]
     route on both paths, so ``route_custody`` is asked first (``phase="auxiliary"``,
     ``task="side_question"``), and a refusal sends nothing. *route* names the resolved entry record,
     the session id and the platform of *main_runtime*."""
-    from agent.route_hooks import custody_applies, detached_auxiliary, out_of_turn_record
+    from agent.route_hooks import agent_custody_applies, custody_applies, detached_auxiliary, entry_requires_custody
     route, runtime = route or {}, main_runtime or {}
     record = route.get("record")
-    if not (custody_applies(record) or custody_applies(out_of_turn_record(parent_agent))):
+    if not (custody_applies(record) or agent_custody_applies(parent_agent) or entry_requires_custody(runtime)):
         yield
         return
     session_id = route.get("session_id") or getattr(parent_agent, "session_id", "") or runtime.get("session_id")
@@ -191,7 +191,8 @@ def _side_question_custody(question: str, history: Optional[list[dict[str, Any]]
             record, task=SIDE_QUESTION_TASK, session_id=session_id, provider=runtime.get("provider"),
             model=runtime.get("model"), messages=[*(history or ()), {"role": "user", "content": question}],
             rides_main=_rides_main_route(parent_agent, main_runtime),
-            platform=str(route.get("platform") or getattr(parent_agent, "platform", "") or ""), parent=parent_agent):
+            platform=str(route.get("platform") or getattr(parent_agent, "platform", "") or ""), parent=parent_agent,
+            base_url=runtime.get("base_url")):
         yield
 
 

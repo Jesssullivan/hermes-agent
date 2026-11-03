@@ -4,8 +4,9 @@ A cached ``auto`` client is judged on each call as its walk judged it, and a ref
 again. A resolution-time record keeps the URLs its entry was configured with and resolved to. The
 main agent's own route at the marked endpoint under another name is judged as the marked route, and so
 is a kept fallback at the URL the agent sends to. The last-resort hop to the main model from a kept
-fallback is judged at its own provider and URL. A CLI shell with no session id still binds a side
-route. The Copilot API hosts the token exchange names are part of a ``copilot`` mark. A ``vision`` slot with a
+fallback is judged at its own provider and URL, and the client it builds at the URL that client sends
+to. A resolution-time record is judged at the URL the agent on it sends to, in both directions. A CLI
+shell with no session id still binds a side route. The Copilot API hosts the token exchange names are part of a ``copilot`` mark. A ``vision`` slot with a
 ``base_url`` is judged on the URL its built client sends to. Each probe drives the production code
 with stub clients and a stub gate. No provider is called."""
 
@@ -423,6 +424,277 @@ class TestMainHopFromAKeptFallback:
                                   or {"action": "allow"}]
         self._send(TestKeptFallbackAtTheMarkedEndpoint._agent(LOCAL), "custom", ZAI)
         assert seen == [({"provider": "zai", "model": "or-m", "slot_provider": "custom"}, True)]
+
+
+class TestMainHopBuiltClient:
+    """The hop asks the gate twice when the two can differ: on the provider it declares, before the build,
+    and at the URL the built client sends to, after it. A ``custom`` main with no endpoint of its own falls
+    through to the first API-key provider that has a key, which can be the marked endpoint. Either
+    refusal drops the client."""
+
+    @staticmethod
+    def _marks(client, provider="custom", base_url=None, marked=True):
+        """The real ``_custom_health_base_url``, with no custom endpoint unless *base_url* names one."""
+        return [*_marked("zai", marked), patch.multiple(
+            aux, _read_main_provider=lambda: provider, _read_main_model=lambda: "m",
+            _resolve_custom_runtime=lambda: (base_url, "key" if base_url else None, None),
+            _is_provider_unhealthy=lambda *_a, **_k: False, main_model_fallback_refused=lambda *_a: False),
+            patch.object(aux, "resolve_provider_client", return_value=(client, "m"))]
+
+    @staticmethod
+    def _hop(*marks):
+        return TestMainRouteAtTheMarkedEndpoint()._run(
+            lambda: aux._try_main_agent_model_fallback("zai", "compression", failed_model="glm"), *marks)
+
+    @staticmethod
+    def _primary_on_custom_at(url):
+        return SimpleNamespace(provider="custom", model="m", base_url=url, session_id="s-9", platform="",
+                               _provider_fallback_active=False, _route_resolution_entry=None, _fallback_chain=[])
+
+    @staticmethod
+    def _gate(seen, refuse=()):
+        def custody(candidate, required, **_kw):
+            seen.append((dict(candidate), required))
+            return {"action": "skip" if candidate["provider"] in refuse else "allow"}
+        return [custody]
+
+    @pytest.mark.parametrize("agent_factory", [
+        lambda: TestKeptFallbackAtTheMarkedEndpoint._agent(ZAI), lambda: TestMainHopBuiltClient._primary_on_custom_at(ZAI)],
+        ids=["kept-fallback", "primary-custom"])
+    def test_a_client_at_the_marked_endpoint_needs_an_allow(self, hooks, agent_factory):
+        route_hooks._bind_scope(agent_factory())
+        assert self._hop(*self._marks(_client(ZAI))) == (None, None, "")
+
+    def test_the_gate_sees_the_declared_route_and_then_the_built_one(self, hooks):
+        seen = []
+        hooks["route_custody"] = self._gate(seen)
+        route_hooks._bind_scope(TestKeptFallbackAtTheMarkedEndpoint._agent(ZAI))
+        client = _client(ZAI)
+        assert self._hop(*self._marks(client))[0] is client
+        assert seen == [({"provider": "custom", "model": "m"}, False),
+                        ({"provider": "zai", "model": "m", "slot_provider": "custom"}, True)]
+
+    def test_a_refusal_at_the_built_url_drops_the_client(self, hooks):
+        hooks["route_custody"] = self._gate([], refuse={"zai"})
+        route_hooks._bind_scope(self._primary_on_custom_at(ZAI))
+        assert self._hop(*self._marks(_client(ZAI))) == (None, None, "")
+
+    def test_the_real_custom_branch_falling_through_to_an_api_key_provider_is_judged(self, hooks):
+        """``resolve_provider_client`` itself runs: no custom endpoint, then the first API-key provider."""
+        built = _client(ZAI)
+        marks = [*_marked("zai"), patch.multiple(
+            aux, _read_main_provider=lambda: "custom", _read_main_model=lambda: "m",
+            _resolve_custom_runtime=lambda: (None, None, None), _try_custom_endpoint=lambda: (None, None),
+            _resolve_api_key_provider=lambda: (built, "m"), _is_provider_unhealthy=lambda *_a, **_k: False,
+            main_model_fallback_refused=lambda *_a: False)]
+        route_hooks._bind_scope(self._primary_on_custom_at(ZAI))
+        assert self._hop(*marks) == (None, None, "")
+        seen = []
+        hooks["route_custody"] = self._gate(seen)
+        assert self._hop(*marks)[0] is not None
+        assert seen[-1] == ({"provider": "zai", "model": "m", "slot_provider": "custom"}, True)
+
+    def test_a_refusal_of_the_declared_route_builds_nothing(self, hooks):
+        hooks["route_custody"] = self._gate([], refuse={"custom"})
+        route_hooks._bind_scope(TestKeptFallbackAtTheMarkedEndpoint._agent(LOCAL))
+        build = MagicMock(return_value=(_client(LOCAL), "m"))
+        assert self._hop(*self._marks(_client(LOCAL))[:-1], patch.object(aux, "resolve_provider_client", build)) == (None, None, "")
+        build.assert_not_called()
+
+    def test_a_custom_main_at_its_own_endpoint_is_judged_there(self, hooks):
+        """A control for the fix: under a kept fallback at the mark, a main with its own endpoint elsewhere
+        gets one judgement, unmarked. No over-broad reading of the built client turns it into the mark."""
+        route_hooks._bind_scope(TestKeptFallbackAtTheMarkedEndpoint._agent(ZAI))
+        client = _client(LOCAL)
+        assert self._hop(*self._marks(client, base_url=LOCAL))[0] is client
+        seen = []
+        hooks["route_custody"] = self._gate(seen)
+        assert self._hop(*self._marks(client, base_url=LOCAL))[0] is client
+        assert seen == [({"provider": "custom", "model": "m"}, False)]
+
+    def test_a_custom_main_at_the_marked_endpoint_is_judged_once_as_marked(self, hooks):
+        """The declared judgement already named the mark, so the built client is not asked about again."""
+        route_hooks._bind_scope(TestKeptFallbackAtTheMarkedEndpoint._agent(LOCAL))
+        assert self._hop(*self._marks(_client(ZAI), base_url=ZAI)) == (None, None, "")
+        seen = []
+        hooks["route_custody"] = self._gate(seen)
+        self._hop(*self._marks(_client(ZAI), base_url=ZAI))
+        assert seen == [({"provider": "zai", "model": "m", "slot_provider": "custom"}, True)]
+
+
+class TestRecordAtTheUrlTheAgentSendsTo:
+    """A resolution-time record is judged at the URL the agent on it sends to, not the URLs it was resolved
+    with. A delegation ``base_url`` keeps the parent's provider, so a child binds the parent's record, and a
+    later move on one provider leaves the record behind. Each case runs both ways: toward the marked
+    endpoint the gate sees the marked route, and away from it the gate sees the route the call uses and
+    no allow is needed."""
+
+    TO_MARK = ({"provider": "zai", "model": "m", "slot_provider": "custom"}, True)
+    OFF_MARK = ({"provider": "custom", "model": "m"}, False)
+    BOTH_WAYS = pytest.mark.parametrize("record_url,sends_to,expected", [(LOCAL, ZAI, TO_MARK), (ZAI, LOCAL, OFF_MARK)],
+                                        ids=["to-the-mark", "off-the-mark"])
+
+    @staticmethod
+    def _gate(hooks):
+        seen = []
+        hooks["route_custody"] = [lambda candidate, required, **_kw: seen.append((dict(candidate), required))
+                                  or {"action": "allow"}]
+        return seen
+
+    @staticmethod
+    def _record(url):
+        return route_hooks.resolution_record({"provider": "custom", "model": "m", "base_url": url}, {"provider": "custom"})
+
+    @classmethod
+    def _agent_moved(cls, record_url, sends_to):
+        agent = TestRecordedEndpoint._agent(cls._record(record_url))
+        agent.base_url = sends_to
+        return agent
+
+    @classmethod
+    def _delegated_child(cls, parent_url, override_url):
+        """A child built the way ``delegation.base_url`` with no provider builds it: the parent's provider, the
+        override's URL and the parent's record, read when the runtime is copied."""
+        from tools.delegate_tool_config import _resolve_child_runtime
+        parent = cls._agent_moved(parent_url, parent_url)
+        parent.api_mode, parent.acp_command, parent.acp_args = "chat_completions", None, []
+        runtime = _resolve_child_runtime(
+            parent, {}, "key", model=None, override_provider=None, override_base_url=override_url, override_api_key="key",
+            override_api_mode=None, override_acp_command=None, override_acp_args=None)
+        assert runtime["provider"] == "custom" and runtime["base_url"] == override_url
+        child = SimpleNamespace(provider=runtime["provider"], model="m", base_url=runtime["base_url"], session_id="child",
+                                platform="", _provider_fallback_active=False, _route_resolution_entry=None)
+        route_hooks.inherit_child_route_custody(child, route_hooks.side_route_record(parent), parent)
+        return child
+
+    @staticmethod
+    def _run(fn):
+        return TestMainRouteAtTheMarkedEndpoint()._run(fn, *_marked("zai"))
+
+    @staticmethod
+    def _compaction(agent):
+        return route_hooks.check_out_of_turn_route(agent, phase="compaction")
+
+    def test_a_delegated_child_sent_off_the_mark_needs_no_allow(self, hooks):
+        self._run(lambda: self._compaction(self._delegated_child(ZAI, LOCAL)))
+
+    @BOTH_WAYS
+    def test_a_delegated_child_is_seen_where_it_sends(self, hooks, record_url, sends_to, expected):
+        seen = self._gate(hooks)
+        self._run(lambda: self._compaction(self._delegated_child(record_url, sends_to)))
+        assert seen == [expected]
+
+    def test_a_compaction_after_a_move_off_the_mark_needs_no_allow(self, hooks):
+        self._run(lambda: self._compaction(self._agent_moved(ZAI, LOCAL)))
+
+    @BOTH_WAYS
+    def test_a_compaction_after_a_move_is_seen_where_it_sends(self, hooks, record_url, sends_to, expected):
+        seen = self._gate(hooks)
+        self._run(lambda: self._compaction(self._agent_moved(record_url, sends_to)))
+        assert seen == [expected]
+
+    @BOTH_WAYS
+    def test_a_compaction_with_no_agent_is_seen_where_its_runtime_sends(self, hooks, record_url, sends_to, expected):
+        seen = self._gate(hooks)
+
+        def go():
+            with route_hooks.detached_compaction(self._record(record_url), session_id="s-1", provider="custom", model="m",
+                                                 messages=[], base_url=sends_to):
+                pass
+        self._run(go)
+        assert seen == [expected]
+
+    @BOTH_WAYS
+    def test_a_side_call_is_judged_where_its_parent_sends(self, hooks, record_url, sends_to, expected):
+        seen = self._gate(hooks)
+        self._run(lambda: route_hooks._check_parent_route(
+            self._agent_moved(record_url, sends_to), phase="auxiliary", task="side_question", messages=[], labels_known=True))
+        assert seen == [expected]
+
+    @staticmethod
+    def _side_question(parent=None, runtime=None, record=None):
+        from agent import side_question
+        with patch.object(side_question, "_answer_via_fork", return_value="fork answer") as fork, \
+                patch.object(side_question, "_answer_via_oneshot", return_value="one-shot answer") as oneshot, \
+                patch.object(side_question, "_side_question_task_config", return_value={}):
+            answer = side_question.answer_side_question(
+                "why?", [], parent_agent=parent, main_runtime=runtime or {"provider": "custom", "model": "m"},
+                route={"record": record, "session_id": "s-1"})
+        return answer, fork, oneshot
+
+    def test_a_side_question_forking_from_a_parent_moved_to_the_mark_sends_nothing(self, hooks):
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            self._run(lambda: self._side_question(parent=self._agent_moved(LOCAL, ZAI)))
+
+    def test_a_side_question_forking_from_a_parent_moved_off_the_mark_answers(self, hooks):
+        runtime = {"provider": "custom", "model": "m", "base_url": LOCAL}
+        answer, fork, _oneshot = self._run(lambda: self._side_question(parent=self._agent_moved(ZAI, LOCAL), runtime=runtime))
+        assert answer == "fork answer" and fork.called
+
+    def test_a_side_question_whose_runtime_moved_to_the_mark_sends_nothing(self, hooks):
+        runtime = {"provider": "custom", "model": "m", "base_url": ZAI}
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            self._run(lambda: self._side_question(runtime=runtime, record=self._record(LOCAL)))
+
+    def test_a_side_question_whose_runtime_moved_off_the_mark_answers(self, hooks):
+        runtime = {"provider": "custom", "model": "m", "base_url": LOCAL}
+        answer, _fork, oneshot = self._run(lambda: self._side_question(runtime=runtime, record=self._record(ZAI)))
+        assert answer == "one-shot answer" and oneshot.called
+
+    @BOTH_WAYS
+    def test_a_side_question_is_seen_where_its_runtime_sends(self, hooks, record_url, sends_to, expected):
+        seen = self._gate(hooks)
+        runtime = {"provider": "custom", "model": "m", "base_url": sends_to}
+        self._run(lambda: self._side_question(runtime=runtime, record=self._record(record_url)))
+        assert seen == [expected]
+
+    def test_the_model_in_use_stays_with_the_url_the_agent_sends_to(self, hooks):
+        seen = self._gate(hooks)
+        agent = self._agent_moved(LOCAL, ZAI)
+        agent.model = "other"
+        self._run(lambda: self._compaction(agent))
+        assert seen == [({"provider": "zai", "model": "other", "slot_provider": "custom"}, True)]
+
+    def test_no_secret_of_the_agents_url_reaches_the_record_a_child_copies(self, hooks):
+        self._gate(hooks)
+        parent = self._agent_moved(LOCAL, "https://u:pw@api.z.ai/api/paas/v4?key=k#f")
+        record = self._run(lambda: route_hooks.side_route_record(parent))
+        assert record["base_url"] == ZAI and record["resolved_base_url"] == ZAI
+
+
+class TestNoGateAndNoMarkAskNothing:
+    """Controls for the two judgements above. A deployment with no ``route_custody`` hook and no mark runs the
+    base's route: the hop keeps its client wherever it sends, a record never becomes a judged entry and a
+    side question opens no custody scope, even at a URL another deployment could mark."""
+
+    @staticmethod
+    def _run(fn):
+        return TestMainRouteAtTheMarkedEndpoint()._run(fn, *_marked("zai", False))
+
+    @pytest.mark.parametrize("sends_to", [ZAI, LOCAL], ids=["known-endpoint", "local"])
+    def test_the_hop_keeps_its_client(self, hooks, sends_to):
+        client = _client(sends_to)
+        route_hooks._bind_scope(TestMainHopBuiltClient._primary_on_custom_at(sends_to))
+        assert TestMainHopBuiltClient._hop(*TestMainHopBuiltClient._marks(client, marked=False)) == (client, "m", "main-agent(custom)")
+
+    @pytest.mark.parametrize("record_url,sends_to", [(LOCAL, ZAI), (ZAI, LOCAL)], ids=["to-known-endpoint", "to-local"])
+    def test_a_moved_record_is_no_judged_entry(self, hooks, record_url, sends_to):
+        agent = TestRecordAtTheUrlTheAgentSendsTo._agent_moved(record_url, sends_to)
+        assert self._run(lambda: route_hooks._resolution_fallback_entry(agent)) is None
+        assert self._run(lambda: route_hooks.side_route_record(agent)) is None
+        assert self._run(lambda: route_hooks.check_out_of_turn_route(agent, phase="compaction")) is True
+
+    def test_a_compaction_with_no_agent_runs(self, hooks):
+        def go():
+            with route_hooks.detached_compaction(None, session_id="s-1", provider="custom", model="m", messages=[], base_url=ZAI):
+                return "ran"
+        assert self._run(go) == "ran"
+
+    def test_a_side_question_opens_no_custody_scope(self, hooks):
+        runtime = {"provider": "custom", "model": "m", "base_url": ZAI}
+        with patch.object(route_hooks, "detached_auxiliary", side_effect=AssertionError("custody scope opened")):
+            answer, _fork, oneshot = self._run(lambda: TestRecordAtTheUrlTheAgentSendsTo._side_question(runtime=runtime))
+        assert answer == "one-shot answer" and oneshot.called
 
 
 class TestSideRouteOnAShellWithNoSession:
