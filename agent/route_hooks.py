@@ -1241,13 +1241,19 @@ def auxiliary_refuses(entry: Mapping[str, Any], *, task: Optional[str], failed_p
 
 
 def main_route_refuses(provider: Any, model: Any, *, task: Optional[str], failed_provider: str,
-                       failed_model: Optional[str] = None, slot_provider: Any = None) -> bool:
+                       failed_model: Optional[str] = None, slot_provider: Any = None, base_url: Any = None) -> bool:
     """F3 for an auxiliary call's last-resort hop to the main model. The main route has no chain entry
-    of its own, so the candidate takes the custody key of the gated entry the scope agent runs on.
-    *slot_provider* names the slot judged as this route, for the gate's audit."""
+    of its own, so the candidate takes the custody key of the gated entry the scope agent runs on, and
+    nothing else from it: the hop is judged at its own provider and *base_url*, not at the URLs or the
+    resolved provider of a kept fallback. *slot_provider* names the slot judged as this route, for the
+    gate's audit."""
     agent = _scope_agent()
     active = _active_entry(agent) if agent is not None else None
-    candidate = {**(active or {}), "provider": provider, "model": model}
+    candidate: dict[str, Any] = {"provider": provider, "model": model}
+    if active is not None and active.get(ROUTE_CUSTODY_KEY) is not None:
+        candidate[ROUTE_CUSTODY_KEY] = active[ROUTE_CUSTODY_KEY]
+    if isinstance(base_url, str) and base_url.strip():
+        candidate["base_url"] = base_url.strip()
     if str(slot_provider or "").strip():
         candidate[_SLOT_PROVIDER_KEY] = slot_provider
     return auxiliary_refuses(candidate, task=task, failed_provider=failed_provider, failed_model=failed_model)

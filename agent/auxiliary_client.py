@@ -4327,7 +4327,7 @@ def _try_main_agent_model_fallback(
         _log_skip_unhealthy(main_provider, task, base_url=main_base_url)
         return None, None, ""
     if main_model_fallback_refused(task, reason, failed_provider) or main_route_refuses(  # after the no-op checks
-            main_provider, main_model, task=task, failed_provider=failed_provider, failed_model=failed_model):
+            main_provider, main_model, task=task, failed_provider=failed_provider, failed_model=failed_model, base_url=main_base_url):
         return None, None, ""
     try:
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)

@@ -3,7 +3,8 @@
 A cached ``auto`` client is judged on each call as its walk judged it, and a refused one is walked
 again. A resolution-time record keeps the URLs its entry was configured with and resolved to. The
 main agent's own route at the marked endpoint under another name is judged as the marked route, and so
-is a kept fallback at the URL the agent sends to. A CLI shell with no session id still binds a side
+is a kept fallback at the URL the agent sends to. The last-resort hop to the main model from a kept
+fallback is judged at its own provider and URL. A CLI shell with no session id still binds a side
 route. The Copilot API hosts the token exchange names are part of a ``copilot`` mark. A ``vision`` slot with a
 ``base_url`` is judged on the URL its built client sends to. Each probe drives the production code
 with stub clients and a stub gate. No provider is called."""
@@ -382,6 +383,46 @@ class TestKeptFallbackAtTheMarkedEndpoint:
     def test_a_fallback_elsewhere_is_not_the_marked_route(self, hooks):
         agent = self._agent(LOCAL)
         assert TestMainRouteAtTheMarkedEndpoint()._run(lambda: route_hooks._active_entry(agent), *_marked("zai")) is None
+
+
+class TestMainHopFromAKeptFallback:
+    """The last-resort hop to the main model is judged at its own provider and URL. Only the custody
+    key comes from the kept fallback the scope agent runs on, not its URLs."""
+
+    @staticmethod
+    def _hop(provider, base_url=""):
+        client = _client()
+        return client, [*_marked("zai"), patch.multiple(
+            aux, _read_main_provider=lambda: provider, _read_main_model=lambda: "or-m",
+            _custom_health_base_url=lambda *_a: base_url, _is_provider_unhealthy=lambda *_a: False,
+            main_model_fallback_refused=lambda *_a: False), patch.object(aux, "resolve_provider_client",
+                                                                         return_value=(client, "or-m"))]
+
+    def _send(self, agent, provider, base_url=""):
+        route_hooks._bind_scope(agent)
+        client, marks = self._hop(provider, base_url)
+        sent = TestMainRouteAtTheMarkedEndpoint()._run(
+            lambda: aux._try_main_agent_model_fallback("zai", "compression", failed_model="glm"), *marks)
+        return client, sent
+
+    def test_a_hop_to_an_unmarked_provider_is_not_refused_with_no_gate(self, hooks):
+        client, sent = self._send(TestKeptFallbackAtTheMarkedEndpoint._agent(ZAI), "openrouter")
+        assert sent[0] is client
+
+    def test_the_gate_sees_the_hops_own_provider(self, hooks):
+        seen = []
+        hooks["route_custody"] = [lambda candidate, required, **_kw: seen.append((dict(candidate), required))
+                                  or {"action": "allow"}]
+        self._send(TestKeptFallbackAtTheMarkedEndpoint._agent(ZAI), "openrouter")
+        assert seen == [({"provider": "openrouter", "model": "or-m"}, False)]
+
+    def test_a_hop_whose_own_url_is_the_marked_endpoint_is_judged_as_marked(self, hooks):
+        assert self._send(TestKeptFallbackAtTheMarkedEndpoint._agent(LOCAL), "custom", ZAI)[1] == (None, None, "")
+        seen = []
+        hooks["route_custody"] = [lambda candidate, required, **_kw: seen.append((dict(candidate), required))
+                                  or {"action": "allow"}]
+        self._send(TestKeptFallbackAtTheMarkedEndpoint._agent(LOCAL), "custom", ZAI)
+        assert seen == [({"provider": "zai", "model": "or-m", "slot_provider": "custom"}, True)]
 
 
 class TestSideRouteOnAShellWithNoSession:
