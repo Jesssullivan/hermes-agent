@@ -426,12 +426,12 @@ class CLIAgentSetupMixin:
 
     def _side_route(self) -> dict:
         """Route custody context of this shell's route for a side call (agent/route_hooks.py)."""
-        return {"record": getattr(self, "_route_entry_record", None), "session_id": self.session_id, "platform": "cli"}
+        return {"record": getattr(self, "_route_entry_record", None), "session_id": getattr(self, "session_id", None), "platform": "cli"}
 
     def _bind_side_route(self, agent) -> None:
         """A local side agent on this shell's route: its turn start checks the fallback entry the walker chose."""
         from agent.route_hooks import inherit_route_custody
-        inherit_route_custody(agent, getattr(self, "_route_entry_record", None), session_id=self.session_id)
+        inherit_route_custody(agent, getattr(self, "_route_entry_record", None), session_id=getattr(self, "session_id", None))
 
     def _runtime_credentials_ready(self) -> bool:
         """Silently probe whether any inference provider can be resolved.
