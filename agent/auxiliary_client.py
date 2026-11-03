@@ -124,7 +124,7 @@ from agent.image_routing import _main_model_supports_vision
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
 from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, client_base_url, discovery_mark_refuses, discovery_refused
-from agent.route_hooks import judged_auto_model, judged_vision_client, main_route_marked, main_route_refuses, marked_main_refuses
+from agent.route_hooks import judged_auto_model, judged_built_client, judged_vision_client, main_route_marked, main_route_refuses, marked_main_refuses
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -5510,10 +5510,10 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     if marked_main_refuses(provider, model, task=task or None, base_url=base_url):  # route_custody (F12)
         return None, None
-    return resolve_provider_client(
+    return judged_built_client(provider, *resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
-    )
+    ), task=task or None, base_url=base_url)  # route_custody (F12): also the endpoint the built client sends to
 
 
 _VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
@@ -6030,7 +6030,7 @@ def _get_cached_client(
         provider, async_mode=async_mode, base_url=base_url, api_key=api_key, api_mode=api_mode,
         main_runtime=main_runtime, is_vision=is_vision, task=task, model=model,
     )
-    auto_marked = provider == "auto" and main_route_marked(runtime.get("provider") or _read_main_provider())
+    auto_marked, hit = provider == "auto" and main_route_marked(runtime.get("provider") or _read_main_provider()), None
     with _client_cache_lock:
         if auto_marked:
             _client_cache.pop(cache_key, None)  # an ``auto`` client on a marked route is judged each call
@@ -6040,11 +6040,12 @@ def _get_cached_client(
                 cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
             )
             if loop_ok:
-                return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
-            del _client_cache[cache_key]
+                hit = cached_client, _compat_model(cached_client, model, cached_default)
+            else:  # Stale async entry: evict. Only a closed owner loop may be awaited; a live foreign one stays neutered.
+                _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+                del _client_cache[cache_key]
+    if hit is not None:  # route_custody (F12) judges each call on the endpoint the client sends to, outside the lock
+        return judged_built_client(provider, *hit, task=task, base_url=base_url)
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
     # and retry an exhausted key. A pinned ``custom:<name>`` peeks only its entry's rows.
@@ -6077,7 +6078,7 @@ def _get_cached_client(
                 client, default_model, _ = _client_cache[cache_key]
                 # Race loser was never exposed to a caller — safe to close now.
                 _close_cached_client(built_client, close_async=async_mode)
-    return client, _compat_model(client, model, default_model)
+    return judged_built_client(provider, client, _compat_model(client, model, default_model), task=task, base_url=base_url)
 
 
 # MoA virtual provider: an *explicit* `provider: moa` override (either the caller-passed `provider` arg or

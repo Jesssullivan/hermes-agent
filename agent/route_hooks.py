@@ -1200,19 +1200,42 @@ def marked_main_refuses(provider: Any, model: Any, *, task: Optional[str], base_
     A slot whose *base_url* reaches the marked route's endpoint is judged too (:func:`_endpoint_route`)."""
     if not _main_route_marker()[1]:
         return False
+    route = _marked_route(provider, base_url)
+    return route is not None and _refused_as(route, model, task)
+
+
+def _refused_as(route: Any, model: Any, task: Optional[str]) -> bool:
+    return main_route_refuses(route, model, task=task, failed_provider=str(route or ""), failed_model=str(model or ""))
+
+
+def _marked_route(provider: Any, base_url: Any) -> Optional[str]:
+    """The first spelling of *provider* the mark covers, else :func:`_endpoint_route` of *base_url*."""
     from agent.auxiliary_client import _normalize_aux_provider
     resolved = _normalize_aux_provider(provider) if str(provider or "").strip() else ""
     route = next((name for name in (resolved, provider) if main_route_marked(name)), None)
-    if route is None:
-        route = _endpoint_route(resolved or provider, base_url)
-    return route is not None and main_route_refuses(route, model, task=task, failed_provider=str(route or ""),
-                                                    failed_model=str(model or ""))
+    return route if route is not None else _endpoint_route(base_url)
 
 
-def _endpoint_route(provider: Any, base_url: Any) -> Optional[str]:
-    """The name the gate sees for a slot at *base_url* that no marked name covers: the marked provider
-    when the slot's scheme, host and port are the marked route's, and the slot's own name (else
-    ``custom``) when the marked route's endpoint cannot be resolved (fail closed). ``None`` otherwise."""
+def judged_built_client(provider: Any, client: Any, model: Any, *, task: Optional[str],
+                        base_url: Any = None) -> tuple[Any, Any]:
+    """``(client, model)`` for the client a slot built, and ``(None, None)`` when F12 refuses it. A slot
+    that names no marked route and has no configured *base_url* there can still build on the marked
+    endpoint, through the main runtime or an env base URL, so it is judged on the URL the client sends
+    to. A slot judged before the build is not asked again, and nor is ``auto``, whose walk judges each
+    candidate it builds."""
+    if client is None or not _main_route_marker()[1]:
+        return client, model
+    from agent.auxiliary_client import _normalize_aux_provider
+    if _normalize_aux_provider(provider) == "auto" or _marked_route(provider, base_url) is not None:
+        return client, model
+    route = _endpoint_route(client_base_url(client))
+    return (None, None) if route is not None and _refused_as(route, model, task) else (client, model)
+
+
+def _endpoint_route(base_url: Any) -> Optional[str]:
+    """The marked provider, for a slot at *base_url* that no marked name covers, when the slot's scheme,
+    host and port are the marked route's or the marked route's endpoint cannot be resolved (fail closed:
+    the mark then requires an ``allow``). ``None`` otherwise."""
     url = str(base_url or "").strip()
     if not url:
         return None
@@ -1222,10 +1245,9 @@ def _endpoint_route(provider: Any, base_url: Any) -> Optional[str]:
         if "\0endpoint" not in _warned_values:
             _warned_values.add("\0endpoint")
             logger.warning("Route custody: the marked route's endpoint cannot be resolved; judging every base_url slot")
-        return str(provider or "").strip() or "custom"
-    if origin in origins or not origin[1]:
-        return _main_route_marker()[0]
-    return None
+    elif origin not in origins and origin[1]:
+        return None
+    return _main_route_marker()[0]
 
 
 def _marked_route_origins() -> frozenset[tuple[str, str, int]]:
