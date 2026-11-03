@@ -866,7 +866,7 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # No credentials: try the fallback chain BEFORE failing. An exhausted single-entry pool (typically ``openrouter``
     # under free-tier daily quotas) must not die with a misleading "No LLM provider configured" error (#17929);
     # only explicitly named providers keep the missing-key diagnostic.
-    from agent.route_hooks import bind_resolution_entry, resolution_record, resolution_refuses
+    from agent.route_hooks import bind_resolution_entry, client_base_url, resolution_record, resolution_refuses
     _explicit = (agent.provider or "").strip().lower()
     _refused_entries, _chain, _route_labels = [], _fallback_entries(fallback_model), {}
     for _fb in _chain:
@@ -902,8 +902,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             return None
         agent.provider = agent.requested_provider = _fb["provider"]
         agent.model = _fb_model or _fb["model"]
-        # Custody re-checks this entry at each turn start (agent/route_hooks.py).
-        bind_resolution_entry(agent, resolution_record(_fb, {"provider": agent.provider}, model=agent.model), source="init")
+        bind_resolution_entry(agent, resolution_record(_fb, {"provider": agent.provider, "base_url": client_base_url(_fb_client)},  # custody re-checks it each turn
+                                                       model=agent.model), source="init")
         recompute_init_fallback_api_mode(agent, _fb_client)
         return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,

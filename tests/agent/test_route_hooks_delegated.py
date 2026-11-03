@@ -1,6 +1,6 @@
 """Route custody for delegated children and the end of an auxiliary walk (agent/route_hooks.py).
 
-CADE-1 seq 1002 named these open:
+A review of TIN-7765 named these open:
 
 1: a delegated child copied a gated route with no record, so its turn start asked nothing.
 2: a child's connector data stopped at the child, while its summary reached the parent.

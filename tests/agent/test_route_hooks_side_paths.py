@@ -1,6 +1,6 @@
 """Route custody on the CLI walker and on side agents and side questions (agent/route_hooks.py).
 
-CADE-1 review 5728175100 found these open:
+A review of TIN-7765 found these open:
 
 B1: the interactive CLI walker (``_resolve_fallback_runtime``) asked no gate, so a ``required``
     entry became the CLI route, and nothing recorded the entry.

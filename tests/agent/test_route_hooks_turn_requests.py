@@ -1,6 +1,6 @@
 """Route custody between the requests of a turn (agent/route_hooks.py ``check_request_route``).
 
-CADE-1 review 5728175100 (B3): after a failover, a tool row stamped with ``data_use`` reached the
+A review of TIN-7765 (B3): after a failover, a tool row stamped with ``data_use`` reached the
 fallback on the next request, and the gate had been asked once with ``data_use`` empty. F12 widens
 the check to every request on any route (``test_route_hooks_serving_route.py``). Each probe drives
 the real ``run_conversation`` loop with a stub provider call and a stub tool. No provider is called."""

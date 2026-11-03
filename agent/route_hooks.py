@@ -247,12 +247,13 @@ def _entry_marked_by_name(entry: Mapping[str, Any]) -> bool:
 
 
 def _entry_endpoint_route(entry: Mapping[str, Any]) -> Optional[str]:
-    """The marked provider, for an entry that has a URL at the marked endpoint: its own ``base_url`` or the
-    ``base_url`` of its provider's ``providers`` entry (:func:`_endpoint_route`). A lookup that fails counts
-    as reaching it. ``None`` otherwise, and with no mark. The lookup reads no credential."""
+    """The marked provider, for an entry that has a URL at the marked endpoint: its own ``base_url``, the URL
+    a resolution-time record resolved it to, or the ``base_url`` of its provider's ``providers`` entry
+    (:func:`_endpoint_route`). A lookup that fails counts as reaching it. ``None`` otherwise, and with no
+    mark. The lookup reads no credential."""
     if not _main_route_marker()[1]:
         return None
-    urls, provider = [entry.get("base_url")], str(entry.get("provider") or "").strip()
+    urls, provider = [entry.get("base_url"), entry.get("resolved_base_url")], str(entry.get("provider") or "").strip()
     if provider:
         try:
             from hermes_cli.runtime_provider import _get_named_custom_provider
@@ -279,8 +280,17 @@ def custody_applies(record: Any) -> bool:
 
 
 def agent_custody_applies(agent: Any) -> bool:
-    """:func:`custody_applies` for *agent*: also true when ``model.route_custody`` covers its route."""
-    return custody_applies(out_of_turn_record(agent)) or main_route_marked(getattr(agent, "provider", ""))
+    """:func:`custody_applies` for *agent*: also true when ``model.route_custody`` covers its route, by
+    name or at the marked endpoint under another name (:func:`_agent_route`)."""
+    return (custody_applies(out_of_turn_record(agent)) or main_route_marked(getattr(agent, "provider", ""))
+            or _entry_endpoint_route(_agent_route(agent)) is not None)
+
+
+def _agent_route(agent: Any) -> dict[str, str]:
+    """*agent*'s own route, with the ``base_url`` it sends to when it has one, so a route at the marked
+    endpoint under another name (``custom``, a ``providers`` alias) is judged as the marked route."""
+    route, url = _current_route(agent), getattr(agent, "base_url", "")
+    return {**route, "base_url": url.strip()} if isinstance(url, str) and url.strip() else route
 
 
 def _chain_routes(chain: Any) -> list[dict[str, str]]:
@@ -768,11 +778,24 @@ def begin_turn(agent: Any, *, messages: list, turn_id: str) -> bool:
 def resolution_record(entry: Mapping[str, Any], runtime: Optional[Mapping[str, Any]] = None, *,
                       model: Any = None) -> dict[str, Any]:
     """The custody-relevant part of the fallback entry a resolution-time walker chose: its route
-    as configured, the provider and model the walker resolved, and its custody key. No secret."""
+    as configured, the provider and model the walker resolved, its custody key, and the URLs it was
+    configured with and resolved to, so a later check finds the marked endpoint under any name
+    (:func:`_entry_endpoint_route`). No secret: a URL keeps no user info, query or fragment."""
+    urls = {"base_url": _public_url(entry.get("base_url")),
+            "resolved_base_url": _public_url((runtime or {}).get("base_url"))}
     return {"provider": str(entry.get("provider") or "").strip(), "model": str(entry.get("model") or "").strip(),
             ROUTE_CUSTODY_KEY: entry.get(ROUTE_CUSTODY_KEY),
             "resolved_provider": str((runtime or {}).get("provider") or "").strip(),
-            "resolved_model": str(model or "").strip()}
+            "resolved_model": str(model or "").strip(), **{key: url for key, url in urls.items() if url}}
+
+
+def _public_url(url: Any) -> str:
+    """*url* without its user info, query or fragment; ``""`` for no URL."""
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url.strip())
+    return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
 
 
 def mark_resolution_entry(runtime: dict[str, Any], entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -859,7 +882,8 @@ def side_route_record(parent: Any) -> Optional[dict[str, Any]]:
         entry = getattr(parent, "_route_fallback_entry", None)
         if not isinstance(entry, Mapping):
             return None
-        return resolution_record(entry, {"provider": getattr(parent, "provider", "")}, model=getattr(parent, "model", ""))
+        runtime = {"provider": getattr(parent, "provider", ""), "base_url": getattr(parent, "base_url", "")}
+        return resolution_record(entry, runtime, model=getattr(parent, "model", ""))
     entry = _resolution_fallback_entry(parent)
     return dict(entry) if entry is not None else None
 
@@ -1059,7 +1083,8 @@ def out_of_turn_record(agent: Any) -> Any:
 def _active_entry(agent: Any) -> Optional[Mapping[str, Any]]:
     """The gated entry the agent's own route came from, or ``None``: a kept fallback while one is
     active, else a resolution-time entry the agent still runs on, else the route itself when
-    ``model.route_custody`` covers it. A fallback active with no recorded entry counts as that route."""
+    ``model.route_custody`` covers it, by name or at the marked endpoint (:func:`_agent_route`). A fallback
+    active with no recorded entry counts as that route."""
     if getattr(agent, "_provider_fallback_active", False):
         entry = getattr(agent, "_route_fallback_entry", None)
         if isinstance(entry, Mapping):
@@ -1068,7 +1093,7 @@ def _active_entry(agent: Any) -> Optional[Mapping[str, Any]]:
         entry = _resolution_fallback_entry(agent)
         if entry is not None:
             return entry
-    route = _current_route(agent)
+    route = _agent_route(agent)
     return route if entry_requires_custody(route) else None
 
 
@@ -1255,8 +1280,8 @@ def judged_built_client(provider: Any, client: Any, model: Any, *, task: Optiona
     """``(client, model)`` for the client a slot built, and ``(None, None)`` when F12 refuses it. A slot
     that names no marked route and has no configured *base_url* there can still build on the marked
     endpoint, through the main runtime or an env base URL, so it is judged on the URL the client sends
-    to. A slot judged before the build is not asked again, and nor is ``auto``, whose walk judges each
-    candidate it builds."""
+    to. A slot judged before the build is not asked again, and nor is ``auto``: its walk judges each
+    candidate it builds, and :func:`judged_auto_hit` judges each cache hit."""
     if client is None or not _main_route_marker()[1]:
         return client, model
     from agent.auxiliary_client import _normalize_aux_provider
@@ -1270,9 +1295,69 @@ def judged_entry_client(entry: Mapping[str, Any], client: Any, model: Any, *, ta
     """:func:`judged_built_client` for the client a fallback chain entry built. An entry that names the
     marked route or has a URL at its endpoint was judged as that route before the build
     (:func:`entry_requires_custody`), so only another entry is judged on the URL its client sends to."""
+    if client is not None:  # a cached ``auto`` client on this entry is judged as the entry (:func:`judged_auto_hit`)
+        with suppress(AttributeError, TypeError):
+            setattr(client, _AUTO_ENTRY_ATTR, {key: entry.get(key) for key in _ENTRY_FIELDS if entry.get(key) is not None})
     if _entry_marked_by_name(entry) or _entry_endpoint_route(entry) is not None:
         return client, model
     return judged_built_client(entry.get("provider"), client, model, task=task)
+
+
+# A client a fallback chain entry built carries that entry's route and custody key, with no secret, so a
+# cached ``auto`` client is judged as the entry that built it.
+_AUTO_ENTRY_ATTR = "_hermes_route_entry"
+_ENTRY_FIELDS = ("provider", "model", "base_url", ROUTE_CUSTODY_KEY)
+
+
+def carry_auto_entry(built: Any, routed: Any, model: Any) -> tuple[Any, Any]:
+    """``(routed, model)``, with the entry :func:`judged_entry_client` stamped on *built* kept on *routed*,
+    its async wrapper."""
+    entry = getattr(built, _AUTO_ENTRY_ATTR, None)
+    if routed is not None and routed is not built and isinstance(entry, Mapping):
+        with suppress(AttributeError, TypeError):
+            setattr(routed, _AUTO_ENTRY_ATTR, entry)
+    return routed, model
+
+
+def judged_auto_hit(client: Any, model: Any, *, task: Optional[str], main_provider: Any) -> tuple[Any, Any]:
+    """F12 for an ``auto`` client served from the cache, on every hit: no walk runs, so the hit is judged as
+    the walk judged the route that built it. A client a chain entry built is judged as that entry, with the
+    custody key the chain holds now, and on the URL it sends to; a loaded gate is asked as it was in the
+    walk. Any other is judged on the route its label names and on the URL it sends to
+    (:func:`discovery_mark_refuses`), so a mark added since, or a gate that now refuses, reaches it.
+    ``(None, None)`` on a refusal, and the caller drops the client and walks again."""
+    if client is None:
+        return None, None
+    stamped = getattr(client, _AUTO_ENTRY_ATTR, None)
+    if isinstance(stamped, Mapping):
+        entry = _chain_entry_now(stamped, task)
+        if entry is None or auxiliary_refuses(entry, task=task, failed_provider=str(main_provider or "auto")):
+            return None, None
+        client, model = judged_entry_client(entry, client, model, task=task)
+        refused = client is not None and judged_auto_model(entry.get("provider"), client, model, entry.get("model"), task=task)
+        return (None, None) if refused else (client, model)
+    from agent.auxiliary_client import _effective_provider_for_client
+    label = _effective_provider_for_client(client, "")
+    refused = discovery_mark_refuses(label, model, task=task, base_url=client_base_url(client))
+    return (None, None) if refused else (client, model)
+
+
+def _chain_entry_now(stamped: Mapping[str, Any], task: Optional[str]) -> Optional[Mapping[str, Any]]:
+    """The main or *task* fallback chain entry with *stamped*'s route, as config holds it now; ``None`` when
+    the chain no longer holds it. A chain that cannot be read keeps *stamped* as required (fail closed)."""
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+        chain = list(get_fallback_chain(load_config_readonly()) or ())
+        task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
+        chain += task_chain if isinstance(task_chain, list) else []
+    except Exception:  # health: allow BLE001 -- an unreadable chain judges the entry as required
+        logger.debug("Route custody: fallback chain read failed for a cached auto client", exc_info=True)
+        return {**stamped, ROUTE_CUSTODY_KEY: ROUTE_CUSTODY_REQUIRED}
+    route = tuple(str(stamped.get(key) or "").strip() for key in _ENTRY_FIELDS[:3])
+    return next((entry for entry in chain if isinstance(entry, Mapping)
+                 and tuple(str(entry.get(key) or "").strip() for key in _ENTRY_FIELDS[:3]) == route), None)
 
 
 def vision_send_refused(provider: Any, client: Any, model: Any, judged: Any, judged_url: Any = None) -> bool:
@@ -1282,27 +1367,8 @@ def vision_send_refused(provider: Any, client: Any, model: Any, judged: Any, jud
     if client is None:
         return True
     if model != judged:
-        return marked_main_refuses(provider, model, task="vision", base_url=client_base_url(client))
+        return marked_main_refuses(provider, model, task="vision", base_url=client_base_url(client) or judged_url)
     return judged_built_client(provider, client, model, task="vision", base_url=judged_url)[0] is None
-
-
-def auto_client_judged_each_call(main_provider: Any, task: Optional[str]) -> bool:
-    """Whether an ``auto`` slot's cached client is dropped, so its walk judges the route again on each
-    call: the mark covers the main route, or the main or the task fallback chain the walk reads holds an
-    entry that needs an ``allow``. A chain that cannot be read counts as holding one."""
-    if main_route_marked(main_provider):
-        return True
-    try:
-        from agent.auxiliary_client import _get_auxiliary_task_config
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.fallback_config import get_fallback_chain
-        chain = list(get_fallback_chain(load_config_readonly()) or ())
-        task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
-        chain += task_chain if isinstance(task_chain, list) else []
-    except Exception:  # health: allow BLE001 -- an unreadable chain judges every call
-        logger.debug("Route custody: fallback chain read failed for an auto slot", exc_info=True)
-        return True
-    return any(isinstance(entry, Mapping) and entry_requires_custody(entry) for entry in chain)
 
 
 def _endpoint_route(base_url: Any) -> Optional[str]:
@@ -1369,10 +1435,14 @@ def _marked_route_origins() -> frozenset[tuple[str, str, int]]:
 
 def _key_selected_endpoints(forms: frozenset[str]) -> list[str]:
     """Endpoints a provider's base URL resolver can pick from its key instead of the registry default
-    (``hermes_cli.auth._API_KEY_BASE_URL_RESOLVERS``): Kimi Code for an ``sk-kimi-`` key, and each Z.AI
-    region the probe can select."""
+    (``hermes_cli.auth._API_KEY_BASE_URL_RESOLVERS``): Kimi Code for an ``sk-kimi-`` key, each Z.AI
+    region the probe can select, and the Copilot API host the token exchange names: each plan's host and
+    every host an exchange in this process returned."""
     from hermes_cli.auth_zai_kimi import KIMI_CODE_BASE_URL, ZAI_ENDPOINTS
     urls = [KIMI_CODE_BASE_URL] if forms & {"kimi-coding", "kimi-coding-cn"} else []
+    if "copilot" in forms:
+        from hermes_cli.copilot_auth import COPILOT_PLAN_API_URLS, exchanged_api_urls
+        urls += [*COPILOT_PLAN_API_URLS, *exchanged_api_urls()]
     return urls + ([endpoint[1] for endpoint in ZAI_ENDPOINTS] if "zai" in forms else [])
 
 
@@ -1418,8 +1488,12 @@ def judged_auto_model(label: Any, client: Any, model: Any, judged: Any, *, task:
 def judged_vision_client(provider: Any, client: Any, model: Any, judged: Any,
                          base_url: Any = None) -> tuple[Any, Any]:
     """``(client, model)`` for a vision slot, judged again (F12) when the model it sends is not the
-    *judged* one the gate already saw, and ``(None, None)`` when there is no client or a refusal."""
-    if client is None or (model != judged and marked_main_refuses(provider, model, task="vision", base_url=base_url)):
+    *judged* one the gate already saw, and ``(None, None)`` when there is no client or a refusal. A slot
+    with a configured *base_url* is also judged on the URL its built client sends to, because a backend
+    can ignore that URL (:func:`vision_send_refused`)."""
+    if base_url:
+        return (None, None) if vision_send_refused(provider, client, model, judged, base_url) else (client, model)
+    if client is None or (model != judged and marked_main_refuses(provider, model, task="vision")):
         return None, None
     return client, model
 

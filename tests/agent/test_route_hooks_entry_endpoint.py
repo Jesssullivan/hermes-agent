@@ -2,8 +2,8 @@
 
 A marked route's endpoint includes the URLs its key can select. A fallback chain entry is judged by
 its URLs as well as its name, and so is the client it builds. A vision backend's built client is
-judged on every path. An ``auto`` client is built again on each call while a chain it walks holds an
-entry that needs an ``allow``. The gate sees the slot's own name as ``slot_provider``. Each probe
+judged on every path. A cached ``auto`` client is judged on each call
+(``test_route_hooks_cached_routes.py``). The gate sees the slot's own name as ``slot_provider``. Each probe
 drives the production code with a stub client. No provider is called."""
 
 from types import SimpleNamespace
@@ -233,7 +233,7 @@ class TestVisionBuiltClient:
 
 
 class TestAutoClientCache:
-    """F-D: a cached ``auto`` client is built again while a chain it walks holds a required entry."""
+    """A cached ``auto`` client is reused, and the gate is asked on each call."""
 
     @staticmethod
     def _twice(chain):
@@ -245,20 +245,11 @@ class TestAutoClientCache:
                 assert aux._get_cached_client("auto", "m", task="compression") == (built, "m")
         return build.call_count
 
-    def test_a_required_main_chain_entry_rebuilds_on_each_call(self, hooks):
-        assert self._twice([{"provider": "hosted", "model": "h", "route_custody": "required"}]) == 2
-
-    def test_a_required_task_chain_entry_rebuilds_on_each_call(self, hooks):
-        chain = [{"provider": "hosted", "model": "h", "route_custody": "required"}]
-        with patch.object(aux, "_get_auxiliary_task_config", return_value={"fallback_chain": chain}):
-            assert self._twice([]) == 2
-
     def test_an_unkeyed_chain_reuses_the_cached_client(self, hooks):
         assert self._twice([{"provider": "hosted", "model": "h"}]) == 1
 
-    def test_an_unreadable_chain_rebuilds_on_each_call(self, hooks):
-        with patch("hermes_cli.fallback_config.get_fallback_chain", side_effect=OSError("unreadable")):
-            assert self._twice([]) == 2
+    def test_a_keyed_chain_reuses_a_client_no_entry_built(self, hooks):
+        assert self._twice([{"provider": "hosted", "model": "h", "route_custody": "required"}]) == 1
 
     def test_the_walk_asks_the_gate_on_each_call(self, hooks):
         seen = []

@@ -124,7 +124,7 @@ from agent.image_routing import _main_model_supports_vision
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
 from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, client_base_url, discovery_mark_refuses, discovery_refused
-from agent.route_hooks import auto_client_judged_each_call, judged_auto_model, judged_built_client, judged_entry_client, judged_vision_client, main_route_refuses, marked_main_refuses, vision_send_refused
+from agent.route_hooks import carry_auto_entry, judged_auto_hit, judged_auto_model, judged_built_client, judged_entry_client, judged_vision_client, main_route_refuses, marked_main_refuses, vision_send_refused
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4996,7 +4996,7 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
         model = None
     if judged_auto_model(_effective_provider_for_client(client, effective_provider), client, model or resolved, resolved, task=req.task):
         return None, None  # route_custody (F12): the slot's own model is judged on the route the walk picked
-    routed_client, routed_model = _route_client(req, client, model or resolved)
+    routed_client, routed_model = carry_auto_entry(client, *_route_client(req, client, model or resolved))  # route_custody: its chain entry
     if routed_client is not None and effective_provider:
         try:
             routed_client._hermes_aux_effective_provider = effective_provider
@@ -5575,8 +5575,7 @@ def _finalize_vision_client(
     resolved_provider: str, sync_client: Any, default_model: Optional[str],
     resolved_model: Optional[str], async_mode: bool, judged: Any = ..., judged_url: Any = None,
 ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Apply the explicit model override (and async wrapping) to a resolved vision client. Route
-    custody (F12) judges the model it sends and the URL the client sends to (route_hooks.vision_send_refused)."""
+    """Apply the model override and async wrapping; route custody (F12) judges what it sends (vision_send_refused)."""
     final_model = resolved_model or default_model
     if vision_send_refused(resolved_provider, sync_client, final_model, judged, judged_url):
         return resolved_provider, None, None
@@ -6024,16 +6023,13 @@ def _get_cached_client(
         base_url, api_key = local
     if marked_main_refuses(provider, model, task=task, base_url=base_url):  # route_custody (F12): names or reaches the mark
         return None, None
-    current_loop = _current_event_loop() if async_mode else None
+    current_loop, hit = (_current_event_loop() if async_mode else None), None
     runtime = _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(
         provider, async_mode=async_mode, base_url=base_url, api_key=api_key, api_mode=api_mode,
         main_runtime=main_runtime, is_vision=is_vision, task=task, model=model,
     )
-    auto_marked, hit = provider == "auto" and auto_client_judged_each_call(runtime.get("provider") or _read_main_provider(), task), None
     with _client_cache_lock:
-        if auto_marked:
-            _client_cache.pop(cache_key, None)  # an ``auto`` client on a marked route or a required chain entry is judged each call
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
             loop_ok = not async_mode or (
@@ -6044,7 +6040,11 @@ def _get_cached_client(
             else:  # Stale async entry: evict. Only a closed owner loop may be awaited; a live foreign one stays neutered.
                 _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
                 del _client_cache[cache_key]
-    if hit is not None:  # route_custody (F12) judges each call on the endpoint the client sends to, outside the lock
+    if hit is not None and provider == "auto":  # route_custody (F12): each hit is judged as its walk judged it, outside the lock
+        if (judged := judged_auto_hit(*hit, task=task, main_provider=runtime.get("provider") or _read_main_provider()))[0] is not None:
+            return judged
+        _evict_cached_client_instance(hit[0])  # a refused hit is dropped, and the walk below judges the route again
+    elif hit is not None:  # route_custody (F12) judges each hit on the endpoint the client sends to, outside the lock
         return judged_built_client(provider, *hit, task=task, base_url=base_url)
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
