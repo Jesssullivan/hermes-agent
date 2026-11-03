@@ -2,8 +2,9 @@
 
 A cached ``auto`` client is judged on each call as its walk judged it, and a refused one is walked
 again. A resolution-time record keeps the URLs its entry was configured with and resolved to. The
-main agent's own route at the marked endpoint under another name is judged as the marked route. The
-Copilot API hosts the token exchange names are part of a ``copilot`` mark. A ``vision`` slot with a
+main agent's own route at the marked endpoint under another name is judged as the marked route, and so
+is a kept fallback at the URL the agent sends to. A CLI shell with no session id still binds a side
+route. The Copilot API hosts the token exchange names are part of a ``copilot`` mark. A ``vision`` slot with a
 ``base_url`` is judged on the URL its built client sends to. Each probe drives the production code
 with stub clients and a stub gate. No provider is called."""
 
@@ -85,7 +86,7 @@ class _Walk:
         self.builds.append(entry["provider"])
         return self.built[entry["provider"]], entry.get("model")
 
-    def call(self, *marks, model=None):
+    def call(self, *marks, model=None, provider="auto"):
         patches = [*marks,
                    patch.object(aux, "_main_route_target", return_value=self.main_target),
                    patch.object(aux, "_try_main_provider_route", return_value=self.main),
@@ -99,7 +100,7 @@ class _Walk:
         for item in patches:
             item.start()
         try:
-            return aux._get_cached_client("auto", model, task="compression")
+            return aux._get_cached_client(provider, model, task="compression")
         finally:
             for item in reversed(patches):
                 item.stop()
@@ -116,6 +117,15 @@ class TestCachedAutoClient:
         gate.refuse = True
         assert walk.call(*_marked("kimi-coding")) == (None, None), "the cached client was served"
         assert {(c["provider"], c.get("slot_provider")) for c in gate.seen} == {("kimi-coding", "custom")}
+
+    @pytest.mark.parametrize("spelling", ["Auto", "AUTO", " auto "])
+    def test_a_hit_of_any_spelling_of_auto_is_judged(self, hooks, spelling):
+        gate, built = _Gate(), _client(KIMI_CODE)
+        hooks["route_custody"] = [gate]
+        walk = _Walk(main=(built, "k2", "custom"), main_target=("custom", "k2", KIMI_CODE, "", ""))
+        assert walk.call(*_marked("kimi-coding"), provider=spelling)[0] is built
+        gate.refuse = True
+        assert walk.call(*_marked("kimi-coding"), provider=spelling) == (None, None), "the cached client was served"
 
     def test_an_admitted_hit_is_served_from_the_cache(self, hooks):
         gate, built = _Gate(), _client(KIMI_CODE)
@@ -273,6 +283,27 @@ class TestRecordedEndpoint:
             for item in reversed(marks):
                 item.stop()
 
+    def test_the_init_walker_records_the_url_its_client_resolved_to(self, hooks):
+        from agent.agent_init import _routed_client_kwargs
+
+        def resolve(provider, model=None, **_kw):
+            return (None, None) if provider == "anthropic" else (_client(ZAI), model)
+
+        agent = SimpleNamespace(provider="anthropic", requested_provider="anthropic", model="opus",
+                                api_mode="chat_completions", _fallback_activated=False)
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve):
+            _routed_client_kwargs(agent, [{"provider": "custom", "model": "m"}], None)
+        record = agent._route_resolution_entry
+        assert record["resolved_base_url"] == ZAI and "base_url" not in record
+        marks = _marked("zai")
+        for item in marks:
+            item.start()
+        try:
+            assert route_hooks.entry_requires_custody(record), "the init record was not judged at the marked endpoint"
+        finally:
+            for item in reversed(marks):
+                item.stop()
+
     def test_a_record_elsewhere_needs_no_allow(self):
         record = route_hooks.resolution_record({"provider": "custom", "model": "m", "base_url": LOCAL}, {"provider": "custom"})
         marks = _marked("zai")
@@ -320,6 +351,61 @@ class TestMainRouteAtTheMarkedEndpoint:
         agent = self._agent(LOCAL)
         assert not self._run(lambda: route_hooks.agent_custody_applies(agent), *_marked("kimi-coding"))
         assert self._run(lambda: route_hooks._active_entry(agent), *_marked("kimi-coding")) is None
+
+
+class TestKeptFallbackAtTheMarkedEndpoint:
+    """R5: a kept fallback whose entry names no URL is judged at the URL the agent sends to."""
+
+    @staticmethod
+    def _agent(base_url):
+        return SimpleNamespace(provider="custom", model="m", base_url=base_url, session_id="s-3", platform="",
+                               _provider_fallback_active=True, _route_fallback_entry={"provider": "custom", "model": "m"},
+                               _route_resolution_entry=None, _fallback_chain=[], _rate_limited_until=0,
+                               _restore_primary_runtime=lambda: False)
+
+    def test_with_no_gate_the_fallback_sends_nothing(self, hooks):
+        agent = self._agent(ZAI)
+        with pytest.raises(route_hooks.RouteCustodyRefused):
+            TestMainRouteAtTheMarkedEndpoint()._run(
+                lambda: route_hooks.check_request_route(agent, [{"role": "user", "content": "q"}]), *_marked("zai"))
+
+    def test_the_gate_sees_the_marked_route_as_required(self, hooks):
+        seen = []
+        hooks["route_custody"] = [lambda candidate, required, **_kw: seen.append((dict(candidate), required))
+                                  or {"action": "allow"}]
+        agent = self._agent(ZAI)
+        assert not TestMainRouteAtTheMarkedEndpoint()._run(
+            lambda: route_hooks.check_request_route(agent, []), *_marked("zai"))
+        assert seen == [({"provider": "zai", "model": "m", "slot_provider": "custom"}, True)]
+        assert agent._route_fallback_entry == {"provider": "custom", "model": "m"}, "the kept entry was changed"
+
+    def test_a_fallback_elsewhere_is_not_the_marked_route(self, hooks):
+        agent = self._agent(LOCAL)
+        assert TestMainRouteAtTheMarkedEndpoint()._run(lambda: route_hooks._active_entry(agent), *_marked("zai")) is None
+
+
+class TestSideRouteOnAShellWithNoSession:
+    """ce9062ce: a CLI shell with no session id still gives a side call its route context."""
+
+    @staticmethod
+    def _shell(**attrs):
+        from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+        shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
+        shell.__dict__.update(attrs)
+        return shell
+
+    def test_side_route_with_no_session_id(self):
+        assert self._shell()._side_route() == {"record": None, "session_id": None, "platform": "cli"}
+
+    def test_side_route_carries_the_session_and_record(self):
+        record = {"provider": "custom", "model": "m"}
+        shell = self._shell(session_id="s-4", _route_entry_record=record)
+        assert shell._side_route() == {"record": record, "session_id": "s-4", "platform": "cli"}
+
+    def test_bind_side_route_with_no_session_id(self):
+        with patch("agent.route_hooks.inherit_route_custody") as inherit:
+            self._shell()._bind_side_route(agent := SimpleNamespace())
+        inherit.assert_called_once_with(agent, None, session_id=None)
 
 
 class TestCopilotEndpoints:

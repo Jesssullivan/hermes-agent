@@ -6040,7 +6040,7 @@ def _get_cached_client(
             else:  # Stale async entry: evict. Only a closed owner loop may be awaited; a live foreign one stays neutered.
                 _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
                 del _client_cache[cache_key]
-    if hit is not None and provider == "auto":  # route_custody (F12): each hit is judged as its walk judged it, outside the lock
+    if hit is not None and _normalize_aux_provider(provider) == "auto":  # route_custody (F12): any spelling of auto, judged as its walk judged it
         if (judged := judged_auto_hit(*hit, task=task, main_provider=runtime.get("provider") or _read_main_provider()))[0] is not None:
             return judged
         _evict_cached_client_instance(hit[0])  # a refused hit is dropped, and the walk below judges the route again

@@ -1083,11 +1083,14 @@ def out_of_turn_record(agent: Any) -> Any:
 def _active_entry(agent: Any) -> Optional[Mapping[str, Any]]:
     """The gated entry the agent's own route came from, or ``None``: a kept fallback while one is
     active, else a resolution-time entry the agent still runs on, else the route itself when
-    ``model.route_custody`` covers it, by name or at the marked endpoint (:func:`_agent_route`). A fallback
-    active with no recorded entry counts as that route."""
+    ``model.route_custody`` covers it, by name or at the marked endpoint (:func:`_agent_route`). A kept
+    fallback is judged at the URL the agent sends to, as ``resolved_base_url``, since its entry may name
+    none. A fallback active with no recorded entry counts as that route."""
     if getattr(agent, "_provider_fallback_active", False):
         entry = getattr(agent, "_route_fallback_entry", None)
         if isinstance(entry, Mapping):
+            url = _agent_route(agent).get("base_url")
+            entry = {**entry, "resolved_base_url": url} if url else entry
             return entry if _gated(entry) else None
     else:
         entry = _resolution_fallback_entry(agent)
