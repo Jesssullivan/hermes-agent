@@ -241,6 +241,154 @@ class TestNameMarkedRewrittenModel:
         assert [candidate["model"] for candidate, _required in seen] == list(dict.fromkeys(["deepseek-reasoner", sends]))
 
 
+# ``deepseek-reasoner`` is a retired alias that the real normalizer folds onto ``deepseek-flash``;
+# ``deepseek-v4-pro`` goes to the wire as configured.
+FOLDS = [("deepseek-reasoner", "deepseek-flash", False), ("deepseek-v4-pro", "deepseek-v4-pro", True)]
+FOLD_IDS = ["folded", "nothing-folds"]
+
+
+def _admits(seen, configured):
+    """A gate that admits only the *configured* model, and records each candidate."""
+    def custody(candidate, required, **_kw):
+        seen.append((dict(candidate), required))
+        return {"action": "allow" if candidate.get("model") == configured else "skip"}
+    return [custody]
+
+
+def _entry_walk(entry, client, *, chain):
+    """The ``auto`` walk with no main client and *entry* on the main (``main``) or the task (``task``)
+    fallback chain. The entry builds *client* on the model the real normalizer resolves for it."""
+    main_chain = {"fallback_providers": [entry]} if chain == "main" else {}
+    task_config = {"fallback_chain": [entry]} if chain == "task" else {}
+    return [patch.multiple(
+        aux, _main_route_target=lambda _runtime, _task: ("zai", "glm", "", "", ""),
+        _try_main_provider_route=lambda *_a: None, _read_main_provider=lambda: "zai",
+        _warn_stale_openai_base_url=lambda *_a, **_k: None, _get_auxiliary_task_config=lambda *_a, **_k: task_config,
+        _is_provider_unhealthy=lambda *_a, **_k: False, _context_too_small=lambda *_a, **_k: None,
+        _resolve_fallback_entry=lambda e: (client, aux._normalize_resolved_model(e["model"], e["provider"]))),
+        patch("hermes_cli.config.load_config_readonly", return_value=main_chain)]
+
+
+class TestChainEntryRewrittenModel:
+    """A fallback chain entry is judged on its configured model before the build. When its provider folds
+    that model, the walk judges the entry again on the model its client sends: as the marked route when the
+    mark names the entry, and by a loaded gate with no mark. A cache hit is judged the same way."""
+
+    @pytest.mark.parametrize("chain", ["main", "task"])
+    @pytest.mark.parametrize("configured,sends,served", FOLDS, ids=FOLD_IDS)
+    def test_a_marked_entry_is_judged_on_the_model_it_sends(self, hooks, chain, configured, sends, served):
+        seen, built = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _admits(seen, configured)
+        marks = [*_marked("deepseek"), *_entry_walk({"provider": "deepseek", "model": configured}, built, chain=chain)]
+        got = _run(lambda: aux._get_cached_client("auto", None, task="compression"), *marks)
+        assert got == ((built, sends) if served else (None, None))
+        assert [(c["provider"], c["model"], required) for c, required in seen] == [
+            ("deepseek", model, True) for model in dict.fromkeys([configured, sends])]
+        built.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize("configured,sends,served", FOLDS, ids=FOLD_IDS)
+    def test_with_no_mark_a_loaded_gate_judges_the_model_it_sends(self, hooks, configured, sends, served):
+        seen, built = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _admits(seen, configured)
+        marks = [*_marked("deepseek", False), *_entry_walk({"provider": "deepseek", "model": configured}, built, chain="main")]
+        got = _run(lambda: aux._get_cached_client("auto", None, task="compression"), *marks)
+        assert got == ((built, sends) if served else (None, None))
+        assert [(c["model"], required) for c, required in seen] == [(m, False) for m in dict.fromkeys([configured, sends])]
+
+    def test_with_no_mark_and_no_gate_the_folded_entry_is_served(self, hooks):
+        built = _client(DEEPSEEK)
+        marks = [*_marked("deepseek", False), *_entry_walk({"provider": "deepseek", "model": "deepseek-reasoner"}, built,
+                                                          chain="main")]
+        assert _run(lambda: aux._get_cached_client("auto", None, task="compression"), *marks) == (built, "deepseek-flash")
+
+    def test_a_cache_hit_is_judged_on_the_model_it_sends(self, hooks):
+        """The gate admits the folded model on the walk and refuses it on the hit, with no mark."""
+        seen, built, refuse = [], _client(DEEPSEEK), []
+
+        def custody(candidate, required, **_kw):
+            seen.append(candidate["model"])
+            return {"action": "skip" if refuse and candidate["model"] == "deepseek-flash" else "allow"}
+        hooks["route_custody"] = [custody]
+        marks = [*_marked("deepseek", False), *_entry_walk({"provider": "deepseek", "model": "deepseek-reasoner"}, built,
+                                                          chain="main")]
+        assert _run(lambda: aux._get_cached_client("auto", None, task="compression"), *marks)[0] is built
+        refuse.append(True)
+        assert _run(lambda: aux._get_cached_client("auto", None, task="compression"), *marks) == (None, None)
+        assert seen[:4] == ["deepseek-reasoner", "deepseek-flash", "deepseek-reasoner", "deepseek-flash"]
+
+
+def _deepseek_hop(client, sends):
+    return [patch.multiple(
+        aux, _read_main_provider=lambda: "deepseek", _read_main_model=lambda: "deepseek-reasoner",
+        _is_provider_unhealthy=lambda *_a, **_k: False, main_model_fallback_refused=lambda *_a: False),
+        patch.object(aux, "resolve_provider_client", return_value=(client, sends))]
+
+
+class TestUnmarkedRewrittenModel:
+    """With no mark, a loaded gate judges a rewritten model on the walk's main step and the hop, as on a
+    chain entry. With no gate and no mark nothing is asked and the client is served as before."""
+
+    @pytest.mark.parametrize("sends,served", [("deepseek-flash", False), ("deepseek-reasoner", True)],
+                             ids=["rewritten", "as-judged"])
+    def test_the_hop_judges_the_model_its_client_sends(self, hooks, sends, served):
+        seen, client = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _reasoner_only(seen)
+        marks = [*_marked("deepseek", False), *_deepseek_hop(client, sends)]
+        got = _run(lambda: aux._try_main_agent_model_fallback("zai", "compression", failed_model="glm"), *marks)
+        assert got[:2] == ((client, sends) if served else (None, None))
+        assert [(c["provider"], c["model"], required) for c, required in seen] == [
+            ("deepseek", model, False) for model in dict.fromkeys(["deepseek-reasoner", sends])]
+
+    def test_with_no_gate_the_hop_sends_as_before(self, hooks):
+        client = _client(DEEPSEEK)
+        marks = [*_marked("deepseek", False), *_deepseek_hop(client, "deepseek-flash")]
+        got = _run(lambda: aux._try_main_agent_model_fallback("zai", "compression", failed_model="glm"), *marks)
+        assert got[:2] == (client, "deepseek-flash")
+
+    @pytest.mark.parametrize("sends,served", [("deepseek-flash", False), ("deepseek-reasoner", True)],
+                             ids=["rewritten", "as-configured"])
+    def test_the_walk_judges_the_model_its_main_step_sends(self, hooks, sends, served):
+        seen, built = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _reasoner_only(seen)
+        marks = [*_marked("deepseek", False), patch.multiple(
+            aux, _main_route_target=lambda _runtime, _task: ("deepseek", "deepseek-reasoner", "", "", ""),
+            _try_main_provider_route=lambda *_a: (built, sends, "deepseek"), _discovery_chain_allowed=lambda *_a: False,
+            _warn_stale_openai_base_url=lambda *_a, **_k: None, _get_auxiliary_task_config=lambda *_a, **_k: {}),
+            patch("hermes_cli.config.load_config_readonly", return_value={})]
+        got = _run(lambda: aux._resolve_auto_route(task="compression"), *marks)
+        assert got[:2] == ((built, sends) if served else (None, None))
+        assert [c["model"] for c, _required in seen] == ([] if served else [sends]), "only a rewritten model is asked"
+
+
+class TestTextSlotRewrittenModel:
+    """``get_text_auxiliary_client``, which kanban's ``goal_judge`` handoff check calls, judges an explicit
+    slot on its configured model before the build and again on the model its client sends."""
+
+    @staticmethod
+    def _slot(client, sends):
+        return [patch.object(aux, "_resolve_task_provider_model",
+                             return_value=("deepseek", "deepseek-reasoner", None, None, None)),
+                patch.object(aux, "resolve_provider_client", return_value=(client, sends))]
+
+    @pytest.mark.parametrize("sends,served", [("deepseek-flash", False), ("deepseek-reasoner", True)],
+                             ids=["rewritten", "as-judged"])
+    def test_a_marked_slot_is_judged_on_the_model_it_sends(self, hooks, sends, served):
+        seen, client = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _reasoner_only(seen)
+        got = _run(lambda: aux.get_text_auxiliary_client("goal_judge"), *_marked("deepseek"), *self._slot(client, sends))
+        assert got == ((client, sends) if served else (None, None))
+        assert [c["model"] for c, _required in seen] == list(dict.fromkeys(["deepseek-reasoner", sends]))
+
+    @pytest.mark.parametrize("sends,served", [("deepseek-flash", False), ("deepseek-reasoner", True)],
+                             ids=["rewritten", "as-configured"])
+    def test_with_no_mark_a_loaded_gate_judges_a_rewritten_model(self, hooks, sends, served):
+        seen, client = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _reasoner_only(seen)
+        got = _run(lambda: aux.get_text_auxiliary_client("goal_judge"), *_marked("deepseek", False), *self._slot(client, sends))
+        assert got == ((client, sends) if served else (None, None))
+        assert [c["model"] for c, _required in seen] == ([] if served else [sends])
+
+
 BAD = "http://[::1/v1"
 
 

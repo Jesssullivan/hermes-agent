@@ -23,6 +23,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Imported before _prepare_compress patches agent.context_compressor.ContextCompressor. prepare_compress
+# imports agent_init inside the call, and agent_init binds that name at import, so a first import under the
+# patch would keep the stub for every later test in the process, whatever order the files are collected in.
+import agent.agent_init
 from agent import route_hooks
 from agent.message_metadata import stamp_data_use
 from hermes_cli.auth import AuthError

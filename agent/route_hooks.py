@@ -1327,28 +1327,44 @@ def judged_built_client(provider: Any, client: Any, model: Any, *, task: Optiona
     endpoint, through the main runtime or an env base URL, so it is judged on the URL the client sends
     to. A slot judged before the build is not asked again on the model the gate saw then, *judged*. A
     provider can rewrite that model, such as a ``deepseek`` alias, so a client that sends another model
-    is judged again on it. ``auto`` is not asked here: its walk judges each candidate it builds, and
-    :func:`judged_auto_hit` judges each cache hit."""
-    if client is None or not _main_route_marker()[1]:
+    is judged again on it: as the marked route when the mark covers the slot, and otherwise whenever a
+    gate is loaded, when the slot configured a model. ``auto`` is not asked here: its walk judges each
+    candidate it builds, and :func:`judged_auto_hit` judges each cache hit."""
+    if client is None:
+        return client, model
+    marked, rewritten = _main_route_marker()[1], judged is not _UNJUDGED and model != judged
+    gated = rewritten and bool(str(judged or "").strip()) and _has_hook(ROUTE_CUSTODY_HOOK)
+    if not marked and not gated:
         return client, model
     from agent.auxiliary_client import _normalize_aux_provider
     if _normalize_aux_provider(provider) == "auto":
         return client, model
-    route = _marked_route(provider, base_url)
+    route = _marked_route(provider, base_url) if marked else None
     if route is not None:
-        rewritten = judged is not _UNJUDGED and model != judged
         return (None, None) if rewritten and _refused_as(route, model, task, provider) else (client, model)
-    route = _endpoint_route(client_base_url(client))
-    return (None, None) if route is not None and _refused_as(route, model, task, provider) else (client, model)
+    route = _endpoint_route(client_base_url(client)) if marked else None
+    if route is not None:
+        return (None, None) if _refused_as(route, model, task, provider) else (client, model)
+    refused = gated and main_route_refuses(provider, model, task=task, failed_provider=str(provider or ""),
+                                           failed_model=str(judged or ""), base_url=base_url)
+    return (None, None) if refused else (client, model)
 
 
-def judged_entry_client(entry: Mapping[str, Any], client: Any, model: Any, *, task: Optional[str]) -> tuple[Any, Any]:
-    """:func:`judged_built_client` for the client a fallback chain entry built. An entry that names the
-    marked route or has a URL at its endpoint was judged as that route before the build
-    (:func:`entry_requires_custody`), so only another entry is judged on the URL its client sends to."""
+def judged_entry_client(entry: Mapping[str, Any], client: Any, model: Any, *, task: Optional[str],
+                        judged: Any = _UNJUDGED, failed_provider: str = "",
+                        failed_model: Optional[str] = None) -> tuple[Any, Any]:
+    """:func:`judged_built_client` for the client a fallback chain entry built. The entry was judged before
+    the build on its configured model, *judged*. A provider can rewrite that model, such as a ``deepseek``
+    alias, so a client that sends another model is judged again as the entry was, on the model it sends:
+    as the marked route when the entry names it or has a URL at its endpoint, and by a loaded gate
+    otherwise (:func:`auxiliary_refuses`). An entry judged as the marked route before the build
+    (:func:`entry_requires_custody`) is not judged on the URL its client sends to. Any other entry is."""
     if client is not None:  # a cached ``auto`` client on this entry is judged as the entry (:func:`judged_auto_hit`)
         with suppress(AttributeError, TypeError):
             setattr(client, _AUTO_ENTRY_ATTR, {key: entry.get(key) for key in _ENTRY_FIELDS if entry.get(key) is not None})
+        if judged is not _UNJUDGED and model != judged and auxiliary_refuses(
+                {**entry, "model": model}, task=task, failed_provider=failed_provider, failed_model=failed_model):
+            return None, None
     if _entry_marked_by_name(entry) or _entry_endpoint_route(entry) is not None:
         return client, model
     return judged_built_client(entry.get("provider"), client, model, task=task)
@@ -1381,12 +1397,10 @@ def judged_auto_hit(client: Any, model: Any, *, task: Optional[str], main_provid
         return None, None
     stamped = getattr(client, _AUTO_ENTRY_ATTR, None)
     if isinstance(stamped, Mapping):
-        entry = _chain_entry_now(stamped, task)
-        if entry is None or auxiliary_refuses(entry, task=task, failed_provider=str(main_provider or "auto")):
+        entry, failed = _chain_entry_now(stamped, task), str(main_provider or "auto")
+        if entry is None or auxiliary_refuses(entry, task=task, failed_provider=failed):
             return None, None
-        client, model = judged_entry_client(entry, client, model, task=task)
-        refused = client is not None and judged_auto_model(entry.get("provider"), client, model, entry.get("model"), task=task)
-        return (None, None) if refused else (client, model)
+        return judged_entry_client(entry, client, model, task=task, judged=entry.get("model"), failed_provider=failed)
     from agent.auxiliary_client import _effective_provider_for_client
     label = _effective_provider_for_client(client, "")
     refused = discovery_mark_refuses(label, model, task=task, base_url=client_base_url(client))

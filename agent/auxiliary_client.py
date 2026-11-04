@@ -4416,7 +4416,9 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
         label = f"fallback_chain[{i}]({fb_provider})"
         try:
-            fb_client, resolved_model = judged_entry_client(entry, *_resolve_fallback_entry(entry), task=task)  # route_custody (F12)
+            fb_client, resolved_model = judged_entry_client(  # route_custody (F12), again on a rewritten model
+                entry, *_resolve_fallback_entry(entry), task=task, judged=entry.get("model"),
+                failed_provider=failed_provider, failed_model=failed_model)
         except Exception:
             fb_client, resolved_model = None, None
         if fb_client is not None:
@@ -4507,7 +4509,9 @@ def _try_main_fallback_chain(
             tried.append(f"{label} (unhealthy)")
             continue
         try:
-            fb_client, resolved_model = judged_entry_client(entry, *_resolve_fallback_entry(entry), task=task)  # route_custody (F12)
+            fb_client, resolved_model = judged_entry_client(  # route_custody (F12), again on a rewritten model
+                entry, *_resolve_fallback_entry(entry), task=task, judged=entry.get("model"),
+                failed_provider=failed_provider, failed_model=failed_model)
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
@@ -5515,7 +5519,7 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str
     return judged_built_client(provider, *resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
-    ), task=task or None, base_url=base_url)  # route_custody (F12): also the endpoint the built client sends to
+    ), task=task or None, base_url=base_url, judged=model)  # route_custody (F12): the endpoint and model it sends
 
 
 _VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
