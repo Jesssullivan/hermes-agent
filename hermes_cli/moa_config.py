@@ -154,6 +154,10 @@ def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] |
     effort = _clean_reasoning_effort(slot.get("reasoning_effort"))
     if effort:
         clean["reasoning_effort"] = effort
+    # agent/route_hooks.py entry_requires_custody reads it, on a reference slot as on a fallback entry.
+    custody = slot.get("route_custody")
+    if custody not in (None, False, ""):
+        clean["route_custody"] = custody
 
     if include_enabled:
         clean["enabled"] = _coerce_bool(slot.get("enabled"), True)

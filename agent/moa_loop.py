@@ -24,6 +24,7 @@ from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
 from agent.message_metadata import DATA_USE
 from agent.moa_alternation import destination_key, is_role_alternation_rejection, merge_same_role_messages
+from agent.route_hooks import moa_reference_refuses
 from agent.transports import get_transport
 from agent.usage_pricing import CanonicalUsage
 
@@ -564,6 +565,10 @@ _REFERENCE_INTERRUPT_SETTLE_S = 0.05
 _INTERRUPTED_REFERENCE_NOTE = "[skipped: interrupted by user]"
 
 
+# A ``[skipped:`` sentinel, so ``_is_failed_reference`` drops the slot from the aggregator's context.
+_ROUTE_CUSTODY_REFERENCE_NOTE = "[skipped: route custody refused this reference]"
+
+
 def _placeholder_output(slot: dict[str, Any], note: str) -> tuple[str, str, Any]:
     """A reference-output tuple for a slot that was not (fully) run: zero accounting."""
     return _slot_label(slot), note, _RefAccounting(CanonicalUsage())
@@ -650,6 +655,9 @@ def _run_references_parallel(
         for idx, slot in enumerate(reference_models):
             if slot.get("provider") == "moa":
                 results[idx] = _placeholder_output(slot, "[skipped: MoA presets cannot recursively reference MoA]")
+                continue
+            if moa_reference_refuses(agent, slot):  # route_custody (F13): no request leaves for this slot
+                results[idx] = _placeholder_output(slot, _ROUTE_CUSTODY_REFERENCE_NOTE)
                 continue
             futures[
                 executor.submit(
