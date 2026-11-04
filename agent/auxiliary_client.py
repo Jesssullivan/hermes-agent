@@ -4331,7 +4331,8 @@ def _try_main_agent_model_fallback(
         return None, None, ""
     try:  # judged again at the URL the client sends to: a custom main can fall through to an API-key provider
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
-        client, resolved_model = judged_built_client(main_provider, client, resolved_model or main_model, task=task, base_url=main_base_url)
+        client, resolved_model = judged_built_client(main_provider, client, resolved_model or main_model, task=task,
+                                                     base_url=main_base_url, judged=main_model)
     except Exception:
         client, resolved_model = None, None
     if client is None:
@@ -4674,7 +4675,8 @@ def _resolve_auto_route(
     with auxiliary_walk():
         if not marked_main_refuses(main_provider, main_model, task=task, base_url=base_url):  # route_custody (F12)
             routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
-            if routed is not None and judged_built_client(main_provider, *routed[:2], task=task, base_url=base_url)[0] is not None:
+            if routed is not None and judged_built_client(
+                    main_provider, *routed[:2], task=task, base_url=base_url, judged=main_model)[0] is not None:
                 return routed  # judged again at the URL the client sends to: a custom main can fall through to an API-key provider
         if task:
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(

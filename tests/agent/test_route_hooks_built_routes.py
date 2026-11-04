@@ -3,7 +3,8 @@
 The ``auto`` walk's main step is judged on the provider it declares and the runtime ``base_url`` before
 the build. A ``custom`` main with no endpoint of its own falls through to the first API-key provider
 that has a key, which can be the marked endpoint, so the built client is judged at the URL it sends to,
-as the last-resort hop's is. The hop judges that client on the model it resolved. A URL that
+as the last-resort hop's is. The hop judges that client on the model it resolved. A route the mark
+names is judged again when its client sends another model than the one judged before the build. A URL that
 ``urlsplit`` rejects names no endpoint: with no gate and no mark nothing applies, and under either the
 route needs an allow. Vision enrichment, a side question and ``session.mutate compress`` each judge
 the runtime at its ``base_url``. Each probe drives the production code with stub clients and a stub
@@ -16,6 +17,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Imported before any test patches agent.context_compressor.ContextCompressor. agent_init binds that name
+# at import, so a first import under the patch would keep the stub for every later test in the process.
+import agent.agent_init
 from agent import auxiliary_client as aux
 from agent import route_hooks
 from hermes_cli.plugins import PluginManager
@@ -183,6 +187,60 @@ class TestMainHopResolvedModel:
                         ({"provider": "zai", "model": "glm-resolved", "slot_provider": "custom"}, True)]
 
 
+DEEPSEEK = "https://api.deepseek.com/v1"
+
+
+def _reasoner_only(seen):
+    def custody(candidate, required, **_kw):
+        seen.append((dict(candidate), required))
+        return {"action": "allow" if candidate.get("model") == "deepseek-reasoner" else "skip"}
+    return [custody]
+
+
+class TestNameMarkedRewrittenModel:
+    """A route the mark names is judged on its configured model before the build. Its provider can send
+    another model, so the walk's main step and the last-resort hop judge the built client again on the
+    model it sends. The gate admits ``deepseek-reasoner`` only."""
+
+    @staticmethod
+    def _resolves_to(client, model):
+        real = aux.resolve_provider_client
+
+        def resolve(provider, *args, **kwargs):
+            return (client, model) if provider == "deepseek" else real(provider, *args, **kwargs)
+        return patch.object(aux, "resolve_provider_client", side_effect=resolve)
+
+    @pytest.mark.parametrize("sends,served", [("deepseek-flash", False), ("deepseek-reasoner", True)],
+                             ids=["rewritten", "as-judged"])
+    def test_the_walk_judges_the_model_its_main_step_sends(self, hooks, sends, served):
+        seen, built = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _reasoner_only(seen)
+        marks = [*_marked("deepseek"), patch.multiple(
+            aux, _main_route_target=lambda _runtime, _task: ("deepseek", "deepseek-reasoner", "", "", ""),
+            _is_provider_unhealthy=lambda *_a, **_k: False, _warn_stale_openai_base_url=lambda *_a, **_k: None,
+            _get_auxiliary_task_config=lambda *_a, **_k: {}, _read_main_provider=lambda: "deepseek"),
+            patch("hermes_cli.config.load_config_readonly", return_value={}), self._resolves_to(built, sends)]
+        got = _run(lambda: aux._get_cached_client("auto", None, task="compression"), *marks)
+        assert got == ((built, sends) if served else (None, None))
+        assert [candidate["model"] for candidate, _required in seen] == list(dict.fromkeys(["deepseek-reasoner", sends]))
+
+    @pytest.mark.parametrize("sends,served", [("deepseek-flash", False), ("deepseek-reasoner", True)],
+                             ids=["rewritten", "as-judged"])
+    def test_the_hop_judges_the_model_its_client_sends(self, hooks, sends, served):
+        seen, client = [], _client(DEEPSEEK)
+        hooks["route_custody"] = _reasoner_only(seen)
+        route_hooks._bind_scope(SimpleNamespace(provider="deepseek", model="deepseek-reasoner", base_url="",
+                                                session_id="s-r", platform="", _provider_fallback_active=False,
+                                                _route_resolution_entry=None, _fallback_chain=[]))
+        marks = [*_marked("deepseek"), patch.multiple(
+            aux, _read_main_provider=lambda: "deepseek", _read_main_model=lambda: "deepseek-reasoner",
+            _is_provider_unhealthy=lambda *_a, **_k: False, main_model_fallback_refused=lambda *_a: False),
+            patch.object(aux, "resolve_provider_client", return_value=(client, sends))]
+        got = _run(lambda: aux._try_main_agent_model_fallback("zai", "compression", failed_model="glm"), *marks)
+        assert got[:2] == ((client, sends) if served else (None, None))
+        assert [candidate["model"] for candidate, _required in seen] == list(dict.fromkeys(["deepseek-reasoner", sends]))
+
+
 BAD = "http://[::1/v1"
 
 
@@ -232,6 +290,14 @@ class TestUnparsedAgentUrl:
         assert "base_url" not in entry or entry["base_url"] == LOCAL, "the unparsed URL was kept"
         assert not _run(lambda: route_hooks.check_request_route(agent, []), *_marked("zai", False))
         assert [required for _candidate, required in seen] == [True]
+
+    @pytest.mark.parametrize("off", [None, "off", False], ids=["unset", "off-string", "false"])
+    def test_under_a_mark_alone_the_record_needs_an_allow(self, hooks, off):
+        """No gate is loaded. The mark alone makes an entry at an unparsed URL required, over its own key."""
+        entry = {"provider": "custom", "model": "m", "base_url": BAD, "route_custody": off}
+        record = _run(lambda: route_hooks.resolution_record(entry, {"provider": "custom", "base_url": BAD}),
+                      *_marked("zai"))
+        assert record[route_hooks.ROUTE_CUSTODY_KEY] == route_hooks.ROUTE_CUSTODY_REQUIRED
 
     def test_a_delegated_child_record_under_a_gate_needs_an_allow(self, hooks):
         hooks["route_custody"] = _gate([])

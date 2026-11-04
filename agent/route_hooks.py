@@ -1317,18 +1317,27 @@ def _marked_route(provider: Any, base_url: Any) -> Optional[str]:
     return route if route is not None else _endpoint_route(base_url)
 
 
+_UNJUDGED = object()
+
+
 def judged_built_client(provider: Any, client: Any, model: Any, *, task: Optional[str],
-                        base_url: Any = None) -> tuple[Any, Any]:
+                        base_url: Any = None, judged: Any = _UNJUDGED) -> tuple[Any, Any]:
     """``(client, model)`` for the client a slot built, and ``(None, None)`` when F12 refuses it. A slot
     that names no marked route and has no configured *base_url* there can still build on the marked
     endpoint, through the main runtime or an env base URL, so it is judged on the URL the client sends
-    to. A slot judged before the build is not asked again, and nor is ``auto``: its walk judges each
-    candidate it builds, and :func:`judged_auto_hit` judges each cache hit."""
+    to. A slot judged before the build is not asked again on the model the gate saw then, *judged*. A
+    provider can rewrite that model, such as a ``deepseek`` alias, so a client that sends another model
+    is judged again on it. ``auto`` is not asked here: its walk judges each candidate it builds, and
+    :func:`judged_auto_hit` judges each cache hit."""
     if client is None or not _main_route_marker()[1]:
         return client, model
     from agent.auxiliary_client import _normalize_aux_provider
-    if _normalize_aux_provider(provider) == "auto" or _marked_route(provider, base_url) is not None:
+    if _normalize_aux_provider(provider) == "auto":
         return client, model
+    route = _marked_route(provider, base_url)
+    if route is not None:
+        rewritten = judged is not _UNJUDGED and model != judged
+        return (None, None) if rewritten and _refused_as(route, model, task, provider) else (client, model)
     route = _endpoint_route(client_base_url(client))
     return (None, None) if route is not None and _refused_as(route, model, task, provider) else (client, model)
 
