@@ -3639,12 +3639,14 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
         _set_reset_from_retry_after(context, payload.get("retry_after"))
     headers = getattr(getattr(error, "response", None), "headers", None)
     if headers:
+        # Ahead of Retry-After: a refused plan window reopens at its reset, whatever a short
+        # Retry-After beside it says. cade classifyProviderError reads it first too.
+        if "reset_at" not in context:
+            _set_reset_from_unified_headers(context, headers)
         _set_reset_from_retry_after(context, headers)
         ratelimit_reset = headers.get("x-ratelimit-reset")
         if ratelimit_reset and "reset_at" not in context:
             context["reset_at"] = ratelimit_reset
-        if "reset_at" not in context:
-            _set_reset_from_unified_headers(context, headers)
         if "reset_at" not in context:
             _set_reset_from_vendor_headers(context, headers)
     if "message" not in context and str(error).strip():

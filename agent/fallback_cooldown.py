@@ -55,8 +55,10 @@ def _arm_rate_limit_cooldown(
     The failing route goes to the shared store (agent/route_cooldown.py) on every hop, so its window
     outlives this agent and a fallback's wall is recorded too. ``_rate_limited_until`` stays the
     primary's: chain-switching from an active fallback means the primary was not the failing source.
-    The doubling reads the store as well, because a fresh agent starts at zero. Return the armed
-    primary cooldown in seconds, or None when not armed.
+    The doubling reads the store as well, because a fresh agent starts at zero. It counts windows,
+    not walls: a wall inside an armed window keeps the count, and the later deadline stands, so a
+    burst of in-flight calls or a soft wall's retries cannot raise a 60 s throttle to a 4 h hold.
+    Return the armed primary cooldown in seconds, or None when not armed.
     """
     if reason not in _RATE_LIMIT_FAILOVER_REASONS:
         return None
@@ -65,22 +67,28 @@ def _arm_rate_limit_cooldown(
     on_primary = not getattr(agent, "_fallback_activated", False) or bool(primary_provider and current_provider == primary_provider)
     route = (getattr(agent, "provider", ""), getattr(agent, "model", ""), getattr(agent, "base_url", ""))
     shared = read_route_cooldown(*route)
+    held_seconds = math.ceil(shared.remaining()) if shared is not None else 0
     backoff_count = max(getattr(agent, "_rate_limit_backoff_count", 0) if on_primary else 0, shared.count if shared else 0)
     provider_delay = _provider_reset_delay(reset_at)
     if provider_delay is not None:
         backoff_seconds = math.ceil(provider_delay)
         source = "provider reset"
+    elif held_seconds > 0:
+        backoff_seconds = 0
+        source = "armed window"
     else:
         backoff_seconds = min(60 * (2 ** backoff_count), 14400)
         source = "exponential fallback"
-    record_route_cooldown(*route, seconds=backoff_seconds, count=backoff_count + 1, reason=reason.value)
+    new_count = backoff_count if held_seconds > 0 else backoff_count + 1
+    record_route_cooldown(*route, seconds=backoff_seconds, count=new_count, reason=reason.value)
     if not on_primary:
         return None
-    agent._rate_limit_backoff_count = backoff_count + 1
+    backoff_seconds = max(backoff_seconds, held_seconds)
+    agent._rate_limit_backoff_count = new_count
     agent._rate_limited_until = time.monotonic() + backoff_seconds
     logging.info(
         "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",
-        backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1, source,
+        backoff_count, backoff_seconds, backoff_seconds / 60, new_count, source,
     )
     return backoff_seconds
 
