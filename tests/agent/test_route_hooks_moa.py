@@ -50,7 +50,7 @@ def outputs(results):
 
 
 def client_raw_gate(*, candidate, labels, **_kw):
-    """Refuses Kimi and Sol on a session labelled as holding a client raw export: the SPR-102 half."""
+    """Refuses Kimi and Sol on a session labelled as holding a client raw export: it allows only the Anthropic slot."""
     return {"action": "skip"} if "cade:client-raw" in labels and candidate["provider"] != "anthropic" else {"action": "allow"}
 
 
