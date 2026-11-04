@@ -59,7 +59,9 @@ block sets ``route_custody: required``.
 ``HERMES_ROUTE_CAPABILITIES`` names what this build provides, keyed by the route-gate ids. F12 means
 the serving route is judged as above. F1 is not listed. The ``auxiliary.main_model_fallback`` and
 ``compression.main_model_fallback`` keys cover explicit auxiliary slots only: a slot left on ``provider: auto`` still walks the main
-model and the main fallback chain.
+model and the main fallback chain. F7 is not listed: bare usage codes classify and carry their
+reset, but ``fallback.switch_on_plan_limit`` does not exist. F8 is the ``post_api_response``
+observer (agent/route_receipt.py) and F9 the shared cooldown store (agent/route_cooldown.py).
 """
 
 from __future__ import annotations
@@ -88,6 +90,8 @@ HERMES_ROUTE_CAPABILITIES: Mapping[str, str] = MappingProxyType({
     "F3": ROUTE_CUSTODY_HOOK,
     "F6": ROUTES_EXHAUSTED_HOOK,
     "F12": ROUTE_CUSTODY_HOOK,
+    "F8": "post_api_response",
+    "F9": "route_cooldown_store",
 })
 # Every ``phase`` a ``route_custody`` callback may receive from this build. A gate that pins a
 # revision checks that each phase it handles is listed here, and refuses a phase it does not know.

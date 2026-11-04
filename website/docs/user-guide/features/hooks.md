@@ -1882,6 +1882,10 @@ Fires for each provider attempt immediately before sending it. This is observer-
 
 Fires after a provider response has been normalized successfully. This is observer-only. Prefer the sanitized `response`; `assistant_message` is the raw normalized message, and `usage` contains accounting data.
 
+#### `post_api_response`
+
+Fires once per provider response, on success and on a failed attempt with an HTTP status, with a `receipt` dict of the `cade.route-receipt/v0` shape: `schema`, `home`, `provider`, `status`, `headers`, `usage` and `at`. `headers` holds only an allowlist of rate headers and `usage` only token counts, so a receipt never carries a message, an error body or a credential. A quota wall that arrives as an HTTP 200 `status=failed` reports `status` 429. This is observer-only, and a failure in it never reaches the turn.
+
 #### `api_request_error`
 
 Fires for a failed provider attempt with status/retry timing, an `error` object, and sanitized `request`. This is observer-only. Error messages may still contain provider or user data.

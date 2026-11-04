@@ -40,7 +40,7 @@ class _Agent:
     def _has_pending_fallback(self):
         return False
 
-    def _try_activate_fallback(self):
+    def _try_activate_fallback(self, **_kwargs):
         return False
 
     def __getattr__(self, name):

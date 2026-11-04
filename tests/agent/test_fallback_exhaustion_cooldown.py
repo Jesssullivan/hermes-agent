@@ -145,7 +145,13 @@ class TestRateLimitBackoffEscalation:
         """Simulate the primary provider rate-limiting again on a later turn
         (without a successful restore, which would reset the counter): put
         the agent's identity back on the primary and reset the turn-scoped
-        fallback chain state."""
+        fallback chain state. A later turn means a later window: a wall inside
+        an armed window does not double, so the shared deadline expires first."""
+        from agent.route_cooldown import clear_route_cooldown, read_route_cooldown, record_route_cooldown
+        held = read_route_cooldown(*snapshot)
+        if held is not None:
+            clear_route_cooldown(*snapshot)
+            record_route_cooldown(*snapshot, seconds=0, count=held.count, reason=held.reason)
         agent.provider, agent.model, agent.base_url = snapshot
         agent._fallback_activated = False
         agent._fallback_index = 0
@@ -219,6 +225,11 @@ class TestRateLimitBackoffEscalation:
         agent._rate_limited_until = 0
         assert agent._restore_primary_runtime() is True
         assert agent._rate_limit_backoff_count == 0
+
+        # A restore alone proves nothing, so the shared count stands until the route serves a
+        # response (agent/route_cooldown.py).
+        from agent.route_cooldown import clear_route_cooldown
+        clear_route_cooldown(agent.provider, agent.model, agent.base_url)
 
         # The next rate-limit is treated as a fresh first failure: 60s.
         with (

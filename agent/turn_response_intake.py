@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, Optional
 
 from agent.provider_projection import splice_provider_projection
+from agent.route_receipt import fire_route_receipt
 from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_truncation import (
     CODEX_FALLBACK_ACTIVATED, continue_codex_incomplete, normalize_response_for_agent, partial_result,
@@ -145,6 +146,7 @@ def normalize_model_response(
         api_call_count=api_call_count, api_duration=api_duration, api_start_time=api_start_time,
         api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
     )
+    fire_route_receipt(agent, status=200, task_id=effective_task_id, turn_id=turn_id, response=response)
     from hermes_cli.observability.shared_metrics_harness import record_reply_content
     record_reply_content(agent, response, assistant_message)
 
