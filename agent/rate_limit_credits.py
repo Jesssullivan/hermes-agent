@@ -47,6 +47,8 @@ class RateLimitCreditsMixin:
         if not headers:
             return
         try:
+            from agent.route_receipt import receipt_headers
+            self._last_route_headers = receipt_headers(headers)  # the attempt's receipt takes these
             from agent.rate_limit_tracker import parse_rate_limit_headers
             state = parse_rate_limit_headers(headers, provider=self.provider)
             if state is not None:

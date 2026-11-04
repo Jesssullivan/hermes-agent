@@ -675,6 +675,9 @@ _MESSAGE_TAIL_RULES = (
 _ERROR_CODE_VERDICTS: dict[str, Verdict] = {
     **dict.fromkeys(("resource_exhausted", "throttled", "rate_limit_exceeded"),
                     _v(_R.rate_limit, should_rotate_credential=True)),
+    # A plan window that arrives as a bare code with no status: a Responses ``response.failed``
+    # frame (HTTP 200) or a stream ``error`` frame. The 429 path decides before this table.
+    **dict.fromkeys(("usage_limit_reached", "subscription_sharing_usage_limit_exceeded"), _V_RATE_LIMIT),
     **dict.fromkeys(_BILLING_ERROR_CODES, _V_BILLING),
     **dict.fromkeys(("model_not_found", "model_not_available", "invalid_model"), _V_MODEL_NOT_FOUND),
     **dict.fromkeys(("context_length_exceeded", "max_tokens_exceeded"), _V_CONTEXT_OVERFLOW),
@@ -1309,7 +1312,9 @@ _STATUS_HANDLERS: dict[int, Callable[[_Ctx], Verdict]] = {
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 _RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")
-_RESET_HEADERS = ("retry-after", "Retry-After", "x-ratelimit-reset", "X-RateLimit-Reset")
+_RESET_HEADERS = (
+    "retry-after", "Retry-After", "x-ratelimit-reset", "X-RateLimit-Reset", "anthropic-ratelimit-unified-reset",
+)
 
 
 def _has_usage_limit_transient_signal(error_msg: str, body: dict, response_headers) -> bool:

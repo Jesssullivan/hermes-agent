@@ -220,6 +220,11 @@ class TestRateLimitBackoffEscalation:
         assert agent._restore_primary_runtime() is True
         assert agent._rate_limit_backoff_count == 0
 
+        # A restore alone proves nothing, so the shared count stands until the route serves a
+        # response (agent/route_cooldown.py).
+        from agent.route_cooldown import clear_route_cooldown
+        clear_route_cooldown(agent.provider, agent.model, agent.base_url)
+
         # The next rate-limit is treated as a fresh first failure: 60s.
         with (
             patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
