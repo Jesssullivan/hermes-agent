@@ -1428,7 +1428,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         return image_paths, audio_paths, audio_file_paths, video_paths
 
     async def _enrich_inbound_images(
-        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
+        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str],
+        history: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
         # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
@@ -1449,19 +1450,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         )
         # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
         # runtime explicitly rather than consulting process-global compatibility mirrors.
-        vision_runtime = None
+        from agent.route_hooks import take_resolution_entry
+        vision_runtime, route_entry = None, None
         try:
             turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source, session_key=session_key,
             )
+            route_entry = take_resolution_entry()  # the turn's own resolution stashes its record again
             vision_runtime = {**(runtime_kwargs or {}), "model": turn_model}
         except Exception:
             logger.debug("vision enrichment: session runtime resolution failed", exc_info=True)
 
         from agent.auxiliary_client import scoped_runtime_main
+        from gateway.route_vision import vision_under_custody
+        from gateway.run_turn_prepare import _resolution_session_id
 
         with scoped_runtime_main(vision_runtime):
-            return await self._enrich_message_with_vision(message_text, image_paths)
+            return await vision_under_custody(
+                lambda: self._enrich_message_with_vision(message_text, image_paths), route_entry, vision_runtime,
+                session_id=lambda: _resolution_session_id(self, source, session_key),
+                messages=[*(history or ()), {"role": "user", "content": message_text}],
+                message_text=message_text, image_paths=image_paths)
 
     async def _echo_stt_transcripts(
         self, adapter, source: SessionSource, transcripts: list[str], *, metadata=None, log_context: str = "Transcript"
@@ -1669,7 +1678,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
         if image_paths:
-            message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
+            message_text = await self._enrich_inbound_images(
+                source, session_key, message_text, image_paths, history=history)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)

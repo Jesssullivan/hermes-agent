@@ -25,6 +25,7 @@ from agent.message_content import flatten_message_text
 from agent.lsp.deferred import forward_to_agent as forward_lsp_verdicts
 from agent.plugin_live_notes import pop_plugin_notices
 from agent.skills_index_delta import stage_skills_index_note
+from agent.route_hooks import begin_turn as begin_route_turn
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -1165,6 +1166,13 @@ def build_turn_context(
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
+    # Route hooks (agent/route_hooks.py), before turn-start compaction can send this turn to the
+    # active route: turn_route labels the turn, route_custody judges the serving route. A custody
+    # move changed the route, so auxiliary ``auto`` calls and the turn's prompt must learn it too.
+    if begin_route_turn(agent, messages=messages, turn_id=turn_id):
+        _publish_runtime_main(agent)
+        from agent.conversation_loop import _sync_failover_system_message
+        active_system_prompt = _sync_failover_system_message(agent, None, active_system_prompt)
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,

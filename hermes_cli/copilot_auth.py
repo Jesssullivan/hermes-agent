@@ -237,6 +237,14 @@ _exchange_failure_cache: dict[str, float] = {}
 # the ONE in-flight exchange instead of each spawning a hung resolver thread during a DNS outage.
 _exchange_locks: dict[str, threading.Lock] = {}
 _exchange_locks_guard = threading.Lock()
+# The API hosts the exchange's ``endpoints.api`` names for each Copilot plan.
+COPILOT_PLAN_API_URLS = ("https://api.individual.githubcopilot.com", "https://api.business.githubcopilot.com",
+                         "https://api.enterprise.githubcopilot.com")
+
+
+def exchanged_api_urls() -> list[str]:
+    """The API base URL each token exchange in this process returned. No token leaves this module."""
+    return sorted({entry[2] for entry in list(_jwt_cache.values()) if len(entry) > 2 and entry[2]})
 
 
 def _exchange_lock_for(fp: str) -> threading.Lock:

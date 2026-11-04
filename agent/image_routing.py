@@ -372,6 +372,19 @@ def _lookup_supports_vision(
     return None
 
 
+def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
+    """True when ``provider``/``model`` is known to accept image input; unknown capability → True (attempt the call)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+    except ImportError:
+        return True
+    try:
+        supports = _lookup_supports_vision(provider, model, load_config_readonly())
+    except Exception:  # health: allow BLE001 -- an unknown capability attempts the call
+        return True
+    return True if supports is None else bool(supports)
+
+
 def decide_image_input_mode(
     provider: str,
     model: str,

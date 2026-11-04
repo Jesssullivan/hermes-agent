@@ -30,6 +30,10 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
+from agent.route_hooks import (
+    ROUTE_CUSTODY_REASON, RouteCustodyRefused, end_turn as end_route_turn, route_custody_refused_result,
+    route_custody_stopped,
+)
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
@@ -37,10 +41,11 @@ from agent.surface_switch import (
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_route_check import enforce_request_route
 from agent.turn_scripted_prelude import Prelude, play_prelude
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call, stop_thinking_spinner
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, OPEN_TURN_TAIL_ROLES, failed_turn_notice, site_copy
@@ -1475,6 +1480,14 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> dict[str, Any
     )
 
 
+def _turn_start_stop_result(agent, exc, conversation_history) -> dict[str, Any]:
+    """A turn stopped during setup with no request sent: a preflight compression timeout, or
+    route custody refusing the only route (``agent/route_hooks.py``)."""
+    if isinstance(exc, RouteCustodyRefused):
+        return route_custody_refused_result(agent, exc, conversation_history)
+    return _preflight_timeout_result(agent, exc, conversation_history)
+
+
 @dataclass
 class _LoopState:
     """Every local the turn loop threads through the phase helpers in ``agent/turn_*.py``.
@@ -1592,17 +1605,47 @@ def _run_phase(fn, agent, state: _LoopState, **extra):
     return verdict
 
 
+def _start_iteration(agent, s: _LoopState) -> bool:
+    """Open one iteration. ``False`` ends the turn: the loop's own stop, or route custody refusing
+    the route before this request (``agent/turn_route_check.py``)."""
+    if _run_phase(begin_iteration, agent, s).action == "break":
+        return False
+    _run_phase(prepare_iteration, agent, s)
+    return _run_phase(enforce_request_route, agent, s, refund=True).action != "break"
+
+
+def _finish_turn(agent, s: _LoopState) -> dict[str, Any]:
+    """Post-loop finalization (agent/turn_finalizer.finalize_turn) and its typed endings."""
+    result = finalize_turn(agent, **{
+        name: getattr(s, name)
+        for name in inspect.signature(finalize_turn).parameters if name != "agent"
+    })
+    if ROUTE_CUSTODY_REASON in (s._turn_exit_reason, result.get("turn_exit_reason")):
+        result = route_custody_stopped(agent, result)
+    if s._compression_timeout_exhausted:
+        # Reuse the gateway's context-recovery contract: transcript stays intact while
+        # future input can move to a clean session (#98722).
+        result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
+    return result
+
+
 def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
     """One API call with its retry/recovery loop (guard → build → call → check, error handlers).
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+    attempted = False
     while s.retry_count < s.max_retries:
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
         if _ng.action == "break":
             return None
+        # ``_start_iteration`` judged the first attempt. Each retry is a request too (route custody).
+        if attempted and _run_phase(enforce_request_route, agent, s, refund=False).action == "break":
+            s.thinking_spinner = stop_thinking_spinner(agent, s.thinking_spinner)
+            return _finish_turn(agent, s)
+        attempted = True
         try:
             _run_phase(build_api_request, agent, s)
             if _run_phase(perform_api_call, agent, s).action == "break":
@@ -1711,8 +1754,8 @@ def _run_conversation_turn(
             moa_active=bool(moa_config),
             title_user_message=title_user_message,
         )
-    except PreflightCompressionTimedOut as _preflight_timeout_exc:
-        return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
+    except (PreflightCompressionTimedOut, RouteCustodyRefused) as _turn_start_exc:
+        return _turn_start_stop_result(agent, _turn_start_exc, conversation_history)
     # Voice turns may run on auxiliary.voice_chat: bound after the prompt/row/compaction were settled
     # against the main model, undone in finalize_turn (and run_conversation's finally on early exits).
     from agent.voice_turn_route import begin_voice_turn_route
@@ -1749,9 +1792,8 @@ def _run_conversation_turn(
     while _prelude_action != "break" and (
         (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call
     ):
-        if _run_phase(begin_iteration, agent, s).action == "break":
+        if not _start_iteration(agent, s):
             break
-        _run_phase(prepare_iteration, agent, s)
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
@@ -1795,16 +1837,7 @@ def _run_conversation_turn(
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
                 break
 
-    # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
-    result = finalize_turn(agent, **{
-        name: getattr(s, name)
-        for name in inspect.signature(finalize_turn).parameters if name != "agent"
-    })
-    if s._compression_timeout_exhausted:
-        # Reuse the gateway's context-recovery contract: transcript stays intact while
-        # future input can move to a clean session (#98722).
-        result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
-    return result
+    return _finish_turn(agent, s)
 
 
 def run_conversation(
@@ -1862,6 +1895,7 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            end_route_turn(agent)  # a later compaction in this context is outside the turn (route_custody)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

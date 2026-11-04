@@ -8,8 +8,9 @@ the agent): a rendered transcript through :func:`agent.oneshot.run_oneshot`.
 ``auxiliary.side_question.provider``/``.model`` route the fork elsewhere with a compact digest.
 """
 
+from contextlib import contextmanager
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from agent.background_review import _msg_text
 
@@ -111,6 +112,7 @@ def _answer_via_fork(parent_agent: Any, question: str, history: Optional[list[di
     from agent.background_review import (
         _digest_history, _record_review_usage_to_parent, _snapshot_review_usage, build_cache_parity_fork,
     )
+    from agent.route_hooks import ROUTE_CUSTODY_REASON, RouteCustodyRefused
     from hermes_cli.plugins import clear_thread_tool_whitelist, set_thread_tool_whitelist
 
     fork, _rt, routed = build_cache_parity_fork(parent_agent, _side_question_task_config(),
@@ -124,6 +126,8 @@ def _answer_via_fork(parent_agent: Any, question: str, history: Optional[list[di
         snapshot = trim_snapshot_for_fork(history)
         result = fork.run_conversation(user_message=f"{_FORK_PROMPT}\n\nSide question: {question}",
                                        conversation_history=_digest_history(snapshot) if routed else snapshot)
+        if (result or {}).get("failure_reason") == ROUTE_CUSTODY_REASON:
+            raise RouteCustodyRefused(f"route custody refused the side question: {result.get('error')}")
         answer = (result or {}).get("final_response", "") or ""
         if not answer and result and result.get("error"):
             raise RuntimeError(str(result["error"]))
@@ -152,32 +156,78 @@ def _answer_via_oneshot(question: str, history: Optional[list[dict[str, Any]]], 
     return run_oneshot(instructions=_ONESHOT_INSTRUCTIONS, user_input=user_input, task=SIDE_QUESTION_TASK, **run_kwargs)
 
 
+def _rides_main_route(parent_agent: Any, main_runtime: Optional[dict[str, Any]]) -> bool:
+    """Whether a side question sends on the session's main route. Only a slot that names a provider
+    and a model off that route leaves it, as ``_resolve_review_runtime`` decides for the fork. An
+    unreadable slot counts as the main route (fail closed)."""
+    try:
+        from agent.route_hooks import provider_matches
+        task = _side_question_task_config()
+        provider, model = (str(task.get(key) or "").strip() for key in ("provider", "model"))
+        if not model or provider.lower() in {"", "auto", "main", "custom:main"}:
+            return True
+        main = (main_runtime or {}).get("provider") or getattr(parent_agent, "provider", "")
+        return provider_matches(provider, main)
+    except Exception:  # health: allow BLE001 -- an unreadable slot is treated as the main route
+        logger.debug("side question slot lookup failed; treating it as the main route", exc_info=True)
+        return True
+
+
+@contextmanager
+def _side_question_custody(question: str, history: Optional[list[dict[str, Any]]], parent_agent: Any,
+                           main_runtime: Optional[dict[str, Any]], route: Optional[dict[str, Any]]) -> Iterator[None]:
+    """Route custody for the whole side question: the transcript and the question reach the same
+    route on both paths, so ``route_custody`` is asked first (``phase="auxiliary"``,
+    ``task="side_question"``), and a refusal sends nothing. *route* names the resolved entry record,
+    the session id and the platform of *main_runtime*."""
+    from agent.route_hooks import agent_custody_applies, custody_applies, detached_auxiliary, entry_requires_custody
+    route, runtime = route or {}, main_runtime or {}
+    record = route.get("record")
+    if not (custody_applies(record) or agent_custody_applies(parent_agent) or entry_requires_custody(runtime)):
+        yield
+        return
+    session_id = route.get("session_id") or getattr(parent_agent, "session_id", "") or runtime.get("session_id")
+    with detached_auxiliary(
+            record, task=SIDE_QUESTION_TASK, session_id=session_id, provider=runtime.get("provider"),
+            model=runtime.get("model"), messages=[*(history or ()), {"role": "user", "content": question}],
+            rides_main=_rides_main_route(parent_agent, main_runtime),
+            platform=str(route.get("platform") or getattr(parent_agent, "platform", "") or ""), parent=parent_agent,
+            base_url=runtime.get("base_url")):
+        yield
+
+
 def answer_side_question(
     question: str, history: Optional[list[dict[str, Any]]], *, parent_agent: Any = None,
     main_runtime: Optional[dict[str, Any]] = None, max_tokens: int = 2048, temperature: Optional[float] = 0.3,
     timeout: float = 180.0, on_fork: Optional[Callable[[Any], None]] = None,
-    should_stop: Optional[Callable[[], bool]] = None,
+    should_stop: Optional[Callable[[], bool]] = None, route: Optional[dict[str, Any]] = None,
 ) -> str:
     """Fork when ``parent_agent`` is live, else (or on empty answer / failure) the one-shot
-    digest. Raises on failure — callers surface the error on their own UI.
+    digest. Raises on failure — callers surface the error on their own UI. A custody refusal
+    (``agent/route_hooks.py``) raises too and never falls through to the one-shot.
 
     ``on_fork`` receives the fork once built (and ``None`` after its teardown) so the caller can
-    interrupt it; ``should_stop()`` true after the fork skips the one-shot fallback."""
+    interrupt it; ``should_stop()`` true after the fork skips the one-shot fallback. ``route`` is
+    the custody context of ``main_runtime`` (:func:`_side_question_custody`)."""
+    from agent.route_hooks import RouteCustodyRefused
     question = (question or "").strip()
     if not question:
         raise ValueError("answer_side_question requires a non-empty question")
 
-    if parent_agent is not None:
-        try:
-            answer = (_answer_via_fork(parent_agent, question, history, on_fork) if on_fork is not None
-                      else _answer_via_fork(parent_agent, question, history))
-            if answer:
-                return answer
-            logger.warning("/btw fork returned an empty answer; falling back to one-shot")
-        except Exception:
-            logger.warning("/btw cache-parity fork failed; falling back to one-shot", exc_info=True)
-    if should_stop is not None and should_stop():
-        raise RuntimeError("side question stopped")
+    with _side_question_custody(question, history, parent_agent, main_runtime, route):
+        if parent_agent is not None:
+            try:
+                answer = (_answer_via_fork(parent_agent, question, history, on_fork) if on_fork is not None
+                          else _answer_via_fork(parent_agent, question, history))
+                if answer:
+                    return answer
+                logger.warning("/btw fork returned an empty answer; falling back to one-shot")
+            except RouteCustodyRefused:
+                raise
+            except Exception:
+                logger.warning("/btw cache-parity fork failed; falling back to one-shot", exc_info=True)
+        if should_stop is not None and should_stop():
+            raise RuntimeError("side question stopped")
 
-    return _answer_via_oneshot(question, history, main_runtime=main_runtime, max_tokens=max_tokens,
-                               temperature=temperature, timeout=timeout)
+        return _answer_via_oneshot(question, history, main_runtime=main_runtime, max_tokens=max_tokens,
+                                   temperature=temperature, timeout=timeout)

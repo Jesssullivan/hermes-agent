@@ -1962,8 +1962,7 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
-    # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
-    # See #22548, #62984, #70893.
+    # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure (#22548, #62984, #70893).
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
@@ -1973,7 +1972,8 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
         return True
-    return False
+    from agent.route_hooks import fallback_custody_refuses  # route_custody (F3): per turn, not added to unavailable
+    return fallback_custody_refuses(agent, fb, fb_provider, fb_model)
 
 
 def _update_fallback_context_compressor(agent) -> None:
@@ -2094,7 +2094,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
-            agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+            agent._provider_fallback_route, agent._route_fallback_entry = (str(fb_model), str(fb_provider)), fb
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
@@ -2287,8 +2287,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     else:
         agent._safe_print(warning, diagnostic=True)
 
-    summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
-    summary_call_outcome = "failed"
+    from agent.turn_route_check import RouteCustodyRefused, check_summary_route
+    summary_api_request_id, summary_call_outcome = f"iteration-summary:{uuid.uuid4()}", "failed"
 
     # Shared constant so compaction recognizers can identify this runtime nudge by its stable
     # content after SessionDB projection strips metadata flags.
@@ -2297,13 +2297,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     try:
         api_messages = _iteration_summary_api_messages(agent, messages)
-        build_attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
-        attempt = build_attempt(agent, api_messages, summary_api_request_id)
 
         # One retry on an empty summary; a summary empty once its <think> block is stripped is NOT retried.
         final_response = _EMPTY_SUMMARY_RESPONSE
         for retry_count in (0, 1):
-            text = attempt(retry_count)
+            check_summary_route(agent, messages)  # custody may move the route: each attempt builds for its own
+            attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
+            text = attempt(agent, api_messages, summary_api_request_id)(retry_count)
             if not text:
                 continue
             if "<think>" in text:
@@ -2314,9 +2314,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = text
             break
 
-    except InterruptedError:
-        # Cancellation is not a summary failure: drop the unanswered nudge and let the
-        # finalizer end the turn as interrupted so the pending message is requeued.
+    except (InterruptedError, RouteCustodyRefused):
+        # Cancellation or a custody stop is not a summary failure: drop the unanswered nudge and let
+        # the finalizer end the turn on its own reason, so a pending message is requeued.
         summary_call_outcome = "cancelled"
         if messages and messages[-1] is nudge:
             messages.pop()

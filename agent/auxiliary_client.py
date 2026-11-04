@@ -120,8 +120,11 @@ def aux_probe_mode():
 
 
 from agent.credential_pool import load_pool
+from agent.image_routing import _main_model_supports_vision
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
+from agent.route_hooks import auxiliary_refuses, auxiliary_request, auxiliary_walk, client_base_url, discovery_mark_refuses, discovery_refused
+from agent.route_hooks import carry_auto_entry, judged_auto_hit, judged_auto_model, judged_built_client, judged_entry_client, judged_vision_client, main_route_refuses, marked_main_refuses, vision_send_refused
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -4242,7 +4245,7 @@ def _try_payment_fallback(
     # The SESSION's provider decides whether discovery is allowed: a live `/model xai-oauth` session
     # over a persisted ``provider: auto`` is a selection, so the disk value alone is not the answer.
     main_provider = _normalize_main_runtime(main_runtime).get("provider") or _read_main_provider()
-    if not _discovery_chain_allowed(main_provider, task):
+    if discovery_refused(task) or not _discovery_chain_allowed(main_provider, task):  # route_custody (F3) first
         return None, None, ""
     skip_labels = {skip}
     if main_provider and main_provider.lower() in skip:
@@ -4323,35 +4326,25 @@ def _try_main_agent_model_fallback(
     if _is_provider_unhealthy(main_provider, main_base_url):
         _log_skip_unhealthy(main_provider, task, base_url=main_base_url)
         return None, None, ""
-    if main_model_fallback_refused(task, reason, failed_provider):  # after the no-op checks
+    if main_model_fallback_refused(task, reason, failed_provider) or main_route_refuses(  # after the no-op checks
+            main_provider, main_model, task=task, failed_provider=failed_provider, failed_model=failed_model, base_url=main_base_url):
         return None, None, ""
-    try:
+    try:  # judged again at the URL the client sends to: a custom main can fall through to an API-key provider
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
+        client, resolved_model = judged_built_client(main_provider, client, resolved_model or main_model, task=task,
+                                                     base_url=main_base_url, judged=main_model)
     except Exception:
         client, resolved_model = None, None
     if client is None:
         return None, None, ""
-    label = f"main-agent({main_provider})"
-    logger.info("Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
-                task or "call", reason, failed_provider, label, resolved_model or main_model)
-    return client, resolved_model or main_model, label
+    logger.info("Auxiliary %s: %s on %s — falling back to main agent model main-agent(%s) (%s)",
+                task or "call", reason, failed_provider, main_provider, resolved_model or main_model)
+    return client, resolved_model or main_model, f"main-agent({main_provider})"
 
 
-# Context-window screening for runtime fallback chains: the startup feasibility check filters
-# too-small aux models; runtime chains must too, or compression stops at a reachable-but-too-small
-# candidate. ``None`` (unknown) passes through.
-
-# ── Context-window screening for runtime fallback chains (issue #52392) ── When the runtime auxiliary
-# fallback chain selects a candidate that is reachable but has a context window smaller than the compression
-# task requires, the call errors out instead of continuing to the next, viable candidate. The startup
-# feasibility check in ``agent.conversation_compression.check_compression_model_feasibility`` already
-# filters too-small auxiliary models at startup, but the runtime fallback chain
-# (``_try_configured_fallback_chain`` and ``_try_main_fallback_chain``) does not apply the same filter, so
-# compression can stop at the first alive door even if the room behind it is too small. The helpers below
-# screen each candidate by its effective context window before it is returned. ``None`` results from
-# ``get_model_context_length`` are passed through (we cannot prove a model is too small, so we do not block
-# it). This preserves the existing fallback surface for unrecognised/custom models while closing the gap on
-# the well-known ones.
+# ── Context-window screening for runtime fallback chains (issue #52392) ── A reachable candidate too small
+# for the compression task errors out instead of continuing. The helpers below screen each candidate by its
+# effective context window. ``None`` from ``get_model_context_length`` passes: such a model is not proven small.
 def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
     """Minimum context length for an auxiliary task; None = no floor (only ``compression`` has one)."""
     return MINIMUM_CONTEXT_LENGTH if task == "compression" else None
@@ -4413,7 +4406,8 @@ def _try_configured_fallback_chain(
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
-        if skip(fb_provider, fb_model_raw, fb_base_url):
+        if skip(fb_provider, fb_model_raw, fb_base_url) or auxiliary_refuses(  # route_custody (F3)
+                entry, task=task, failed_provider=failed_provider, failed_model=failed_model):
             continue
         if _is_provider_unhealthy(fb_provider, fb_base_url):
             _log_skip_unhealthy(fb_provider, task, base_url=fb_base_url)
@@ -4422,7 +4416,9 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
         label = f"fallback_chain[{i}]({fb_provider})"
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = judged_entry_client(  # route_custody (F12), again on a rewritten model
+                entry, *_resolve_fallback_entry(entry), task=task, judged=entry.get("model"),
+                failed_provider=failed_provider, failed_model=failed_model)
         except Exception:
             fb_client, resolved_model = None, None
         if fb_client is not None:
@@ -4502,10 +4498,10 @@ def _try_main_fallback_chain(
         fb_model = str(entry.get("model") or "").strip()
         if not fb_provider or not fb_model:
             continue
-        fb_norm = fb_provider.lower()
-        label = f"fallback_providers[{i}]({fb_provider})"
+        fb_norm, label = fb_provider.lower(), f"fallback_providers[{i}]({fb_provider})"
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
-        if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
+        if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url) or auxiliary_refuses(  # route_custody (F3)
+                entry, task=task, failed_provider=failed_provider, failed_model=failed_model):
             tried.append(f"{label} (skipped)")
             continue
         if _is_provider_unhealthy(fb_norm, fb_base_url):
@@ -4513,7 +4509,9 @@ def _try_main_fallback_chain(
             tried.append(f"{label} (unhealthy)")
             continue
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = judged_entry_client(  # route_custody (F12), again on a rewritten model
+                entry, *_resolve_fallback_entry(entry), task=task, judged=entry.get("model"),
+                failed_provider=failed_provider, failed_model=failed_model)
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
@@ -4678,21 +4676,27 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
-    routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
-    if routed is not None:
-        return routed
-    if task:
-        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+    with auxiliary_walk():
+        if not marked_main_refuses(main_provider, main_model, task=task, base_url=base_url):  # route_custody (F12)
+            routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
+            if routed is not None and judged_built_client(
+                    main_provider, *routed[:2], task=task, base_url=base_url, judged=main_model)[0] is not None:
+                return routed  # judged again at the URL the client sends to: a custom main can fall through to an API-key provider
+        if task:
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, main_provider or "auto", reason="main provider unavailable")
+            if fb_client is not None:
+                return fb_client, fb_model, _fallback_provider_from_label(fb_label)
+        fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
-            return fb_client, fb_model, _fallback_provider_from_label(fb_label)
-    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-        task, main_provider or "auto", reason="main provider unavailable")
-    if fb_client is not None:
-        return fb_client, fb_model, fb_label
-    if not _discovery_chain_allowed(main_provider, task):
-        return None, None, ""
-    return _try_discovery_chain()
+            return fb_client, fb_model, fb_label
+        if discovery_refused(task) or not _discovery_chain_allowed(main_provider, task):
+            return None, None, ""
+    client, model, label = _try_discovery_chain()
+    if client is not None and discovery_mark_refuses(_effective_provider_for_client(client, label), model, task=task, base_url=client_base_url(client)):
+        return None, None, ""  # route_custody (F12): a candidate the mark covers carries nothing unadmitted
+    return client, model, label
 
 
 def _effective_provider_for_client(client: Any, fallback: str) -> str:
@@ -4996,7 +5000,9 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
         logger.debug("Dropping OpenRouter-format model %r for non-OpenRouter "
                      "auxiliary provider (using %r instead)", model, resolved)
         model = None
-    routed_client, routed_model = _route_client(req, client, model or resolved)
+    if judged_auto_model(_effective_provider_for_client(client, effective_provider), client, model or resolved, resolved, task=req.task):
+        return None, None  # route_custody (F12): the slot's own model is judged on the route the walk picked
+    routed_client, routed_model = carry_auto_entry(client, *_route_client(req, client, model or resolved))  # route_custody: its chain entry
     if routed_client is not None and effective_provider:
         try:
             routed_client._hermes_aux_effective_provider = effective_provider
@@ -5508,27 +5514,15 @@ def resolve_provider_client(
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str, Any]] = None) -> tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
+    if marked_main_refuses(provider, model, task=task or None, base_url=base_url):  # route_custody (F12)
+        return None, None
+    return judged_built_client(provider, *resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
-    )
+    ), task=task or None, base_url=base_url, judged=model)  # route_custody (F12): the endpoint and model it sends
 
 
 _VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
-
-
-def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
-    """True when ``provider``/``model`` is known to accept image input; unknown capability → True (attempt the call)."""
-    try:
-        from agent.image_routing import _lookup_supports_vision
-        from hermes_cli.config import load_config_readonly
-    except ImportError:
-        return True
-    try:
-        supports = _lookup_supports_vision(provider, model, load_config_readonly())
-    except Exception:  # pragma: no cover - defensive
-        return True
-    return True if supports is None else bool(supports)
 
 
 def _normalize_vision_provider(provider: Optional[str]) -> str:
@@ -5585,12 +5579,12 @@ def get_available_vision_backends() -> list[str]:
 
 def _finalize_vision_client(
     resolved_provider: str, sync_client: Any, default_model: Optional[str],
-    resolved_model: Optional[str], async_mode: bool,
+    resolved_model: Optional[str], async_mode: bool, judged: Any = ..., judged_url: Any = None,
 ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Apply the explicit model override (and async wrapping) to a resolved vision client."""
-    if sync_client is None:
-        return resolved_provider, None, None
+    """Apply the model override and async wrapping; route custody (F12) judges what it sends (vision_send_refused)."""
     final_model = resolved_model or default_model
+    if vision_send_refused(resolved_provider, sync_client, final_model, judged, judged_url):
+        return resolved_provider, None, None
     if async_mode:
         async_client, async_model = _to_async_client(sync_client, final_model, is_vision=True)
         return resolved_provider, async_client, async_model
@@ -5599,12 +5593,11 @@ def _finalize_vision_client(
 
 def _vision_main_provider_client(
     main_provider: str, main_model: str, runtime: dict[str, Any], resolved_model: Optional[str],
-    resolved_api_mode: Optional[str],
+    resolved_api_mode: Optional[str], provider_vision_default: Optional[str],
 ) -> tuple[Optional[Any], Optional[str]]:
     """Auto-detect step 1: try the main provider; (None, None) falls through to the aggregator chain."""
     # A provider vision default (static override or catalog discovery) is a *known* multimodal
     # model; the pinned chat model usually isn't, so only fall back to it when no default exists.
-    provider_vision_default = _resolve_provider_vision_default(main_provider)
     vision_model = provider_vision_default or main_model
     if main_provider == "nous":
         # Nous picks its vision model from Portal tier-aware slots inside _try_nous(vision=True);
@@ -5660,15 +5653,19 @@ def _vision_auto_route(
             main_provider, main_model = _agg_provider, _agg_model
             runtime = dict(runtime, base_url="", api_key="", api_mode="")
     if main_provider and main_provider not in {"auto", "", "moa"}:
-        client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
+        vision_default = _resolve_provider_vision_default(main_provider)  # the model step 1 sends
+        judged = resolved_model or (vision_default if main_provider == "nous" else vision_default or main_model)
+        if marked_main_refuses(main_provider, judged, task="vision", base_url=runtime.get("base_url")):
+            return None, None, None  # route_custody (F12): no image leaves, and no discovery follows a refusal
+        client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode, vision_default)
         if client is not None:
-            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
+            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode, judged, runtime.get("base_url"))
     # Aggregators use their dedicated vision model, not the user's main model.
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:
             continue  # already tried above
         sync_client, default_model = _resolve_strict_vision_backend(candidate)
-        if sync_client is not None:
+        if sync_client is not None:  # route_custody (F12) judges the model it picked; a refusal ends the walk
             return _finalize_vision_client(candidate, sync_client, default_model, resolved_model, async_mode)
     logger.debug("Auxiliary vision client: none available")
     return None, None, None
@@ -5697,17 +5694,21 @@ def resolve_vision_provider_client(
     raw_requested, requested = requested, _normalize_vision_provider(requested)
     if resolved_base_url:
         provider_for_base_override = requested if requested and requested not in {"", "auto"} else "custom"
+        if marked_main_refuses(provider_for_base_override, resolved_model, task="vision", base_url=resolved_base_url):
+            return provider_for_base_override, None, None  # route_custody (F12)
         client, final_model = resolve_provider_client(
             provider_for_base_override, model=resolved_model, async_mode=async_mode,
             explicit_base_url=resolved_base_url, explicit_api_key=resolved_api_key,
             api_mode=resolved_api_mode, main_runtime=runtime,
         )
-        return provider_for_base_override, client, (final_model if client is not None else None)
+        return provider_for_base_override, *judged_vision_client(provider_for_base_override, client, final_model, resolved_model, resolved_base_url)
     if requested == "auto":
         return _vision_auto_route(runtime, resolved_model, resolved_api_mode, async_mode)
     if requested in _VISION_AUTO_PROVIDER_ORDER:
+        if marked_main_refuses(requested, resolved_model, task="vision"):
+            return requested, None, None  # route_custody (F12)
         sync_client, default_model = _resolve_strict_vision_backend(requested, resolved_model)
-        return _finalize_vision_client(requested, sync_client, default_model, resolved_model, async_mode)
+        return _finalize_vision_client(requested, sync_client, default_model, resolved_model, async_mode, resolved_model)
     if requested == "zai":
         for _zai_url in _ZAI_OPENAI_VISION_URLS:
             client, final_model = _get_cached_client(
@@ -5716,12 +5717,12 @@ def resolve_vision_provider_client(
                 is_vision=True,
             )
             if client is not None:
-                return _finalize_vision_client(requested, client, final_model, resolved_model, async_mode)
+                return _finalize_vision_client(requested, client, final_model, resolved_model, async_mode, resolved_model)
         # Fallback: try without explicit base_url (old behavior)
     client, final_model = _get_cached_client(
         raw_requested, resolved_model, async_mode, api_mode=resolved_api_mode, main_runtime=runtime, is_vision=True,
     )
-    return requested, client, (final_model if client is not None else None)
+    return requested, *judged_vision_client(raw_requested, client, final_model, resolved_model)
 
 
 def get_auxiliary_extra_body() -> dict:
@@ -6016,9 +6017,7 @@ def _get_cached_client(
     Async clients bind to the loop they were created on, so every async hit validates the cached
     loop is the current, open loop; stale entries are replaced in place (bounded, no cross-loop reuse).
 
-    This keeps cache size bounded to one entry per unique provider config, preventing the fd-exhaustion that
-    previously occurred in long-running gateways where recycled worker threads created unbounded entries
-    (#10200).
+    One entry per provider config keeps the cache bounded: recycled gateway workers once exhausted fds (#10200).
     """
     # A bare llama.cpp alias keys on the live local endpoint: a restarted server (new port/key)
     # must not be served the old client, and a stopped one resolves to nothing, not a cloud client.
@@ -6028,7 +6027,9 @@ def _get_cached_client(
         if not local[0]:
             return None, None
         base_url, api_key = local
-    current_loop = _current_event_loop() if async_mode else None
+    if marked_main_refuses(provider, model, task=task, base_url=base_url):  # route_custody (F12): names or reaches the mark
+        return None, None
+    current_loop, hit = (_current_event_loop() if async_mode else None), None
     runtime = _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(
         provider, async_mode=async_mode, base_url=base_url, api_key=api_key, api_mode=api_mode,
@@ -6041,11 +6042,16 @@ def _get_cached_client(
                 cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
             )
             if loop_ok:
-                return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
-            del _client_cache[cache_key]
+                hit = cached_client, _compat_model(cached_client, model, cached_default)
+            else:  # Stale async entry: evict. Only a closed owner loop may be awaited; a live foreign one stays neutered.
+                _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+                del _client_cache[cache_key]
+    if hit is not None and _normalize_aux_provider(provider) == "auto":  # route_custody (F12): any spelling of auto, judged as its walk judged it
+        if (judged := judged_auto_hit(*hit, task=task, main_provider=runtime.get("provider") or _read_main_provider()))[0] is not None:
+            return judged
+        _evict_cached_client_instance(hit[0])  # a refused hit is dropped, and the walk below judges the route again
+    elif hit is not None:  # route_custody (F12) judges each hit on the endpoint the client sends to, outside the lock
+        return judged_built_client(provider, *hit, task=task, base_url=base_url)
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
     # and retry an exhausted key. A pinned ``custom:<name>`` peeks only its entry's rows.
@@ -6078,7 +6084,7 @@ def _get_cached_client(
                 client, default_model, _ = _client_cache[cache_key]
                 # Race loser was never exposed to a caller — safe to close now.
                 _close_cached_client(built_client, close_async=async_mode)
-    return client, _compat_model(client, model, default_model)
+    return judged_built_client(provider, client, _compat_model(client, model, default_model), task=task, base_url=base_url)
 
 
 # MoA virtual provider: an *explicit* `provider: moa` override (either the caller-passed `provider` arg or
@@ -8034,6 +8040,7 @@ def call_llm(
     try:
         with (
             scoped_runtime_main(main_runtime),
+            auxiliary_request(messages),  # route_custody (F3) sees the request's own data use
             aux_progress_hook(
                 prior_progress_hook
                 if callable(prior_progress_hook)
@@ -8322,7 +8329,7 @@ async def async_call_llm(
     if semaphore is not None:
         await semaphore.acquire()
     try:
-        with scoped_runtime_main(main_runtime):
+        with scoped_runtime_main(main_runtime), auxiliary_request(messages):
             return await _async_call_llm_impl(
                 task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
                 main_runtime=main_runtime, messages=messages, temperature=temperature,
@@ -8352,8 +8359,7 @@ async def _async_call_llm_impl(
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
     try:
-        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()).
-        # (PR #16587)
+        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm(), PR #16587).
         _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
 
         async def _acreate(_kwargs: dict[str, Any]) -> Any:

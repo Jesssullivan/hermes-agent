@@ -262,7 +262,7 @@ async def test_btw_side_question_does_not_hold_profile_retirement(monkeypatch, p
             interrupts.append(message)
             release.set()
 
-    def answer(question, history, *, parent_agent=None, main_runtime=None, on_fork=None, should_stop=None):
+    def answer(question, history, *, parent_agent=None, main_runtime=None, on_fork=None, should_stop=None, route=None):
         if path == 'fork':
             on_fork(Fork())
             started.set()

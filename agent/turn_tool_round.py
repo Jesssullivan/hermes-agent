@@ -14,7 +14,9 @@ from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id, normalize_provider_tool_call_ids
+from agent.route_hooks import ROUTE_CUSTODY_REASON
 from agent.turn_preflight import compress_after_tool_results
+from agent.turn_route_check import ROUTE_CUSTODY_STOP_COPY, route_stops_turn
 from agent.turn_tool_validation import validate_tool_calls
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -201,6 +203,12 @@ def run_tool_round(
     # calling) — cheap RPC-style calls shouldn't eat the budget.
     if {tc.function.name for tc in assistant_message.tool_calls} == {"execute_code"}:
         agent.iteration_budget.refund()
+
+    # Route custody before this round's rows can leave: a post-tool compaction rides the agent's route.
+    active_system_prompt, _route_stopped = route_stops_turn(agent, messages, active_system_prompt)
+    if _route_stopped:
+        final_response, failed, _turn_exit_reason = ROUTE_CUSTODY_STOP_COPY, True, ROUTE_CUSTODY_REASON
+        return _verdict("break")
 
     _ptc = compress_after_tool_results(
         agent, messages=messages, system_message=system_message, user_message=user_message,

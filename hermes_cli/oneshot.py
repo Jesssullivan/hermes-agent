@@ -597,6 +597,9 @@ def _run_agent(
             # commands via HERMES_YOLO_MODE=1, skill secret capture degrades gracefully.
             clarify_callback=_oneshot_clarify_callback,
         )
+        from agent.route_hooks import bind_resolution_entry, resolution_record
+        # Custody re-checks a resolution-time fallback entry at each turn start (agent/route_hooks.py).
+        bind_resolution_entry(agent, resolution_record(fallback_entry, runtime) if fallback_entry else None)
         # Belt-and-braces: no streaming display callbacks may bypass our stdout capture.
         agent.suppress_status_output = True
         agent.stream_delta_callback = None
