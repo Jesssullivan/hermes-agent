@@ -29,13 +29,15 @@ async def vision_under_custody(
     *, session_id: Any, messages: list, message_text: str, image_paths: list[str], platform: str = "",
 ) -> str:
     """Run *enrich* on *runtime* once custody admits the resolution-time *record* for this
-    session's images. With no route hook loaded and no custody key, *enrich* runs unchanged.
-    A refusal sends nothing and leaves a note with each image's path."""
-    from agent.route_hooks import RouteCustodyRefused, custody_applies, detached_auxiliary, vision_rides_main_route
-    if not custody_applies(record):
+    session's images. With no route hook loaded, no custody key and no ``model.route_custody`` mark
+    that covers *runtime*, by name or at its ``base_url``, *enrich* runs unchanged, as a side question
+    does. A refusal sends nothing and leaves a note with each image's path."""
+    from agent.route_hooks import (RouteCustodyRefused, custody_applies, detached_auxiliary, entry_requires_custody,
+                                   vision_rides_main_route)
+    runtime = dict(runtime or {})
+    if not (custody_applies(record) or entry_requires_custody(runtime)):
         return await enrich()
     from agent.auxiliary_client import scoped_runtime_main
-    runtime = dict(runtime or {})
     session_id = session_id() if callable(session_id) else session_id  # looked up only when custody applies
     try:
         with scoped_runtime_main(runtime or None), detached_auxiliary(

@@ -300,7 +300,8 @@ class TestClientBaseUrl:
                 patch.object(aux, "_try_main_provider_route", return_value=(_client(ZAI), "main-m", "custom")), \
                 patch.object(aux, "_warn_stale_openai_base_url"):
             assert aux.resolve_provider_client("auto", model="slot-m", task="compression") == (None, None)
-        assert [(c["provider"], c["model"]) for c in seen] == [("zai", "slot-m")]
+        # The walk judges the client its main step built on the model it routed; the slot's own model is judged after.
+        assert [(c["provider"], c["model"]) for c in seen] == [("zai", "main-m"), ("zai", "slot-m")]
 
 
 class TestSlotProvider:

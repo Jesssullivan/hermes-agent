@@ -4674,8 +4674,8 @@ def _resolve_auto_route(
     with auxiliary_walk():
         if not marked_main_refuses(main_provider, main_model, task=task, base_url=base_url):  # route_custody (F12)
             routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
-            if routed is not None:
-                return routed
+            if routed is not None and judged_built_client(main_provider, *routed[:2], task=task, base_url=base_url)[0] is not None:
+                return routed  # judged again at the URL the client sends to: a custom main can fall through to an API-key provider
         if task:
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                 task, main_provider or "auto", reason="main provider unavailable")

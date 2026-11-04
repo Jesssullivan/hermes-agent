@@ -41,7 +41,8 @@ block sets ``route_custody: required``.
   ``phase="auxiliary"`` and ``task="vision"`` before an image leaves, after ``turn_route`` has
   labelled the inbound message (:func:`detached_auxiliary`, :func:`agent_vision_scope`).
   The last-resort hop to the main model asks the gate as well (:func:`main_route_refuses`), and its
-  built client is judged at the URL it sends to (:func:`judged_built_client`). A
+  built client is judged at the URL it sends to (:func:`judged_built_client`), as is the client the
+  main step of an ``auto`` walk builds. A
   refusal in an auxiliary call ends that call's walk before built-in discovery
   (:func:`discovery_refused`), whose candidates the gate sees only when that mark covers them
   (:func:`discovery_mark_refuses`). An availability probe builds stubs that cannot send, so it
@@ -787,22 +788,37 @@ def resolution_record(entry: Mapping[str, Any], runtime: Optional[Mapping[str, A
     """The custody-relevant part of the fallback entry a resolution-time walker chose: its route
     as configured, the provider and model the walker resolved, its custody key, and the URLs it was
     configured with and resolved to, so a later check finds the marked endpoint under any name
-    (:func:`_entry_endpoint_route`). No secret: a URL keeps no user info, query or fragment."""
+    (:func:`_entry_endpoint_route`). No secret: a URL keeps no user info, query or fragment. A URL that
+    cannot be parsed is left out (:func:`_unparsed_url_entry`)."""
     urls = {"base_url": _public_url(entry.get("base_url")),
             "resolved_base_url": _public_url((runtime or {}).get("base_url"))}
-    return {"provider": str(entry.get("provider") or "").strip(), "model": str(entry.get("model") or "").strip(),
-            ROUTE_CUSTODY_KEY: entry.get(ROUTE_CUSTODY_KEY),
-            "resolved_provider": str((runtime or {}).get("provider") or "").strip(),
-            "resolved_model": str(model or "").strip(), **{key: url for key, url in urls.items() if url}}
+    record = {"provider": str(entry.get("provider") or "").strip(), "model": str(entry.get("model") or "").strip(),
+              ROUTE_CUSTODY_KEY: entry.get(ROUTE_CUSTODY_KEY),
+              "resolved_provider": str((runtime or {}).get("provider") or "").strip(),
+              "resolved_model": str(model or "").strip(), **{key: url for key, url in urls.items() if url}}
+    return _unparsed_url_entry(record) if None in urls.values() else record
 
 
-def _public_url(url: Any) -> str:
-    """*url* without its user info, query or fragment; ``""`` for no URL."""
+def _public_url(url: Any) -> Optional[str]:
+    """*url* without its user info, query or fragment; ``""`` for no URL, and ``None`` for a URL that
+    ``urlsplit`` rejects (``http://[::1/v1``)."""
     if not isinstance(url, str) or not url.strip():
         return ""
     from urllib.parse import urlsplit, urlunsplit
-    parts = urlsplit(url.strip())
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
     return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
+
+
+def _unparsed_url_entry(entry: Mapping[str, Any]) -> Mapping[str, Any]:
+    """*entry*, whose URL cannot be parsed. Such a URL names no endpoint, so no check can show that it
+    is not the marked one. While a gate is loaded or ``model.route_custody`` is set, the entry then
+    needs an explicit allow (fail closed). With neither, it stands as it is and nothing applies."""
+    if _has_hook(ROUTE_CUSTODY_HOOK) or _main_route_marker()[1]:
+        return {**entry, ROUTE_CUSTODY_KEY: ROUTE_CUSTODY_REQUIRED}
+    return entry
 
 
 def mark_resolution_entry(runtime: dict[str, Any], entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -989,14 +1005,17 @@ def _resolution_fallback_entry(agent: Any) -> Optional[Mapping[str, Any]]:
     ``nous/welcome``) is still the entry's route, with the model in use, so the gate judges what
     will carry the data. So is a blank provider, which proves no move. The entry is judged at the URL
     the agent sends to now, when it has one, as a kept fallback is (:func:`_active_entry`): a
-    delegation ``base_url`` or a later move on the same provider leaves the record's URLs behind.
-    ``None`` with no record, no gate, or after the agent moved to another provider, which is logged
+    delegation ``base_url`` or a later move on the same provider leaves the record's URLs behind. A URL
+    that cannot be parsed is judged by :func:`_unparsed_url_entry`. ``None`` with no record, no gate, or after the agent moved to another provider, which is logged
     once at warning."""
     record = getattr(agent, "_route_resolution_entry", None)
     if not isinstance(record, Mapping):
         return None
     url = _public_url(_agent_route(agent).get("base_url"))
-    entry = {**record, "base_url": url, "resolved_base_url": url} if url else record
+    if url is None:
+        entry = _unparsed_url_entry(record)
+    else:
+        entry = {**record, "base_url": url, "resolved_base_url": url} if url else record
     current = _current_route(agent)
     if not current["provider"] or _record_provider_forms(record) & _provider_forms(current["provider"]):
         if not _gated(entry):
@@ -1396,13 +1415,17 @@ def vision_send_refused(provider: Any, client: Any, model: Any, judged: Any, jud
 
 def _endpoint_route(base_url: Any) -> Optional[str]:
     """The marked provider, for a slot at *base_url* that no marked name covers, when the slot's scheme,
-    host and port are the marked route's or the marked route's endpoint cannot be resolved (fail closed:
-    the mark then requires an ``allow``). ``None`` otherwise."""
+    host and port are the marked route's, or when *base_url* or the marked route's endpoint cannot be
+    resolved (fail closed: the mark then requires an ``allow``). ``None`` otherwise."""
     url = str(base_url or "").strip()
     if not url:
         return None
     from utils import base_url_origin
-    origins, origin = _marked_route_origins(), base_url_origin(url)
+    try:
+        origin = base_url_origin(url)
+    except ValueError:  # ``urlsplit`` rejects it (``http://[::1/v1``): no endpoint to tell apart from the mark's
+        return _main_route_marker()[0]
+    origins = _marked_route_origins()
     if not origins:
         if "\0endpoint" not in _warned_values:
             _warned_values.add("\0endpoint")
