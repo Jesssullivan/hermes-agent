@@ -1,4 +1,4 @@
-"""Quota-wall failover harness for Cade's routes (TIN-7765, SPR-150 to SPR-153, SPR-301).
+"""Quota-wall failover harness for Cade's routes (TIN-7765).
 
 Two chains run through the real ``run_conversation`` loop with fake transports. These tests record
 what this revision does at a quota wall.
@@ -7,17 +7,17 @@ The public-home chain is what the cade launcher renders at Anthropic stage ``act
 main turns with one Kimi Code fallback (xoxd-ai/cade ``scripts/hermes-profiles.py``
 ``public_model_blocks``).
 
-Two more chains run the three routes SPR-301 names. The ruled one is Kimi, then Opus 5.5, then Sol
-through the SIWC relay (J160(a), TIN-7765 ``bdb14417``). The other starts on Sol, the cade home's
+Two more chains run the three failover routes. The ruled one is Kimi, then Opus 5.5, then Sol
+through the SIWC relay (TIN-7765 ``bdb14417``). The other starts on Sol, the cade home's
 live route today, then Opus, then Kimi, because that is where a wall lands until the render moves.
 Main cade renders neither yet: ``interim_model_blocks`` sets ``fallback_providers: []``. The ruled
 chain here is what draft xoxd-ai/cade#256 ``chain_model_blocks`` renders, so Sol carries
 ``route_custody: required`` and no base_url, and the warm on-prem tail is a ``custom:<name>`` entry
-with no base_url. J160(b) keeps that tail, for C1 and C2 turns first, and TestRuledOrder pins the
-turn falling through it while no local model answers. A required entry needs a plugin that answers
-for it, so the ruled tests use the ``custody_gate`` fixture, a real plugin manager with a synthetic
-gate, and TestRuledOrderWithNoGate pins the turn with none. Cade's own gate plugin does not exist
-yet. These tests load no route hook unless they say so.
+with no base_url. The ruled chain keeps that tail, and TestRuledOrder pins the turn falling through
+it while no local model answers. A required entry needs a plugin that answers for it, so the ruled
+tests use the ``custody_gate`` fixture, a real plugin manager with a synthetic gate, and
+TestRuledOrderWithNoGate pins the turn with none. Cade's own gate plugin does not exist yet. These
+tests load no route hook unless they say so.
 
 The error bodies and headers are synthetic. The live shapes of a Claude Max plan-window 429, a Kimi
 Code 429 and a ChatGPT plan wall are not measured (xoxd-ai/cade ``docs/ROUTE_FAILOVER.md`` section
@@ -68,9 +68,9 @@ PUBLIC_FALLBACK = [{"provider": KIMI[0], "model": KIMI[1]}]
 THREE_ROUTE_CHAIN = [{"provider": OPUS[0], "model": OPUS[1]}, {"provider": KIMI[0], "model": KIMI[1]}]
 # The relay is a loopback listener. No test connects, so a reserved name stands in for its address.
 SIWC_BASE_URL = "http://siwc-relay.invalid/v1"
-# J160(a): Kimi, then Opus, then Sol. The primary is Kimi, so these are the entries behind it. This
-# is the shape of xoxd-ai/cade#256 ``chain_model_blocks``: the endpoint and wire of Sol and of the
-# tail come from the ``providers:`` block in RENDERED_PROVIDERS, not from the entry.
+# The ruled order is Kimi, then Opus, then Sol. The primary is Kimi, so these are the entries behind
+# it. This is the shape of xoxd-ai/cade#256 ``chain_model_blocks``: the endpoint and wire of Sol and
+# of the tail come from the ``providers:`` block in RENDERED_PROVIDERS, not from the entry.
 RULED_CHAIN = [
     {"provider": OPUS[0], "model": OPUS[1]},
     {"provider": SOL[0], "model": SOL[1], "route_custody": "required"},
@@ -78,7 +78,7 @@ RULED_CHAIN = [
 ONPREM_NAME = "cade-onprem"
 ONPREM = ("custom:" + ONPREM_NAME, "local-model")
 ONPREM_BASE_URL = "http://onprem.invalid/v1"
-# J160(b): the on-prem tail stays. #256 renders it only while a local model is warm.
+# The ruled chain with its on-prem tail. #256 renders the tail only while a local model is warm.
 RULED_CHAIN_WITH_TAIL = [*RULED_CHAIN, {"provider": ONPREM[0], "model": ONPREM[1]}]
 RENDERED_PROVIDERS = {
     SOL[0]: {"base_url": SIWC_BASE_URL, "api_mode": "codex_responses", "key_env": "SYNTHETIC_RELAY_KEY"},
@@ -456,7 +456,7 @@ class TestHarnessBounds:
 
 
 class TestOpusWallMovesToKimi:
-    """SPR-150 for a public home: a quota wall on Opus moves the turn to Kimi Code."""
+    """For a public home: a quota wall on Opus moves the turn to Kimi Code."""
 
     def test_rate_limit_with_retry_after_falls_back_without_waiting(self):
         agent = _public_home_agent()
@@ -516,7 +516,7 @@ class TestTransientStaysOnOpus:
 
 
 class TestBothWalls:
-    """SPR-151: with every route exhausted the turn must not end in silence."""
+    """With every route exhausted the turn must not end in silence."""
 
     def test_opus_and_kimi_walls_end_the_turn_with_text(self):
         agent = _public_home_agent()
@@ -526,7 +526,7 @@ class TestBothWalls:
         run = drive(agent, lambda route, attempt: opus_wall if route == OPUS else kimi_wall)
         assert run.calls[0] == OPUS and KIMI in run.calls
         assert run.result["completed"] is False
-        # Hermes ends the turn with its own error text. It is not Cade's SPR-151 status reply:
+        # Hermes ends the turn with its own error text. It is not Cade's status reply:
         # that reply needs the F6 on_routes_exhausted hook (Jesssullivan/hermes-agent#3) or the
         # cade route gate in enforce mode.
         assert _reply(run.result).strip(), run.result
@@ -764,29 +764,39 @@ class TestTurnStartHold:
         self._arm(OPUS)
         run = drive(_kimi_home_agent(), lambda route, attempt: "answered on " + route[0])
         assert run.calls == [SOL]
-        [sol] = custody_gate.judged(SOL)
-        assert (sol["phase"], sol["required"], sol["labels"]) == ("failover", True, Gate.LABELS)
+        # F12: the hold's walk judges Sol, then the request on Sol is judged again.
+        judged = [(kw["phase"], kw["required"], kw["labels"]) for kw in custody_gate.judged(SOL)]
+        assert judged == [("failover", True, Gate.LABELS), ("request", True, Gate.LABELS)]
 
-    def test_custody_refusing_every_candidate_leaves_the_primary_with_a_whole_chain(self, custody_gate):
+    def test_custody_refusing_every_route_sends_nothing_and_leaves_a_whole_chain(self, custody_gate):
+        # F12 judges the primary at turn start too, so a gate that refuses every route stops the turn
+        # before anything is sent. The refusal holds for this turn only: the next turn walks the chain.
         self._arm(KIMI)
         agent = _kimi_home_agent()
         custody_gate.decide = lambda candidate: {"action": "block"}
         run = drive(agent, lambda route, attempt: "answered on " + route[0])
-        assert run.calls == [KIMI]
-        assert agent._fallback_index == 0
+        assert run.calls == []
+        assert run.result["completed"] is False
         assert agent._fallback_activated is False
+        assert (agent.provider, agent.model) == KIMI
+        assert not agent._unavailable_fallback_keys
+        custody_gate.decide = lambda candidate: {"action": "allow"}
+        assert drive(agent, lambda route, attempt: "answered on " + route[0]).calls == [OPUS]
 
-    def test_a_raising_gate_refuses_every_candidate_and_the_primary_still_runs_unjudged(self, custody_gate):
-        # F12 in cade#256: nothing judges the primary, so a client raw turn can reach Kimi against
-        # SPR-102. This pins that gap as it stands. It is not the fix.
+    def test_a_raising_gate_refuses_every_route_and_the_primary_is_judged_too(self, custody_gate):
+        # F12: the serving route is judged at turn start, so a gate error refuses the primary as well
+        # as every candidate, and the turn ends before any route is called.
         def boom(candidate):
             raise RuntimeError("synthetic")
 
         self._arm(KIMI)
         custody_gate.decide = boom
         run = drive(_kimi_home_agent(), lambda route, attempt: "answered on " + route[0])
-        assert run.calls == [KIMI]
-        assert custody_gate.judged(KIMI) == []
+        assert run.calls == []
+        assert run.result["completed"] is False
+        assert [kw["phase"] for kw in custody_gate.judged(KIMI)] == ["turn"]
+        assert [kw["phase"] for kw in custody_gate.judged(OPUS)] == ["failover"]
+        assert [kw["phase"] for kw in custody_gate.judged(SOL)] == ["failover"]
 
     def test_labels_are_known_before_the_hold(self):
         # A hold ahead of ``turn_route`` would judge the turn without its labels.
@@ -821,7 +831,7 @@ class TestTurnStartHold:
 
 
 class TestSolWallThroughTheRelay:
-    """A wall on the cade home's live route, in the shapes the relay sends today. SPR-301."""
+    """A wall on the cade home's live route, in the shapes the relay sends today."""
 
     @staticmethod
     def _script(wall):
@@ -909,7 +919,7 @@ class TestSolWallThroughTheRelay:
 
 
 class TestRelayOutage:
-    """SPR-301 covers an outage as well as a quota wall. Here the route is down, not walled."""
+    """Failover covers an outage as well as a quota wall. Here the route is down, not walled."""
 
     def test_a_relay_that_refuses_connections_moves_to_opus(self):
         # A transport failure takes the eager fallback at the second retry count, one call sooner
@@ -1059,7 +1069,7 @@ class TestRuledOrderWithNoGate:
 
 @pytest.mark.usefixtures("custody_gate")
 class TestRuledOrder:
-    """J160(a): Kimi, then Opus, then Sol, with the on-prem tail J160(b) keeps for C1 and C2 turns."""
+    """The turn walks Kimi, then Opus, then Sol, then the on-prem tail when it is rendered."""
 
     _script = staticmethod(_ruled_script)
 
@@ -1083,8 +1093,12 @@ class TestRuledOrder:
         assert _reply(run.result) == "answered on cade-siwc"
         # The entry names neither: both come from the rendered ``providers:`` block.
         assert (agent.provider, agent.base_url, agent.api_mode) == (SOL[0], SIWC_BASE_URL, "codex_responses")
-        assert [kw["required"] for kw in custody_gate.judged(SOL)] == [True]
-        assert [kw["required"] for kw in custody_gate.judged(OPUS)] == [False]
+        # F12: each route is judged as a failover candidate, then again before its request.
+        def judged(route):
+            return [(kw["phase"], kw["required"]) for kw in custody_gate.judged(route)]
+
+        assert judged(SOL) == [("failover", True), ("request", True)]
+        assert judged(OPUS) == [("failover", False), ("request", False)]
 
     def test_a_gate_refusal_keeps_sol_out_of_the_turn(self, custody_gate):
         custody_gate.decide = lambda candidate: {"action": "block" if candidate["provider"] == SOL[0] else "allow"}
@@ -1148,8 +1162,8 @@ class TestRuledOrder:
         assert _reply(run.result) == "Every model route is resting."
 
     def test_a_rendered_tail_that_refuses_falls_through_to_the_status_reply(self, custody_gate):
-        # J160(b): until a local model answers the turn reaches the SPR-151 reply. The reply text is
-        # Cade's, through F6. A refused connection is a tail rendered warm that has gone cold.
+        # A rendered tail that refuses every call still ends the turn on the status reply. The reply
+        # text is Cade's, through F6. A refused connection is a tail rendered warm that has gone cold.
         def cold(route, attempt):
             if route == ONPREM:
                 return openai.APIConnectionError(request=httpx.Request("POST", f"{ONPREM_BASE_URL}/chat"))
