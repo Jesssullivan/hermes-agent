@@ -13,6 +13,10 @@ except ImportError:
 
 from gateway.platforms.api_server_room_grants import _json_error
 
+# Body fields that only a scoped RoomLink dispatch may carry: the dispatch and the policy
+# that _normalize_room_dispatch resolves from this gateway's own catalog.
+_ROOM_ONLY_FIELDS = frozenset({"hosted_room_dispatch", "_room_execution_policy"})
+
 
 async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
     """Create or verify the target's canonical hidden group session. The ``Group: <room_id>``
@@ -77,6 +81,13 @@ async def _normalize_room_dispatch(
     """Validate and normalize a scoped RoomLink dispatch request."""
     _openai_error, room_token = _api_server._openai_error, self._room_grant_token(request)
     if not room_token:
+        # Only a verified room grant may carry these fields. This function writes them below,
+        # and _handle_runs reads them from the body it returns, so a body that brings its own
+        # would set the turn's toolsets from caller text. An API key opens no room.
+        if isinstance(body, dict) and _ROOM_ONLY_FIELDS & set(body):
+            return body, _json_error(
+                _openai_error, "Room dispatch fields require a room grant.",
+                code="room_grant_required", status=400)
         return body, None
     if not isinstance(body, dict) or set(body) - {"input", "hosted_room_dispatch"}:
         return body, _json_error(
